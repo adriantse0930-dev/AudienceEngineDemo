@@ -107,6 +107,33 @@ a { color: inherit; }
 .run-btn { border: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff; box-shadow: 0 10px 24px -12px var(--accent); }
 .run-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 14px 30px -12px var(--accent); }
 .run-btn:disabled { opacity: .45; cursor: default; }
+
+/* Call to action until the sample has been run on this tool: bigger, a sheen sweeping
+   across, a pulsing ring and a hint bubble. */
+.th-actions { position: relative; align-items: center; }
+.run-btn { position: relative; isolation: isolate; transition: background .2s ease, transform .35s var(--ease), box-shadow .3s ease, opacity .2s ease; }
+.run-shine { position: absolute; inset: 0; border-radius: inherit; overflow: hidden; pointer-events: none; z-index: -1; }
+.run-shine::after { content: ""; position: absolute; top: -10%; bottom: -10%; left: -60%; width: 45%; opacity: 0;
+  background: linear-gradient(100deg, transparent, rgba(255,255,255,.6), transparent); transform: skewX(-20deg); }
+.run-btn::before { content: ""; position: absolute; inset: -5px; border-radius: 16px; border: 2px solid rgba(196,181,253,.9); opacity: 0; pointer-events: none; }
+.run-btn.attn { padding: 12px 22px; font-size: 15.5px; background: linear-gradient(135deg, #a78bfa, #7c5ce8 45%, #5b4fcf);
+  box-shadow: 0 0 0 1px rgba(255,255,255,.18) inset, 0 14px 34px -10px #8b6cf0, 0 0 28px -6px rgba(167,139,250,.75); }
+.run-btn.attn .ic { font-size: 17px; }
+.run-btn.attn .run-shine::after { opacity: 1; animation: run-shine 2.8s ease-in-out infinite; }
+.run-btn.attn::before { animation: run-ring 2s ease-out infinite; }
+.run-btn.attn:hover:not(:disabled) { transform: translateY(-2px) scale(1.04); }
+@keyframes run-shine { 0% { transform: translateX(0) skewX(-20deg); } 55%, 100% { transform: translateX(420%) skewX(-20deg); } }
+@keyframes run-ring { 0% { opacity: .9; transform: scale(1); } 100% { opacity: 0; transform: scale(1.22, 1.45); } }
+.run-hint { position: absolute; top: calc(100% + 12px); left: 0; z-index: 6; white-space: nowrap; pointer-events: none;
+  font-size: 12.5px; font-weight: 600; color: #1a1033; background: #fbbf24; padding: 6px 12px; border-radius: 9px;
+  box-shadow: 0 10px 24px -8px rgba(251,191,36,.6); opacity: 0; transform: translateY(-6px); transition: opacity .3s ease, transform .35s var(--ease); }
+.run-hint::before { content: ""; position: absolute; top: -5px; left: 22px; width: 10px; height: 10px; background: #fbbf24; transform: rotate(45deg); border-radius: 2px; }
+.run-hint.show { opacity: 1; transform: none; animation: run-bob 2.4s ease-in-out .4s infinite; }
+@keyframes run-bob { 50% { transform: translateY(3px); } }
+@media (prefers-reduced-motion: reduce) {
+  html:not(.force-motion) .run-btn.attn .run-shine::after, html:not(.force-motion) .run-btn.attn::before, html:not(.force-motion) .run-hint.show { animation: none; }
+  html:not(.force-motion) .run-btn.attn::before { opacity: .7; }
+}
 .run-btn.busy .ic { animation: pulse 1s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: .35; } }
 .about-btn { border: 1px solid var(--line-strong); background: var(--surface); }
@@ -225,9 +252,11 @@ table.smp { width: 100%; border-collapse: collapse; font-size: 12.5px; }
       <p id="thDesc"></p>
     </div>
     <div class="th-actions">
-      <button id="sampleBtn" class="run-btn" type="button" disabled>
-        <svg class="ic" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg><span>Run sample</span>
+      <button id="sampleBtn" class="run-btn" type="button" disabled aria-describedby="sampleHint">
+        <span class="run-shine" aria-hidden="true"></span>
+        <svg class="ic" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg><span class="run-label">Run sample</span>
       </button>
+      <span class="run-hint" id="sampleHint" role="status">Click to see sample output</span>
       <button id="aboutBtn" class="about-btn" type="button" aria-expanded="true" aria-controls="about">
         <span>About</span><svg class="ic" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
       </button>
@@ -413,6 +442,7 @@ var TOOLS = [
   var view = $('view'), menu = $('menu'), tool = $('tool'), notFound = $('notFound');
   var REDUCE = !/[?&]motion/.test(location.search) && !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
   var EASE = 'cubic-bezier(.2,.8,.2,1)';
+  if (/[?&]motion/.test(location.search)) document.documentElement.classList.add('force-motion');
   var current = null, lastCard = null;
   var BY_ROUTE = {};
   TOOLS.forEach(function (t) { BY_ROUTE[t.route] = t; });
@@ -507,19 +537,29 @@ var TOOLS = [
   $('aboutBtn').addEventListener('click', function () { setAbout(!$('about').classList.contains('open'), current); });
 
   // ── Run sample ──────────────────────────────────────────────────────────
-  var sampleBtn = $('sampleBtn');
+  // Until the sample has been run on a tool (this session), the button draws attention.
+  var sampleBtn = $('sampleBtn'), sampleLabel = sampleBtn.querySelector('.run-label'), hint = $('sampleHint'), hintTimer = null;
+  function attention(on) {
+    sampleBtn.classList.toggle('attn', on);
+    clearTimeout(hintTimer);
+    if (on) hintTimer = setTimeout(function () { hint.classList.add('show'); }, REDUCE ? 0 : 700);
+    else hint.classList.remove('show');
+  }
+  window.__sampleIdle = function () { sampleBtn.disabled = true; attention(false); };
   view.addEventListener('load', function () {
     var ok = false;
     try { ok = typeof view.contentWindow.demoSample === 'function'; } catch (e) {}
     sampleBtn.disabled = !ok;
+    attention(ok && store('ae:ran:' + current) !== '1');
   });
   sampleBtn.addEventListener('click', function () {
     var fn; try { fn = view.contentWindow.demoSample; } catch (e) {}
     if (typeof fn !== 'function') return;
+    store('ae:ran:' + current, '1'); attention(false);
     setAbout(false, current);
-    sampleBtn.disabled = true; sampleBtn.classList.add('busy'); sampleBtn.querySelector('span').textContent = 'Running…';
+    sampleBtn.disabled = true; sampleBtn.classList.add('busy'); sampleLabel.textContent = 'Running…';
     Promise.resolve().then(function () { return fn(); }).catch(function (e) { console.error(e); }).then(function () {
-      sampleBtn.disabled = false; sampleBtn.classList.remove('busy'); sampleBtn.querySelector('span').textContent = 'Run sample';
+      sampleBtn.disabled = false; sampleBtn.classList.remove('busy'); sampleLabel.textContent = 'Run sample';
     });
   });
 
@@ -595,7 +635,7 @@ var TOOLS = [
     setAbout(saved === null ? innerWidth > 820 : saved === '1');
     setModebar(mode);
     if (mode) { store('ae:geo', p); if (mode.country === 'ca') store('ae:geo:ca', p); }
-    sampleBtn.disabled = true;
+    window.__sampleIdle();
     var modeName = mode ? (mode.country === 'us' ? 'United States' : 'Canada ' + mode.level.toUpperCase()) : '';
     document.title = (mode ? t.title + ' · ' + modeName : t.title) + ' — Audience Analytics Engine';
     view.srcdoc = PAGES[page];

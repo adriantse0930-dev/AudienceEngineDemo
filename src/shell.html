@@ -41,9 +41,11 @@
       <p id="thDesc"></p>
     </div>
     <div class="th-actions">
-      <button id="sampleBtn" class="run-btn" type="button" disabled>
-        <svg class="ic" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg><span>Run sample</span>
+      <button id="sampleBtn" class="run-btn" type="button" disabled aria-describedby="sampleHint">
+        <span class="run-shine" aria-hidden="true"></span>
+        <svg class="ic" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg><span class="run-label">Run sample</span>
       </button>
+      <span class="run-hint" id="sampleHint" role="status">Click to see sample output</span>
       <button id="aboutBtn" class="about-btn" type="button" aria-expanded="true" aria-controls="about">
         <span>About</span><svg class="ic" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
       </button>

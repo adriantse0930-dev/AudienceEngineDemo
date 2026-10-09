@@ -6,6 +6,7 @@
   var view = $('view'), menu = $('menu'), tool = $('tool'), notFound = $('notFound');
   var REDUCE = !/[?&]motion/.test(location.search) && !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
   var EASE = 'cubic-bezier(.2,.8,.2,1)';
+  if (/[?&]motion/.test(location.search)) document.documentElement.classList.add('force-motion');
   var current = null, lastCard = null;
   var BY_ROUTE = {};
   TOOLS.forEach(function (t) { BY_ROUTE[t.route] = t; });
@@ -100,19 +101,29 @@
   $('aboutBtn').addEventListener('click', function () { setAbout(!$('about').classList.contains('open'), current); });
 
   // ── Run sample ──────────────────────────────────────────────────────────
-  var sampleBtn = $('sampleBtn');
+  // Until the sample has been run on a tool (this session), the button draws attention.
+  var sampleBtn = $('sampleBtn'), sampleLabel = sampleBtn.querySelector('.run-label'), hint = $('sampleHint'), hintTimer = null;
+  function attention(on) {
+    sampleBtn.classList.toggle('attn', on);
+    clearTimeout(hintTimer);
+    if (on) hintTimer = setTimeout(function () { hint.classList.add('show'); }, REDUCE ? 0 : 700);
+    else hint.classList.remove('show');
+  }
+  window.__sampleIdle = function () { sampleBtn.disabled = true; attention(false); };
   view.addEventListener('load', function () {
     var ok = false;
     try { ok = typeof view.contentWindow.demoSample === 'function'; } catch (e) {}
     sampleBtn.disabled = !ok;
+    attention(ok && store('ae:ran:' + current) !== '1');
   });
   sampleBtn.addEventListener('click', function () {
     var fn; try { fn = view.contentWindow.demoSample; } catch (e) {}
     if (typeof fn !== 'function') return;
+    store('ae:ran:' + current, '1'); attention(false);
     setAbout(false, current);
-    sampleBtn.disabled = true; sampleBtn.classList.add('busy'); sampleBtn.querySelector('span').textContent = 'Running…';
+    sampleBtn.disabled = true; sampleBtn.classList.add('busy'); sampleLabel.textContent = 'Running…';
     Promise.resolve().then(function () { return fn(); }).catch(function (e) { console.error(e); }).then(function () {
-      sampleBtn.disabled = false; sampleBtn.classList.remove('busy'); sampleBtn.querySelector('span').textContent = 'Run sample';
+      sampleBtn.disabled = false; sampleBtn.classList.remove('busy'); sampleLabel.textContent = 'Run sample';
     });
   });
 
@@ -188,7 +199,7 @@
     setAbout(saved === null ? innerWidth > 820 : saved === '1');
     setModebar(mode);
     if (mode) { store('ae:geo', p); if (mode.country === 'ca') store('ae:geo:ca', p); }
-    sampleBtn.disabled = true;
+    window.__sampleIdle();
     var modeName = mode ? (mode.country === 'us' ? 'United States' : 'Canada ' + mode.level.toUpperCase()) : '';
     document.title = (mode ? t.title + ' · ' + modeName : t.title) + ' — Audience Analytics Engine';
     view.srcdoc = PAGES[page];
