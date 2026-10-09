@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>OG render</title>
+<style>html,body{margin:0;background:#000}canvas{display:block;width:100%;height:auto}</style></head>
+<body><canvas id="c" width="1200" height="630"></canvas>
+<script>
+// Draws the 1200x630 link-preview card in the Midnight Glass style.
+var ICONS = {
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.7 5.6 3.7 9s-1.2 6.4-3.7 9c-2.5-2.6-3.7-5.6-3.7-9S9.5 5.6 12 3z"/>',
+  headphones: '<path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="3" y="14" width="4.5" height="7" rx="1.8"/><rect x="16.5" y="14" width="4.5" height="7" rx="1.8"/>',
+  chip: '<rect x="6" y="6" width="12" height="12" rx="2.5"/><path d="M9 2.5V6M15 2.5V6M9 18v3.5M15 18v3.5M2.5 9H6M2.5 15H6M18 9h3.5M18 15h3.5"/><rect x="10" y="10" width="4" height="4" rx=".8"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/>',
+  merge: '<circle cx="6" cy="5" r="2.2"/><circle cx="18" cy="5" r="2.2"/><circle cx="12" cy="19" r="2.2"/><path d="M6 7.2c0 5 6 4.6 6 9.6M18 7.2c0 5-6 4.6-6 9.6"/>',
+  chart: '<path d="M4 20V11M10 20V5M16 20v-7M21 20H3"/>'
+};
+var TILES = [
+  ['Geo Analysis', 'US ZIP · CA FSA · FSALDU', '#2dd4bf', 'globe'],
+  ['Streamed Media', 'YouTube to Spotify', '#ff5a63', 'headphones'],
+  ['1P Modelling', 'Lookalikes & clusters', '#a78bfa', 'chip'],
+  ['Taxonomy Search', 'Keyword + semantic', '#fb923c', 'search'],
+  ['Cross Impute', 'Merge & fill gaps', '#3fb950', 'merge'],
+  ['DMP Insights', 'Trait consolidation', '#60a5fa', 'chart']
+];
+var c = document.getElementById('c'), x = c.getContext('2d');
+var F = '"Segoe UI", system-ui, sans-serif';
+
+function rr(px, py, w, h, r) { x.beginPath(); x.roundRect(px, py, w, h, r); }
+function glow(cx, cy, rad, col, a) {
+  var g = x.createRadialGradient(cx, cy, 0, cx, cy, rad);
+  g.addColorStop(0, col.replace('A', a)); g.addColorStop(1, col.replace('A', 0));
+  x.fillStyle = g; x.fillRect(0, 0, 1200, 630);
+}
+function drawIcon(svg, ox, oy, size) {
+  var doc = new DOMParser().parseFromString('<svg xmlns="http://www.w3.org/2000/svg">' + svg + '</svg>', 'image/svg+xml');
+  var s = size / 24;
+  x.save(); x.translate(ox, oy); x.scale(s, s);
+  x.strokeStyle = '#fff'; x.lineWidth = 1.8; x.lineCap = 'round'; x.lineJoin = 'round';
+  [].forEach.call(doc.documentElement.children, function (el) {
+    var n = el.tagName, a = function (k) { return parseFloat(el.getAttribute(k) || 0); };
+    if (n === 'path') x.stroke(new Path2D(el.getAttribute('d')));
+    else if (n === 'circle') { x.beginPath(); x.arc(a('cx'), a('cy'), a('r'), 0, Math.PI * 2); x.stroke(); }
+    else if (n === 'rect') { x.beginPath(); x.roundRect(a('x'), a('y'), a('width'), a('height'), a('rx')); x.stroke(); }
+  });
+  x.restore();
+}
+function mix(hex, t) { // blend hex with #1e1b4b by t (0..1 of hex)
+  var a = parseInt(hex.slice(1), 16), b = 0x1e1b4b;
+  var ch = function (sh) { return Math.round(((a >> sh) & 255) * t + ((b >> sh) & 255) * (1 - t)); };
+  return 'rgb(' + ch(16) + ',' + ch(8) + ',' + ch(0) + ')';
+}
+
+document.fonts.load('800 60px "Segoe UI"').then(function () {
+  // Background
+  x.fillStyle = '#0a0a1d'; x.fillRect(0, 0, 1200, 630);
+  glow(140, 40, 620, 'rgba(124,92,232,A)', .55);
+  glow(1120, 640, 520, 'rgba(45,212,191,A)', .28);
+  glow(900, 60, 360, 'rgba(244,114,182,A)', .16);
+
+  // Badge
+  x.font = '800 15px ' + F;
+  var badge = 'MOCKUP · DEMONSTRATION ONLY', bw = x.measureText(badge).width + 34;
+  x.shadowColor = 'rgba(251,191,36,.55)'; x.shadowBlur = 24;
+  rr(64, 70, bw, 34, 17); x.fillStyle = '#fbbf24'; x.fill(); x.shadowBlur = 0;
+  x.fillStyle = '#1a1400'; x.textBaseline = 'middle'; x.fillText(badge, 81, 88);
+
+  // Title + subtitle
+  x.textBaseline = 'alphabetic';
+  x.shadowColor = 'rgba(167,139,250,.6)'; x.shadowBlur = 40;
+  x.fillStyle = '#fff'; x.font = '800 66px ' + F;
+  x.fillText('Audience', 60, 196); x.fillText('Analytics Engine', 60, 268);
+  x.shadowBlur = 0;
+  x.fillStyle = '#d4ccf2'; x.font = '400 23px ' + F;
+  ['A fully functional mock-up of an AI-built', 'analytics toolkit adopted across my team.'].forEach(function (l, i) { x.fillText(l, 62, 326 + i * 34); });
+
+  // Highlights
+  var pills = ['9 tools','Sample output', 'No company data'], px = 62;
+  x.font = '600 17px ' + F;
+  pills.forEach(function (p) {
+    var w = x.measureText(p).width + 46;
+    rr(px, 410, w, 40, 20); x.fillStyle = 'rgba(255,255,255,.06)'; x.fill();
+    x.strokeStyle = 'rgba(180,160,255,.35)'; x.lineWidth = 1.2; x.stroke();
+    x.strokeStyle = '#2dd4bf'; x.lineWidth = 2.4; x.lineCap = 'round'; x.lineJoin = 'round';
+    x.beginPath(); x.moveTo(px + 15, 430); x.lineTo(px + 20, 435); x.lineTo(px + 29, 425); x.stroke();
+    x.fillStyle = '#ece8ff'; x.textBaseline = 'middle'; x.fillText(p, px + 36, 431); x.textBaseline = 'alphabetic';
+    px += w + 12;
+  });
+
+  // Footer line
+  x.fillStyle = '#8f88b8'; x.font = '500 17px ' + F;
+  x.fillText('Open it live: adriantse0930-dev.github.io/AudienceEngineDemo', 62, 560);
+
+  // Tile grid (right)
+  var gx = 680, gy = 70, tw = 230, th = 150, gap = 18;
+  TILES.forEach(function (t, i) {
+    var cx = gx + (i % 2) * (tw + gap), cy = gy + Math.floor(i / 2) * (th + gap);
+    rr(cx, cy, tw, th, 20); x.fillStyle = 'rgba(255,255,255,.055)'; x.fill();
+    x.strokeStyle = 'rgba(180,160,255,.22)'; x.lineWidth = 1.2; x.stroke();
+    var g = x.createLinearGradient(cx + 20, cy + 20, cx + 76, cy + 76);
+    g.addColorStop(0, t[2]); g.addColorStop(1, mix(t[2], .38));
+    x.shadowColor = t[2]; x.shadowBlur = 22;
+    rr(cx + 20, cy + 20, 56, 56, 16); x.fillStyle = g; x.fill(); x.shadowBlur = 0;
+    drawIcon(ICONS[t[3]], cx + 32, cy + 32, 32);
+    x.fillStyle = '#fff'; x.font = '700 20px ' + F; x.fillText(t[0], cx + 20, cy + 108);
+    x.fillStyle = '#a9a3c9'; x.font = '400 15px ' + F; x.fillText(t[1], cx + 20, cy + 131);
+  });
+
+  c.toBlob(function (b) {
+    fetch('http://127.0.0.1:8799/save', { method: 'POST', body: b }).then(function (r) { return r.text(); })
+      .then(function (t) { document.title = 'DONE ' + t; }).catch(function (e) { document.title = 'ERR ' + e.message; });
+  }, 'image/png');
+});
+</script></body></html>

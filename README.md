@@ -2,7 +2,9 @@ All data inside the HTML is synthetically generated, nothing is extracted from a
 
 ## Run
 
-Open `index.html`. It is fully self-contained; Excel, charts and map tiles load from a CDN on demand.
+Live: https://adriantse0930-dev.github.io/AudienceEngineDemo/
+
+Or download `index.html` and open it. It is fully self-contained; Excel, charts and map tiles load from a CDN on demand.
 
 URL options: `?nosplash` skips the splash screen, `?motion` forces the full splash animation when the OS asks for reduced motion.
 
@@ -23,3 +25,5 @@ node build.js
 | `src/core.js` | In-browser mock server shared by all pages |
 | `src/fsa-geo.js` | Synthetic Ontario FSA boundaries |
 | `src/splash.*` | Splash screen |
+
+`og-image.png` is the link-preview card. To redraw it, serve the repo and open `tools/og-render.html` (it posts the PNG to a local save endpoint).
