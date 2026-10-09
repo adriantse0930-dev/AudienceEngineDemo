@@ -1,0 +1,1450 @@
+<script data-demo="us_geo">
+// US Geo Analysis — in-browser re-implementation of the transform / preview
+// endpoints and the geo differentiation engine, on generated ZIP-level data.
+(function () {
+  'use strict';
+  var M = window.Mock;
+
+  // ── Constants (mirroring the Python modules) ─────────────────────────────
+  var TIER_ORDER = ['Priority', 'Efficiency', 'Scale', 'Marginal', 'Suppress'];
+  var TIER_RANK = {}; TIER_ORDER.forEach(function (t, i) { TIER_RANK[t] = i; });
+  var REQUIRED_COLS = ['ZIP_CODE', 'STATE', 'GENPOP_IN', 'TARGET_IN'];
+
+  var VERSION = '1.0.0';
+  var GEO_KEY_CANDIDATES = ['ZIP', 'FSA', 'Postal', 'PostalCode', 'ZipCode', 'Geo'];
+  var REGION_KEY_CANDIDATES = ['State', 'Province', 'Prov', 'Region'];
+  var IDX_COL = 'National Index', SNORM_COL = 'State-Norm Index', PEN_COL = 'ZIP Pen Rate',
+      TIER_COL = 'Tier', TARGET_COL = 'Target (IN)';
+  var DEFAULT_GATE = 120.0, DEFAULT_SWEEP = [110.0, 120.0, 130.0, 140.0], DEFAULT_MIN_COVERAGE = 0.90;
+  var XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+  function BadInput(msg) { var e = new Error(msg); e.bad = true; return e; }
+  function SpecError(msg) { var e = new Error(msg); e.spec = true; return e; }
+
+  // ── Small numeric helpers ────────────────────────────────────────────────
+  function toNum(v) {
+    if (typeof v === 'number') return v;
+    if (v == null || v === '') return NaN;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    var n = Number(String(v).trim());
+    return isNaN(n) ? NaN : n;
+  }
+  function isNum(v) { return typeof v === 'number' && !isNaN(v); }
+  function r1(x) { return M.round(x, 1); }
+  function sum(a) { var s = 0; a.forEach(function (v) { if (isNum(v)) s += v; }); return s; }
+  function mean(a) { var v = a.filter(isNum); return v.length ? sum(v) / v.length : NaN; }
+  function median(a) {
+    var v = a.filter(isNum).sort(function (x, y) { return x - y; });
+    if (!v.length) return NaN;
+    var m = Math.floor(v.length / 2);
+    return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+  }
+  function std0(a) { var m = mean(a); return Math.sqrt(mean(a.map(function (v) { return (v - m) * (v - m); }))); }
+  function corr(a, b) {                    // pandas Series.corr: pairwise-complete Pearson
+    var x = [], y = [];
+    for (var i = 0; i < a.length; i++) if (isNum(a[i]) && isNum(b[i])) { x.push(a[i]); y.push(b[i]); }
+    if (x.length < 2) return NaN;
+    var mx = mean(x), my = mean(y), sxy = 0, sxx = 0, syy = 0;
+    for (var j = 0; j < x.length; j++) { var dx = x[j] - mx, dy = y[j] - my; sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+    return (sxx && syy) ? sxy / Math.sqrt(sxx * syy) : NaN;
+  }
+  // Comparator for one sort key; NaN always sorts last (pandas na_position='last').
+  function cmpKey(a, b, desc) {
+    var an = typeof a === 'number' && isNaN(a), bn = typeof b === 'number' && isNaN(b);
+    if (an || bn) return an === bn ? 0 : (an ? 1 : -1);
+    if (a === b) return 0;
+    var r = a < b ? -1 : 1;
+    return desc ? -r : r;
+  }
+  function multiSort(rows, keys) {          // keys: [[getter, desc], ...]; stable
+    return rows.map(function (r, i) { return [r, i]; }).sort(function (A, B) {
+      for (var k = 0; k < keys.length; k++) {
+        var c = cmpKey(keys[k][0](A[0]), keys[k][0](B[0]), keys[k][1]);
+        if (c) return c;
+      }
+      return A[1] - B[1];
+    }).map(function (p) { return p[0]; });
+  }
+  function comma(n) { return Math.round(n).toLocaleString('en-US'); }
+  function pctf(v, d) { return (v * 100).toFixed(d == null ? 1 : d) + '%'; }
+  function fmtG(x) { return String(Number(x)); }
+  function today() {
+    var d = new Date();
+    return d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+  }
+  function nowStamp() {
+    var d = new Date(), p = function (n) { return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+           p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  // ── Excel helpers (SheetJS) ──────────────────────────────────────────────
+  function Grid() { this.rows = []; this.fmts = []; }
+  Grid.prototype.put = function (r, c, v, fmt) {           // 1-based, like openpyxl
+    while (this.rows.length < r) this.rows.push([]);
+    var row = this.rows[r - 1];
+    while (row.length < c) row.push(null);
+    if (typeof v === 'number' && !isFinite(v)) v = null;
+    row[c - 1] = v === undefined ? null : v;
+    if (fmt && typeof v === 'number') this.fmts.push([r, c, fmt]);
+  };
+  Grid.prototype.maxRow = function () { return this.rows.length; };
+  Grid.prototype.sheet = function (X, widths) {
+    var ws = X.utils.aoa_to_sheet(this.rows.length ? this.rows : [[]]);
+    this.fmts.forEach(function (f) {
+      var cell = ws[X.utils.encode_cell({ r: f[0] - 1, c: f[1] - 1 })];
+      if (cell && cell.t === 'n') cell.z = f[2];
+    });
+    if (widths) ws['!cols'] = widths.map(function (w) { return { wch: w }; });
+    return ws;
+  };
+  // A table of objects -> Grid (header row + data), with per-column number formats.
+  function tableGrid(cols, rows, formats) {
+    var g = new Grid();
+    cols.forEach(function (c, i) { g.put(1, i + 1, String(c)); });
+    rows.forEach(function (row, ri) {
+      cols.forEach(function (c, ci) {
+        var v = row[c];
+        if (typeof v === 'number' && isNaN(v)) v = '';
+        g.put(ri + 2, ci + 1, v == null ? null : v, formats && formats[c]);
+      });
+    });
+    return g;
+  }
+  function safeSheetName(name, used) {
+    var s = String(name).replace(/[\[\]:*?\/\\]/g, '_').slice(0, 31) || 'Sheet';
+    var base = s, n = 2;
+    while (used[s.toLowerCase()]) { s = (base.slice(0, 27) + ' (' + n + ')'); n++; }
+    used[s.toLowerCase()] = true;
+    return s;
+  }
+  function wbBlob(X, wb) {
+    return new Blob([X.write(wb, { bookType: 'xlsx', type: 'array', compression: true })], { type: XLSX_MIME });
+  }
+  function colsOf(ws, X) {
+    var hdr = X.utils.sheet_to_json(ws, { header: 1, blankrows: false })[0] || [];
+    return hdr.map(function (c) { return c == null ? '' : String(c); });
+  }
+  function unionCols(rows) {
+    var cols = [], seen = {};
+    rows.forEach(function (r) { Object.keys(r).forEach(function (k) { if (!seen[k]) { seen[k] = 1; cols.push(k); } }); });
+    return cols;
+  }
+
+  // ── Transform (us_geo.py build_report) ──────────────────────────────────
+  function findSheet(wb, wanted) {
+    var norm = function (s) { return String(s).trim().replace(/\s+/g, ' ').toLowerCase(); };
+    var t = norm(wanted);
+    for (var i = 0; i < wb.SheetNames.length; i++) if (norm(wb.SheetNames[i]) === t) return wb.SheetNames[i];
+    return null;
+  }
+  function tierOf(idx, vol) {
+    if (idx >= 150 && vol >= 100) return 'Priority';
+    if (idx >= 120 && vol >= 50) return 'Efficiency';
+    if (idx >= 100 && vol >= 500) return 'Scale';
+    if (idx >= 80) return 'Marginal';
+    return 'Suppress';
+  }
+  function audienceName(X, wb) {
+    var sh = findSheet(wb, 'Audience Information');
+    if (!sh) return null;
+    try {
+      var rows = X.utils.sheet_to_json(wb.Sheets[sh], { header: 1, blankrows: false });
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i] && String(rows[i][0] == null ? '' : rows[i][0]).trim() === 'Audience Name') {
+          var v = rows[i][1];
+          return (v == null || v === '') ? null : String(v).trim();
+        }
+      }
+    } catch (e) { /* best effort */ }
+    return null;
+  }
+
+  async function buildReport(buf, filterLabel) {
+    var X = await M.loadXLSX();
+    var wb = X.read(buf, { type: 'array' });
+    var sheet = findSheet(wb, 'GEO - Zip Code');
+    if (!sheet) throw BadInput("Couldn't find a 'GEO - Zip Code' sheet in this file. " +
+                               'Sheets found: ' + wb.SheetNames.join(', '));
+    var ws = wb.Sheets[sheet];
+    var cols = colsOf(ws, X);
+    var missing = REQUIRED_COLS.filter(function (c) { return cols.indexOf(c) < 0; });
+    if (missing.length) throw BadInput("'" + sheet + "' is missing expected column(s): " + missing.join(', ') +
+                                       '. Columns found: ' + cols.join(', '));
+    var raw = X.utils.sheet_to_json(ws, { defval: null });
+    var df = raw.map(function (r) {
+      var g = toNum(r.GENPOP_IN), t = toNum(r.TARGET_IN);
+      var m = r.ZIP_CODE == null ? null : String(r.ZIP_CODE).match(/\d+/);
+      return {
+        ZIP_CODE: (m ? m[0] : '').padStart(5, '0'),
+        STATE: r.STATE == null ? 'nan' : String(r.STATE).trim(),
+        DMA_NAME: r.DMA_NAME == null ? '' : String(r.DMA_NAME).trim(),
+        GENPOP_IN: isNaN(g) ? 0 : g,
+        TARGET_IN: isNaN(t) ? 0 : t
+      };
+    });
+    var totalZips = df.length;
+    df = df.filter(function (r) { return r.TARGET_IN > 0; });
+    if (!df.length) throw BadInput('No ZIPs with a nonzero target audience were found — nothing to report.');
+    var dropped = totalZips - df.length;
+
+    var st = {};
+    df.forEach(function (r) {
+      var a = st[r.STATE] || (st[r.STATE] = { t: 0, g: 0 });
+      a.t += r.TARGET_IN; a.g += r.GENPOP_IN;
+    });
+    var natPen = sum(df.map(function (r) { return r.TARGET_IN; })) / sum(df.map(function (r) { return r.GENPOP_IN; }));
+    df.forEach(function (r) {
+      r.state_pen = st[r.STATE].t / st[r.STATE].g;
+      r.zip_pen = r.TARGET_IN / r.GENPOP_IN;
+      r.state_norm_index = r1(r.zip_pen / r.state_pen * 100);
+      r.national_index = r1(r.zip_pen / natPen * 100);
+      r.tier = tierOf(r.state_norm_index, r.TARGET_IN);
+      r.tier_rank = TIER_RANK[r.tier];
+    });
+    df = multiSort(df, [[function (r) { return r.tier_rank; }, false],
+                        [function (r) { return r.state_norm_index; }, true]]);
+    df.forEach(function (r, i) { r.rank = i + 1; });
+
+    var aud = audienceName(X, wb);
+    var out = X.utils.book_new();
+    X.utils.book_append_sheet(out, tierSummarySheet(X, df, filterLabel), 'Tier Summary');
+    X.utils.book_append_sheet(out, nationalSheet(X, df), 'National');
+    X.utils.book_append_sheet(out, nationalSummarySheet(X, df), 'National Summary');
+
+    var tiers = {};
+    TIER_ORDER.forEach(function (t) { tiers[t] = df.filter(function (r) { return r.tier === t; }).length; });
+    var stats = {
+      audience_name: aud,
+      total_zips_in_export: totalZips,
+      zips_dropped_zero_target: dropped,
+      zips_reported: df.length,
+      total_target: Math.trunc(sum(df.map(function (r) { return r.TARGET_IN; }))),
+      tiers: tiers
+    };
+    return { blob: wbBlob(X, out), stats: stats };
+  }
+
+  function tierSummarySheet(X, df, label) {
+    var g = new Grid();
+    g.put(1, 1, 'State-Normalized Geo-Targeting Analysis — ' + label);
+    g.put(2, 1, 'Index = ZIP Penetration Rate ÷ State Avg Penetration Rate × 100');
+    ['Tier', 'ZIP Count', 'Total Target (IN)', '% of Total Target', 'Avg State-Norm Index',
+     'Avg National Index', 'Median State-Norm Index'].forEach(function (h, i) { g.put(4, i + 1, h); });
+    var total = Math.trunc(sum(df.map(function (r) { return r.TARGET_IN; })));
+    var r = 5;
+    TIER_ORDER.forEach(function (t) {
+      var grp = df.filter(function (x) { return x.tier === t; });
+      var gt = sum(grp.map(function (x) { return x.TARGET_IN; }));
+      var sn = grp.map(function (x) { return x.state_norm_index; });
+      var row = [t, grp.length, Math.trunc(gt), total ? M.round(gt / total, 3) : 0,
+                 grp.length ? r1(mean(sn)) : null,
+                 grp.length ? r1(mean(grp.map(function (x) { return x.national_index; }))) : null,
+                 grp.length ? r1(median(sn)) : null];
+      row.forEach(function (v, ci) { g.put(r, ci + 1, v, ci === 3 ? '0.0%' : (ci >= 4 ? '0.0' : null)); });
+      r++;
+    });
+    ['TOTAL', df.length, total, total ? 1 : 0, null, null, null]
+      .forEach(function (v, ci) { g.put(r, ci + 1, v, ci === 3 ? '0.0%' : null); });
+    r += 2;
+    g.put(r++, 1, 'Tier Thresholds:');
+    [['Priority', 'State-Norm Index ≥ 150  AND  Vol ≥ 100'],
+     ['Efficiency', 'State-Norm Index ≥ 120  AND  Vol ≥ 50'],
+     ['Scale', 'State-Norm Index ≥ 100  AND  Vol ≥ 500'],
+     ['Marginal', 'State-Norm Index ≥ 80'],
+     ['Suppress', 'State-Norm Index < 80']].forEach(function (p) { g.put(r, 1, p[0]); g.put(r, 2, p[1]); r++; });
+    r++;
+    g.put(r++, 1, ' Definition of Tiers:');
+    ['Priority — Index ≥ 150 AND at least 100 target people. High efficiency and enough scale to be worth activating.',
+     'Efficiency — Index ≥ 120 AND at least 50 target people. Still strong over-indexing, slightly lower bar on both dimensions.',
+     'Scale — Index ≥ 100 AND at least 500 target people. At or above the state average, but included because the sheer volume justifies it even without a strong index.',
+     'Marginal — Index ≥ 80. Below average but not dramatically so, could be included in a broad reach scenario.',
+     "Suppress — Index below 80. These ZIPs are meaningfully under-indexing vs. their state peers and aren't worth targeting.",
+     'All 5 tiers are dedupped. The "Marginal" is essentially the left over zipcodes that have an index over 80 that don\'t meet people threshold of the Priority, Efficiency and Scale and the Suppression List is simply any zipcode that falls under index of 80.'
+    ].forEach(function (l) { g.put(r++, 1, l); });
+    r++;
+    g.put(r++, 1, 'Definition of Columns');
+    ['Total Target (IN) = Actual HVA Audience Number',
+     '% of Total Target is based on the total target (in)',
+     'Average state-norm index is comparing against the states themselves rather than national level.',
+     "Average national index is the zipcode against national's index.",
+     'Median State Norm-Index is the median of column E for each tier.'
+    ].forEach(function (l) { g.put(r++, 1, l); });
+    return g.sheet(X, [16, 12, 18, 16, 20, 18, 22]);
+  }
+
+  function nationalSheet(X, df) {
+    var g = new Grid();
+    ['Rank', 'ZIP', 'State', 'DMA', 'Tier', 'Target (IN)', 'GenPop (IN)', 'ZIP Pen Rate',
+     'State Avg Pen Rate', 'State-Norm Index', 'National Index'].forEach(function (h, i) { g.put(1, i + 1, h); });
+    df.forEach(function (r, i) {
+      [r.rank, r.ZIP_CODE, r.STATE, r.DMA_NAME, r.tier, Math.trunc(r.TARGET_IN), Math.trunc(r.GENPOP_IN),
+       r.zip_pen, r.state_pen, r.state_norm_index, r.national_index].forEach(function (v, ci) {
+        g.put(i + 2, ci + 1, v, (ci === 7 || ci === 8) ? '0.00%' : (ci >= 9 ? '0.0' : null));
+      });
+    });
+    return g.sheet(X, [8, 10, 8, 28, 12, 14, 14, 13, 15, 16, 14]);
+  }
+
+  function nationalSummarySheet(X, df) {
+    var g = new Grid();
+    ['State', 'Total ZIPs', 'Priority ZIPs', 'Efficiency ZIPs', 'Scale ZIPs', 'Total Target (IN)',
+     'State Avg Pen Rate (%)', '% ZIPs Actionable'].forEach(function (h, i) { g.put(1, i + 1, h); });
+    var agg = {}, order = [];
+    df.forEach(function (r) {
+      var a = agg[r.STATE];
+      if (!a) { a = agg[r.STATE] = { STATE: r.STATE, total: 0, pri: 0, eff: 0, scale: 0, target: 0, genpop: 0 }; order.push(r.STATE); }
+      a.total++; a.target += r.TARGET_IN; a.genpop += r.GENPOP_IN;
+      if (r.tier === 'Priority') a.pri++; else if (r.tier === 'Efficiency') a.eff++; else if (r.tier === 'Scale') a.scale++;
+    });
+    var rows = order.sort().map(function (s) {
+      var a = agg[s];
+      a.pen = a.target / a.genpop;
+      a.act = M.round((a.pri + a.eff + a.scale) / a.total, 3);
+      return a;
+    });
+    rows = multiSort(rows, [[function (a) { return a.target; }, true]]);
+    rows.forEach(function (a, i) {
+      [a.STATE, a.total, a.pri, a.eff, a.scale, Math.trunc(a.target), a.pen, a.act].forEach(function (v, ci) {
+        g.put(i + 2, ci + 1, v, ci === 6 ? '0.00%' : (ci === 7 ? '0.0%' : null));
+      });
+    });
+    return g.sheet(X, [8, 12, 14, 16, 12, 16, 20, 18]);
+  }
+
+  async function readUpload(req) {
+    var f = req.form && req.form.get('file');
+    if (!f || !f.name) return null;
+    return await f.arrayBuffer();
+  }
+  function labelOf(req) {
+    return (((req.form && req.form.get('filter_label')) || '1PD (No Age Filter)') + '').trim() || '1PD (No Age Filter)';
+  }
+
+  M.route('POST', '/us-geo/api/transform', async function (req) {
+    var buf = await readUpload(req);
+    if (!buf) return M.json({ error: 'Upload the audience platform export (.xlsx) first.' }, 400);
+    var res;
+    try { res = await buildReport(buf, labelOf(req)); }
+    catch (e) {
+      if (e.bad) return M.json({ error: e.message }, 400);
+      return M.json({ error: 'Could not build the report: ' + e.message }, 500);
+    }
+    var safe = String(res.stats.audience_name || 'US_Geo_Report').replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '');
+    await M.sleep(500);
+    return M.file(res.blob, safe + '_Geo_Report_' + today() + '.xlsx', XLSX_MIME);
+  });
+
+  M.route('POST', '/us-geo/api/preview', async function (req) {
+    var buf = await readUpload(req);
+    if (!buf) return M.json({ error: 'Upload the audience platform export (.xlsx) first.' }, 400);
+    try { return (await buildReport(buf, labelOf(req))).stats; }
+    catch (e) {
+      if (e.bad) return M.json({ error: e.message }, 400);
+      return M.json({ error: 'Could not read the file: ' + e.message }, 500);
+    }
+  });
+
+  // ── Generated sample data: states, DMAs, ZIP universe, three audiences ────
+  var STATES = [['AL', 'Alabama'], ['AK', 'Alaska'], ['AZ', 'Arizona'], ['AR', 'Arkansas'], ['CA', 'California'],
+    ['CO', 'Colorado'], ['CT', 'Connecticut'], ['DE', 'Delaware'], ['FL', 'Florida'], ['GA', 'Georgia'],
+    ['HI', 'Hawaii'], ['ID', 'Idaho'], ['IL', 'Illinois'], ['IN', 'Indiana'], ['IA', 'Iowa'], ['KS', 'Kansas'],
+    ['KY', 'Kentucky'], ['LA', 'Louisiana'], ['ME', 'Maine'], ['MD', 'Maryland'], ['MA', 'Massachusetts'],
+    ['MI', 'Michigan'], ['MN', 'Minnesota'], ['MS', 'Mississippi'], ['MO', 'Missouri'], ['MT', 'Montana'],
+    ['NE', 'Nebraska'], ['NV', 'Nevada'], ['NH', 'New Hampshire'], ['NJ', 'New Jersey'], ['NM', 'New Mexico'],
+    ['NY', 'New York'], ['NC', 'North Carolina'], ['ND', 'North Dakota'], ['OH', 'Ohio'], ['OK', 'Oklahoma'],
+    ['OR', 'Oregon'], ['PA', 'Pennsylvania'], ['RI', 'Rhode Island'], ['SC', 'South Carolina'],
+    ['SD', 'South Dakota'], ['TN', 'Tennessee'], ['TX', 'Texas'], ['UT', 'Utah'], ['VT', 'Vermont'],
+    ['VA', 'Virginia'], ['WA', 'Washington'], ['WV', 'West Virginia'], ['WI', 'Wisconsin'], ['WY', 'Wyoming']];
+  var DMAS = [['New York', 'NY'], ['Los Angeles', 'CA'], ['Chicago', 'IL'], ['Philadelphia', 'PA'],
+    ['Dallas-Ft. Worth', 'TX'], ['San Francisco-Oakland-San Jose', 'CA'], ['Atlanta', 'GA'], ['Houston', 'TX'],
+    ['Washington DC', 'VA'], ['Boston', 'MA'], ['Phoenix', 'AZ'], ['Seattle-Tacoma', 'WA'],
+    ['Tampa-St. Petersburg', 'FL'], ['Minneapolis-St. Paul', 'MN'], ['Detroit', 'MI'], ['Denver', 'CO'],
+    ['Orlando', 'FL'], ['Miami-Ft. Lauderdale', 'FL'], ['Cleveland', 'OH'], ['Sacramento', 'CA'],
+    ['Charlotte', 'NC'], ['Portland OR', 'OR'], ['Raleigh-Durham', 'NC'], ['St. Louis', 'MO'],
+    ['Pittsburgh', 'PA'], ['Nashville', 'TN'], ['Baltimore', 'MD'], ['Salt Lake City', 'UT'],
+    ['San Diego', 'CA'], ['Kansas City', 'MO']];
+  var SEGMENTS = [
+    { name: 'Outdoor Adventure Seekers', base: 0.034, seed: 'seg-outdoor' },
+    { name: 'Premium Home Upgraders', base: 0.052, seed: 'seg-home' },
+    { name: 'Weekend Wellness Enthusiasts', base: 0.026, seed: 'seg-wellness' }
+  ];
+
+  var _universe = null;
+  function universe() {
+    if (_universe) return _universe;
+    var r = M.rng('usgeo-universe-v1');
+    var weights = STATES.map(function (s) {
+      var w = M.randFloat(0.3, 2.2, r);
+      DMAS.forEach(function (d) { if (d[1] === s[0]) w += M.randFloat(0.8, 1.6, r); });
+      return w;
+    });
+    var stateEffect = {};
+    STATES.forEach(function (s) { stateEffect[s[0]] = M.gauss(0, 0.28, r); });
+    var wsum = weights.reduce(function (a, b) { return a + b; }, 0);
+    var used = {}, zips = [];
+    for (var i = 0; i < 1400; i++) {
+      var x = r() * wsum, si = 0;
+      while (si < STATES.length - 1 && (x -= weights[si]) > 0) si++;
+      var st = STATES[si][0];
+      var dmas = DMAS.filter(function (d) { return d[1] === st; });
+      var dma = dmas.length && r() < 0.85 ? M.pick(dmas, r)[0] : 'Other / Non-metro';
+      var zip;
+      do { zip = String(1000 + si * 1960 + M.randInt(0, 1959, r)).padStart(5, '0'); } while (used[zip]);
+      used[zip] = 1;
+      var gen = Math.round(Math.min(58000, Math.max(40, Math.exp(M.gauss(8.2, 1.0, r)))));
+      zips.push({ zip: zip, state: st, dma: dma, genpop: gen, aff: M.gauss(0, 1, r), se: stateEffect[st] });
+    }
+    zips.sort(function (a, b) { return a.zip < b.zip ? -1 : 1; });
+    return (_universe = zips);
+  }
+  function segmentRows(k) {
+    var seg = SEGMENTS[k], r = M.rng(seg.seed), rows = [];
+    universe().forEach(function (z) {
+      var own = M.gauss(0, 1, r);
+      if (r() < 0.008) return;                                   // not every ZIP in every pull
+      var pen = seg.base * Math.exp(0.62 * z.aff + 0.8 * z.se + 0.24 * own);
+      pen = Math.min(0.6, pen);
+      var t = r() < 0.01 ? 0 : Math.max(0, Math.round(z.genpop * pen * M.randFloat(0.85, 1.15, r)));
+      rows.push({ ZIP_CODE: z.zip, DMA_NAME: z.dma, STATE: z.state, GENPOP_IN: z.genpop, TARGET_IN: t });
+    });
+    return rows;
+  }
+  async function sampleExportBlob(k) {
+    var X = await M.loadXLSX();
+    var seg = SEGMENTS[k];
+    var wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet([
+      ['Audience Name', seg.name],
+      ['Audience ID', 'AUD-DEMO-' + (4101 + k)],
+      ['Country', 'United States'],
+      ['Export Date', nowStamp().slice(0, 10)],
+      ['Note', 'Demo export — every number in this file is randomly generated.']
+    ]), 'Audience Information');
+    var zipWs = X.utils.json_to_sheet(segmentRows(k), { header: ['ZIP_CODE', 'DMA_NAME', 'STATE', 'GENPOP_IN', 'TARGET_IN'] });
+    X.utils.book_append_sheet(wb, zipWs, 'GEO - Zip Code');
+    return wbBlob(X, wb);
+  }
+  function segIndex(req) { var n = parseInt(req.query.seg || '1', 10); return (n >= 1 && n <= SEGMENTS.length) ? n - 1 : 0; }
+
+  M.route('GET', '/us-geo/api/demo-sample', async function (req) {
+    var k = segIndex(req);
+    return M.file(await sampleExportBlob(k), 'Sample_Export_' + SEGMENTS[k].name.replace(/\s+/g, '_') + '.xlsx', XLSX_MIME);
+  });
+  M.route('GET', '/us-geo/api/demo-sample-report', async function (req) {
+    var k = segIndex(req);
+    var buf = await (await sampleExportBlob(k)).arrayBuffer();
+    var res = await buildReport(buf, '1PD (No Age Filter)');
+    return M.file(res.blob, SEGMENTS[k].name.replace(/\s+/g, '_') + '_ZIP.xlsx', XLSX_MIME);
+  });
+
+  // ── Differentiation engine (geo_differentiation.py) ─────────────────────
+  M.route('GET', '/us-geo/api/differentiate/info', function () {
+    return {
+      version: VERSION,
+      default_gate: DEFAULT_GATE,
+      sweep_levels: DEFAULT_SWEEP.slice(),
+      min_coverage: DEFAULT_MIN_COVERAGE,
+      modes: [
+        { id: 'relative', name: 'Relative index (recommended)',
+          desc: 'Index each segment against the portfolio peer mean instead of GenPop, ' +
+                'then tier in two stages: qualify on absolute quality, rank on distinctiveness.' },
+        { id: 'exclusive', name: 'Mutually exclusive assignment',
+          desc: 'One segment per geography, highest relative index wins, with caps. For ' +
+                'activation splits — stops two segments bidding on the same ZIP. Emitted ' +
+                'as an extra sheet, never instead of the relative output.' },
+        { id: 'residual', name: 'Residualization (PCA)',
+          desc: 'Project the shared affluence factor out and rank on what remains. ' +
+                'Statistically cleanest, hardest to explain to a client.' },
+        { id: 'allocation', name: 'Constrained allocation (not built)',
+          desc: 'Needs CPM and inventory inputs these workbooks do not carry.' }
+      ],
+      tier_sizes: ['original', 'percentile']
+    };
+  });
+
+  function detectKeys(cols) {
+    var lower = {};
+    cols.forEach(function (c) { lower[String(c).trim().toLowerCase()] = c; });
+    var gk = null, rk = null;
+    for (var i = 0; i < GEO_KEY_CANDIDATES.length && gk == null; i++) {
+      var k = GEO_KEY_CANDIDATES[i].toLowerCase(); if (k in lower) gk = lower[k];
+    }
+    if (gk == null) throw SpecError('Could not find a geography column. Looked for ' +
+      GEO_KEY_CANDIDATES.join(', ') + '; sheet has: ' + cols.join(', ') + '. Pass one explicitly.');
+    for (var j = 0; j < REGION_KEY_CANDIDATES.length && rk == null; j++) {
+      var q = REGION_KEY_CANDIDATES[j].toLowerCase(); if (q in lower) rk = lower[q];
+    }
+    return [gk, rk];
+  }
+
+  function readSegment(X, buf, name, label) {
+    var wb = X.read(buf, { type: 'array' });
+    var ws = wb.Sheets.National;
+    if (!ws) throw SpecError(name + ": no sheet named 'National' (Worksheet named 'National' not found)");
+    var cols = colsOf(ws, X);
+    var keys = detectKeys(cols), gk = keys[0], rk = keys[1];
+    var missing = [IDX_COL, SNORM_COL].filter(function (c) { return cols.indexOf(c) < 0; });
+    if (missing.length) throw SpecError(name + ': missing required column(s) ' + missing.join(', ') +
+      '. This tool reads the workbooks produced by US/CA Geo Analysis.');
+    var rows = X.utils.sheet_to_json(ws, { defval: null }).map(function (r) {
+      var o = {};
+      cols.forEach(function (c) { o[c] = r[c]; });
+      o[gk] = r[gk] == null ? 'nan' : String(r[gk]).trim();
+      [IDX_COL, SNORM_COL, PEN_COL, TARGET_COL].forEach(function (c) { if (cols.indexOf(c) >= 0) o[c] = toNum(o[c]); });
+      return o;
+    }).filter(function (r) { return r[gk] !== '' && r[gk].toLowerCase() !== 'nan'; });
+    rows = multiSort(rows, [[function (r) { return r[SNORM_COL]; }, true]]);
+    var seen = {};
+    rows = rows.filter(function (r) { if (seen[r[gk]]) return false; seen[r[gk]] = 1; return true; });
+    if (label == null) {
+      var stem = name.replace(/\.[^.]*$/, '');
+      var sfx = ['_Zipcode', '_ZIP', '_FSA', '_Postal', '_Differentiated'];
+      for (var i = 0; i < sfx.length; i++) {
+        if (stem.toLowerCase().endsWith(sfx[i].toLowerCase())) { stem = stem.slice(0, -sfx[i].length); break; }
+      }
+      label = stem;
+    }
+    var counts = {};
+    if (cols.indexOf(TIER_COL) >= 0) rows.forEach(function (r) { var t = String(r[TIER_COL]); counts[t] = (counts[t] || 0) + 1; });
+    var byGeo = {};
+    rows.forEach(function (r) { byGeo[r[gk]] = r; });
+    return { label: label, source: name, rows: rows, cols: cols, byGeo: byGeo, geo_key: gk, region_key: rk,
+             n: rows.length, tier_counts: counts, hasTier: cols.indexOf(TIER_COL) >= 0 };
+  }
+
+  function strSort(a) { return a.slice().sort(function (x, y) { return x < y ? -1 : x > y ? 1 : 0; }); }
+
+  function joinSegments(segs, minCov) {
+    var gk = segs[0].geo_key;
+    segs.slice(1).forEach(function (s) {
+      if (s.geo_key !== gk) throw SpecError("Inputs use different geography columns ('" + gk + "' vs '" +
+        s.geo_key + "' in " + s.source + '). Pass --geo-key to force one.');
+    });
+    var common = Object.keys(segs[0].byGeo).filter(function (g) {
+      return segs.every(function (s) { return g in s.byGeo; });
+    });
+    var smallest = Math.min.apply(null, segs.map(function (s) { return s.n; }));
+    var coverage = smallest ? common.length / smallest : 0;
+    var all = {};
+    segs.forEach(function (s) { Object.keys(s.byGeo).forEach(function (g) { all[g] = 1; }); });
+    var commonSet = {}; common.forEach(function (g) { commonSet[g] = 1; });
+    var excluded = strSort(Object.keys(all).filter(function (g) { return !commonSet[g]; })).map(function (g) {
+      var have = segs.filter(function (s) { return g in s.byGeo; }).map(function (s) { return s.label; });
+      var o = {}; o[gk] = g;
+      o['Covered by'] = have.join(', ');
+      o['Missing from'] = segs.filter(function (s) { return have.indexOf(s.label) < 0; }).map(function (s) { return s.label; }).join(', ');
+      return o;
+    });
+    var info = { per_input: {}, common: common.length, dropped_per_input: {}, smallest_input: smallest,
+                 coverage: M.round(coverage, 4), min_coverage: minCov };
+    segs.forEach(function (s) { info.per_input[s.label] = s.n; info.dropped_per_input[s.label] = s.n - common.length; });
+    if (smallest && coverage < minCov) throw SpecError('Common coverage is ' + pctf(coverage) +
+      ' of the smallest input (' + common.length + ' of ' + smallest + '), below the ' +
+      Math.round(minCov * 100) + '% minimum. These files probably are not the same geography vintage. ' +
+      'Lower the minimum deliberately if that is expected.');
+    return { common: strSort(common), set: commonSet, excluded: excluded, info: info };
+  }
+
+  function relativeIndex(segs, common) {
+    var peer = {}, rel = {};
+    segs.forEach(function (s) { rel[s.label] = {}; });
+    common.forEach(function (g) {
+      var vals = segs.map(function (s) { return s.byGeo[g][IDX_COL]; });
+      var pm = mean(vals);
+      peer[g] = pm;
+      segs.forEach(function (s, i) { rel[s.label][g] = pm > 0 ? vals[i] / pm * 100 : NaN; });
+    });
+    return { peer: peer, rel: rel };
+  }
+
+  function tierSizesFor(s, rule, nq) {
+    var out = {};
+    if (rule === 'original' || rule == null) {
+      TIER_ORDER.forEach(function (t) { out[t] = s.tier_counts[t] || 0; }); return out;
+    }
+    if (typeof rule === 'string' && rule.indexOf('absolute:') === 0) {
+      var nums = rule.split(':')[1].split(',').filter(function (x) { return x.trim(); }).map(function (x) { return parseInt(x, 10); });
+      TIER_ORDER.forEach(function (t, i) { out[t] = i < nums.length ? nums[i] : 0; }); return out;
+    }
+    if (rule === 'percentile') {
+      var tot = 0; Object.keys(s.tier_counts).forEach(function (k) { tot += s.tier_counts[k]; });
+      tot = tot || 1;
+      TIER_ORDER.forEach(function (t) { out[t] = Math.round(nq * (s.tier_counts[t] || 0) / tot); }); return out;
+    }
+    throw SpecError("Unknown --tier-sizes value '" + rule + "'. Use original, percentile, or absolute:N,N,N");
+  }
+
+  function differentiate(segs, J, gate, tierSizes, relOverride) {
+    var gk = segs[0].geo_key, single = segs.length === 1, out = {};
+    var ri = single ? null : relativeIndex(segs, J.common);
+    var rel = ri ? (relOverride || ri.rel) : null;
+    segs.forEach(function (s) {
+      var df = s.rows.filter(function (r) { return J.set[r[gk]]; }).map(function (r) { return Object.assign({}, r); });
+      if (single) {
+        df.forEach(function (r) {
+          r['Peer Mean Index'] = r[IDX_COL]; r['Relative Index'] = 100.0; r.Qualified = true;
+          r['Differentiated Tier'] = s.hasTier ? r[TIER_COL] : 'Priority';
+        });
+        df = multiSort(df, [[function (r) { return r[SNORM_COL]; }, true], [function (r) { return r[gk]; }, false]]);
+        df.forEach(function (r, i) { r['Differentiated Rank'] = i + 1; });
+      } else {
+        df.forEach(function (r) {
+          r['Peer Mean Index'] = ri.peer[r[gk]];
+          var v = rel[s.label][r[gk]];
+          r['Relative Index'] = v == null ? NaN : v;
+          r.Qualified = r[SNORM_COL] >= gate && !isNaN(r['Relative Index']);
+        });
+        df = multiSort(df, [
+          [function (r) { return r.Qualified ? 1 : 0; }, true],
+          [function (r) { return r['Relative Index']; }, true],
+          [function (r) { return r[SNORM_COL]; }, true],
+          [function (r) { var t = r[TARGET_COL]; return t == null ? 0 : t; }, true],
+          [function (r) { return r[gk]; }, false]]);
+        df.forEach(function (r, i) { r['Differentiated Rank'] = i + 1; });
+        var nq = df.filter(function (r) { return r.Qualified; }).length;
+        var sizes = tierSizesFor(s, tierSizes, nq), bounds = [], cur = 0;
+        TIER_ORDER.forEach(function (t) { bounds.push([t, cur, cur + (sizes[t] || 0)]); cur += sizes[t] || 0; });
+        df.forEach(function (r, i) {
+          var lab = 'Suppress';
+          if (r.Qualified) for (var b = 0; b < bounds.length; b++) if (bounds[b][1] <= i && i < bounds[b][2]) { lab = bounds[b][0]; break; }
+          r['Differentiated Tier'] = lab;
+        });
+      }
+      if (s.hasTier) df.forEach(function (r) {
+        var o = String(r[TIER_COL]), n = r['Differentiated Tier'];
+        r['Tier Change'] = o === n ? o : o + ' → ' + n;
+      });
+      out[s.label] = df;
+    });
+    return out;
+  }
+
+  function exclusiveAssignment(segs, J, results) {
+    var gk = segs[0].geo_key;
+    if (segs.length === 1) return [];
+    var caps = {};
+    segs.forEach(function (s) { caps[s.label] = (s.tier_counts.Priority || 0) || J.common.length; });
+    var cand = [];
+    Object.keys(results).forEach(function (lbl) {
+      results[lbl].forEach(function (r) {
+        if (r.Qualified) cand.push({ g: r[gk], seg: lbl, rel: r['Relative Index'], sn: r[SNORM_COL],
+                                     t: r[TARGET_COL] == null ? 0 : r[TARGET_COL] });
+      });
+    });
+    cand = multiSort(cand, [[function (c) { return c.rel; }, true], [function (c) { return c.sn; }, true],
+                            [function (c) { return c.t; }, true], [function (c) { return c.g; }, false]]);
+    var used = {}, taken = {}, rows = [];
+    Object.keys(results).forEach(function (l) { used[l] = 0; });
+    cand.forEach(function (c) {
+      if (taken[c.g]) return;
+      if (used[c.seg] >= (caps[c.seg] || 0)) return;
+      used[c.seg]++; taken[c.g] = 1;
+      var o = {}; o[gk] = c.g;
+      o['Assigned Segment'] = c.seg; o['Relative Index'] = M.round(c.rel, 2);
+      o[SNORM_COL] = r1(c.sn || 0); o.Reason = 'highest relative index with capacity';
+      rows.push(o);
+    });
+    return rows.sort(function (a, b) { return a[gk] < b[gk] ? -1 : a[gk] > b[gk] ? 1 : 0; });
+  }
+
+  function residualize(segs, J) {
+    var k = segs.length, n = J.common.length;
+    if (k < 2) return [null, { applicable: false, note: 'Residualization needs at least two segments.' }];
+    var Xm = J.common.map(function (g) {
+      return segs.map(function (s) { var v = s.byGeo[g][IDX_COL]; return isNum(v) ? v : 0; });
+    });
+    var mu = [];
+    for (var j = 0; j < k; j++) mu.push(mean(Xm.map(function (r) { return r[j]; })));
+    var Xc = Xm.map(function (r) { return r.map(function (v, j) { return v - mu[j]; }); });
+    var C = [];
+    for (var a = 0; a < k; a++) { C.push([]); for (var b = 0; b < k; b++) { var s2 = 0; for (var i = 0; i < n; i++) s2 += Xc[i][a] * Xc[i][b]; C[a].push(s2 / Math.max(1, n - 1)); } }
+    var v = []; for (var q = 0; q < k; q++) v.push(1 / Math.sqrt(k) + q * 1e-3);
+    var lam = 0;
+    for (var it = 0; it < 300; it++) {                             // power iteration for PC1
+      var w = C.map(function (row) { return row.reduce(function (acc, c, j) { return acc + c * v[j]; }, 0); });
+      var norm = Math.sqrt(w.reduce(function (acc, x) { return acc + x * x; }, 0)) || 1;
+      lam = norm; v = w.map(function (x) { return x / norm; });
+    }
+    var trace = 0; for (var d = 0; d < k; d++) trace += C[d][d];
+    var ev = trace ? lam / trace : 0;
+    var resid = Xc.map(function (r) {
+      var sc = r.reduce(function (acc, x, j) { return acc + x * v[j]; }, 0);
+      return r.map(function (x, j) { return x - sc * v[j]; });
+    });
+    var flat = []; resid.forEach(function (r) { r.forEach(function (x) { flat.push(Math.abs(x)); }); });
+    var scale = std0(flat) || 1.0;
+    var rel = {};
+    segs.forEach(function (s, j) {
+      rel[s.label] = {};
+      J.common.forEach(function (g, i) { rel[s.label][g] = 100.0 + (resid[i][j] / scale) * 10.0; });
+    });
+    var info = { applicable: true, pc1_explained_variance: M.round(ev, 4), collinear: ev >= 0.7,
+      note: ev >= 0.7
+        ? 'PC1 explains ' + (ev * 100).toFixed(1) + '% of variance — the portfolio is collinear, so residualization is doing real work.'
+        : 'PC1 explains only ' + (ev * 100).toFixed(1) + '% of variance. These segments are not strongly collinear, so residualization is unnecessary here and relative mode is the simpler choice.' };
+    return [rel, info];
+  }
+
+  function jaccard(a, b) {
+    var u = {}, inter = 0;
+    Object.keys(a).forEach(function (g) { u[g] = 1; if (b[g]) inter++; });
+    Object.keys(b).forEach(function (g) { u[g] = 1; });
+    var nu = Object.keys(u).length;
+    return nu ? inter / nu : 0;
+  }
+  function setOf(list) { var o = {}; list.forEach(function (g) { o[g] = 1; }); return o; }
+  function interSets(sets) {
+    var ks = Object.keys(sets[0]);
+    return ks.filter(function (g) { return sets.every(function (s) { return s[g]; }); });
+  }
+
+  function diagnostics(segs, J, results, gate, overlapDetail) {
+    var gk = segs[0].geo_key, labels = segs.map(function (s) { return s.label; });
+    var before = {}, after = {}, pen = {};
+    segs.forEach(function (s) {
+      before[s.label] = setOf(s.rows.filter(function (r) { return s.hasTier && r[TIER_COL] === 'Priority'; }).map(function (r) { return r[gk]; }));
+      after[s.label] = setOf(results[s.label].filter(function (r) { return r['Differentiated Tier'] === 'Priority'; }).map(function (r) { return r[gk]; }));
+      if (s.cols.indexOf(PEN_COL) >= 0) pen[s.label] = J.common.map(function (g) { return s.byGeo[g][PEN_COL]; });
+    });
+    var pairs = [];
+    labels.forEach(function (a, i) {
+      labels.slice(i + 1).forEach(function (b) {
+        var row = { 'Segment A': a, 'Segment B': b,
+          'Priority Jaccard (before)': M.round(jaccard(before[a], before[b]), 4),
+          'Priority Jaccard (after)': M.round(jaccard(after[a], after[b]), 4) };
+        if (pen[a] && pen[b]) { var c = corr(pen[a], pen[b]); row['Pen-rate correlation'] = isNaN(c) ? null : M.round(c, 4); }
+        pairs.push(row);
+      });
+    });
+    var perSeg = segs.map(function (s) {
+      var orig = s.rows.filter(function (r) { return s.hasTier && r[TIER_COL] === 'Priority'; });
+      var np = results[s.label].filter(function (r) { return r['Differentiated Tier'] === 'Priority'; });
+      var ov = sum(orig.map(function (r) { return r[TARGET_COL]; })), nv = sum(np.map(function (r) { return r[TARGET_COL]; }));
+      return {
+        'Segment': s.label,
+        'Priority ZIPs (before)': orig.length,
+        'Priority ZIPs (after)': np.length,
+        'Priority target (before)': Math.trunc(ov),
+        'Priority target (after)': Math.trunc(nv),
+        'Reach retained': ov ? M.round(nv / ov, 4) : null,
+        'Mean State-Norm Index (after)': np.length ? r1(mean(np.map(function (r) { return r[SNORM_COL]; }))) : null,
+        'Mean Relative Index (after)': np.length ? r1(mean(np.map(function (r) { return r['Relative Index']; }))) : null
+      };
+    });
+    var bs = labels.map(function (l) { return before[l]; }), as = labels.map(function (l) { return after[l]; });
+    var allB = labels.length > 1 ? interSets(bs).length : 0, allA = labels.length > 1 ? interSets(as).length : 0;
+    var jb = pairs.map(function (p) { return p['Priority Jaccard (before)']; });
+    var ja = pairs.map(function (p) { return p['Priority Jaccard (after)']; });
+    return {
+      gate: gate, segments: labels, pairs: pairs, per_segment: perSeg,
+      priority_overlap: overlapDetail ? priorityOverlap(segs, results, before, after) : null,
+      in_all_priority_before: allB, in_all_priority_after: allA,
+      mean_jaccard_before: jb.length ? M.round(mean(jb), 4) : null,
+      mean_jaccard_after: ja.length ? M.round(mean(ja), 4) : null
+    };
+  }
+
+  function priorityOverlap(segs, results, before, after) {
+    var gk = segs[0].geo_key, rk = segs[0].region_key, labels = segs.map(function (s) { return s.label; });
+    if (labels.length < 2) return { pairs: [], detail: [], contested: 0, contested_target: 0, segment_columns: [] };
+    var pairs = [];
+    labels.forEach(function (a, i) {
+      labels.slice(i + 1).forEach(function (b) {
+        var sb = Object.keys(before[a]).filter(function (g) { return before[b][g]; }).length;
+        var sa = Object.keys(after[a]).filter(function (g) { return after[b][g]; }).length;
+        var na = Object.keys(after[a]).length, nb = Object.keys(after[b]).length;
+        pairs.push({ 'Segment A': a, 'Segment B': b, 'Priority ZIPs (A)': na, 'Priority ZIPs (B)': nb,
+          'Shared ZIPs (before)': sb, 'Shared ZIPs (after)': sa, 'ZIPs de-duplicated': sb - sa,
+          'Share of A still shared': na ? M.round(sa / na, 4) : null,
+          'Share of B still shared': nb ? M.round(sa / nb, 4) : null });
+      });
+    });
+    var claims = {};
+    labels.forEach(function (l) { Object.keys(after[l]).forEach(function (g) { (claims[g] = claims[g] || []).push(l); }); });
+    var contested = Object.keys(claims).filter(function (g) { return claims[g].length > 1; });
+    var idxBy = {}, region = {}, target = {}, hasTarget = false;
+    segs.forEach(function (s) {
+      idxBy[s.label] = {};
+      results[s.label].forEach(function (r) {
+        if (r['Differentiated Tier'] !== 'Priority') return;
+        idxBy[s.label][r[gk]] = r['Relative Index'];
+        if (rk && s.cols.indexOf(rk) >= 0) region[r[gk]] = r[rk];
+        if (s.cols.indexOf(TARGET_COL) >= 0) { hasTarget = true; target[r[gk]] = Math.max(target[r[gk]] || 0, Number(r[TARGET_COL]) || 0); }
+      });
+    });
+    contested.sort(function (a, b) { return (claims[b].length - claims[a].length) || (a < b ? -1 : a > b ? 1 : 0); });
+    var detail = contested.map(function (g) {
+      var row = {}; row[gk] = g;
+      if (rk) row[rk] = region[g] == null ? '' : region[g];
+      row['Segments claiming it'] = claims[g].length;
+      if (hasTarget) row['Target (IN)'] = Math.trunc(target[g] || 0);
+      labels.forEach(function (l) { var v = idxBy[l][g]; row[l + ' — Relative Index'] = v != null ? r1(v) : ''; });
+      row['Claimed by'] = claims[g].join(', ');
+      return row;
+    });
+    var ct = 0; contested.forEach(function (g) { ct += target[g] || 0; });
+    return { pairs: pairs, detail: detail, contested: contested.length, contested_target: Math.trunc(ct),
+             segment_columns: labels.map(function (l) { return l + ' — Relative Index'; }),
+             claimed_by_col: detail.length ? Object.keys(detail[0]).indexOf('Claimed by') + 1 : null };
+  }
+
+  function gateSweep(segs, J, levels, tierSizes) {
+    return levels.map(function (g) {
+      var res = differentiate(segs, J, g, tierSizes);
+      var d = diagnostics(segs, J, res, g, false);
+      var reach = d.per_segment.map(function (p) { return p['Reach retained']; }).filter(function (v) { return v != null; });
+      var idxs = d.per_segment.map(function (p) { return p['Mean State-Norm Index (after)']; }).filter(function (v) { return v != null; });
+      var pools = segs.map(function (s) { return res[s.label].filter(function (r) { return r.Qualified; }).length; });
+      var slots = segs.map(function (s) { return s.tier_counts.Priority || 0; });
+      var starved = pools.some(function (p, i) { return p < slots[i]; });
+      return {
+        'Gate (State-Norm Index >=)': g,
+        'Qualified geos (min across segments)': pools.length ? Math.min.apply(null, pools) : null,
+        'Priority slots to fill (max)': slots.length ? Math.max.apply(null, slots) : null,
+        'Mean reach retained': reach.length ? M.round(mean(reach), 4) : null,
+        'Min reach retained': reach.length ? M.round(Math.min.apply(null, reach), 4) : null,
+        'Mean State-Norm Index': idxs.length ? r1(mean(idxs)) : null,
+        'Mean pairwise Priority Jaccard': d.mean_jaccard_after,
+        'Geos in all Priority tiers': d.in_all_priority_after,
+        'Warning': starved ? 'Qualified pool is smaller than the Priority tier — reach collapses here' : ''
+      };
+    });
+  }
+
+  async function runDifferentiation(files, opts) {
+    var t0 = performance.now();
+    if (opts.mode === 'allocation') {
+      var e = new Error('Constrained allocation is not built yet — it needs CPM and inventory ' +
+        'inputs that do not exist in these workbooks.\n\n' +
+        '--cost-file expects a CSV or XLSX keyed on DMA:\n\n' +
+        '    DMA          str    must match the DMA column in the input workbooks\n' +
+        '    CPM          float  cost per thousand impressions\n' +
+        '    Inventory    int    optional, available impressions in that DMA\n\n' +
+        'Constrained allocation needs those to be worth anything: without cost it cannot ' +
+        'trade reach against efficiency, and without inventory it will happily allocate ' +
+        'budget to geos that have nothing to buy.');
+      e.notImpl = true; throw e;
+    }
+    var X = await M.loadXLSX();
+    var segs = [];
+    for (var i = 0; i < files.length; i++) {
+      var lbl = opts.labels && opts.labels[i] ? opts.labels[i] : null;
+      segs.push(readSegment(X, await files[i].arrayBuffer(), files[i].name, lbl));
+    }
+    var seen = {};
+    segs.forEach(function (s) {
+      var base = s.label, n = 2;
+      while (seen[s.label]) { s.label = base + ' (' + n + ')'; n++; }
+      seen[s.label] = 1;
+    });
+    var J = joinSegments(segs, opts.min_coverage);
+    var single = segs.length === 1;
+    var residInfo = null, relOverride = null;
+    if (opts.mode === 'residual' && !single) { var rr = residualize(segs, J); relOverride = rr[0]; residInfo = rr[1]; }
+    var results = differentiate(segs, J, opts.gate, opts.tier_sizes, relOverride);
+    var diag = diagnostics(segs, J, results, opts.gate, true);
+    diag.coverage = J.info;
+    diag.excluded_geos = J.excluded;
+    diag.mode = opts.mode;
+    diag.single_segment_fallback = single;
+    diag.tier_sizes = opts.tier_sizes;
+    if (residInfo) diag.residual = residInfo;
+    diag.gate_sweep = (opts.sweep && !single) ? gateSweep(segs, J, DEFAULT_SWEEP, opts.tier_sizes) : [];
+    var exclusive = null;
+    if (opts.mode === 'exclusive' && !single) { exclusive = exclusiveAssignment(segs, J, results); diag.exclusive_assigned = exclusive.length; }
+    await M.sleep(700 + Math.min(2500, segs.reduce(function (a, s) { return a + s.n; }, 0) / 2));
+    diag.elapsed_secs = M.round((performance.now() - t0) / 1000, 2);
+    diag.version = VERSION;
+    var blob = writeWorkbook(X, segs, results, diag, J.excluded, exclusive, opts, single);
+    return { blob: blob, diag: diag };
+  }
+
+  function writeWorkbook(X, segs, results, diag, excluded, exclusive, opts, single) {
+    var gk = segs[0].geo_key, wb = X.utils.book_new(), used = {};
+    var g = new Grid(), r;
+    function block(r0, title, rows, fmts) {
+      var rr = r0;
+      if (title) { g.put(rr, 1, title); rr++; }
+      var cols = unionCols(rows);
+      cols.forEach(function (c, ci) { g.put(rr, ci + 1, String(c)); });
+      rows.forEach(function (row) {
+        rr++;
+        cols.forEach(function (c, ci) { var v = row[c]; g.put(rr, ci + 1, (typeof v === 'number' && isNaN(v)) ? null : v, fmts && fmts[c]); });
+      });
+      return rr + 1;
+    }
+    if (diag.pairs.length) {
+      var pcols = unionCols(diag.pairs);
+      var pf = { 'Priority Jaccard (before)': '0.000', 'Priority Jaccard (after)': '0.000', 'Pen-rate correlation': '0.000' };
+      pcols.forEach(function (c, ci) { g.put(1, ci + 1, c); });
+      diag.pairs.forEach(function (p, ri) { pcols.forEach(function (c, ci) { g.put(ri + 2, ci + 1, p[c], pf[c]); }); });
+      r = g.maxRow() + 2;
+      g.put(r, 1, "Geos in EVERY segment's Priority tier");
+      g.put(r, 2, 'before: ' + comma(diag.in_all_priority_before));
+      g.put(r, 3, 'after: ' + comma(diag.in_all_priority_after));
+      r += 2;
+      r = block(r, 'Per segment', diag.per_segment, { 'Reach retained': '0.0%' });
+      var ov = diag.priority_overlap || {};
+      if (ov.pairs && ov.pairs.length) {
+        r += 1;
+        r = block(r, 'Priority ' + gk + ' overlap — actual counts', ov.pairs,
+                  { 'Share of A still shared': '0.0%', 'Share of B still shared': '0.0%' });
+        r += 1;
+        var n = ov.contested || 0;
+        g.put(r, 1, n ? (comma(n) + ' ' + gk + ' code(s) are still Priority for more than one segment' +
+                         (ov.contested_target ? ' — ' + comma(ov.contested_target) + ' target individuals in contested geos.' : '.'))
+                      : 'No ' + gk + ' code is Priority for more than one segment — the tiers are fully distinct.');
+        r += 1;
+      }
+    } else {
+      g.put(1, 1, 'Note'); g.put(2, 1, 'Single segment — no pairwise overlap to report.');
+      r = g.maxRow() + 2;
+    }
+    r += 1;
+    var meta = [['Run at', nowStamp()], ['Tool version', VERSION], ['Mode', opts.mode],
+      ['Qualification gate', SNORM_COL + ' >= ' + fmtG(opts.gate)], ['Tier sizing', String(opts.tier_sizes)],
+      ['Geography key', gk],
+      ['Common geographies', comma(diag.coverage.common) + ' (' + pctf(diag.coverage.coverage) + ' of smallest input)']];
+    segs.forEach(function (s) { meta.push(['Input — ' + s.label, s.source + ' — ' + comma(s.n) + ' rows']); });
+    if (excluded.length) meta.push(['Geographies excluded', comma(excluded.length) +
+      ' — not present in every input, so they could not be compared. Full list is in the JSON sidecar.']);
+    if (single) meta.push(['NOTE — single segment', 'Only one workbook was supplied, so there was no peer set to ' +
+      'differentiate against. Original tiers passed through unchanged.']);
+    if (diag.residual) meta.push(['Residualization', diag.residual.note]);
+    g.put(r, 1, 'Run details');
+    meta.forEach(function (m, i) { g.put(r + 1 + i, 1, m[0]); g.put(r + 1 + i, 2, m[1]); });
+    r += meta.length + 2;
+    var ov2 = diag.priority_overlap || {};
+    if (ov2.detail && ov2.detail.length) {
+      var f2 = {}; (ov2.segment_columns || []).forEach(function (c) { f2[c] = '0.0'; });
+      block(r, 'Contested ' + gk + ' codes — Priority in two or more segments', ov2.detail, f2);
+    }
+    var widths = [26, 26, 22, 22, 20];
+    for (var c = 6; c <= 16; c++) widths.push(c === ov2.claimed_by_col ? 46 : 24);
+    X.utils.book_append_sheet(wb, g.sheet(X, diag.pairs.length ? widths : [90]), safeSheetName('Overlap Summary', used));
+
+    var extra = ['Peer Mean Index', 'Relative Index', 'Qualified', 'Differentiated Tier', 'Differentiated Rank', 'Tier Change'];
+    var pct3 = '0.000%', nf = {};
+    nf[SNORM_COL] = '0.0'; nf[IDX_COL] = '0.0'; nf['Relative Index'] = '0.0'; nf['Peer Mean Index'] = '0.0';
+    nf[PEN_COL] = pct3; nf['State Avg Pen Rate'] = pct3;
+    segs.forEach(function (s) {
+      var rows = results[s.label];
+      var have = unionCols(rows.length ? [rows[0]] : [{}]);
+      var order = s.cols.filter(function (c) { return extra.indexOf(c) < 0; })
+                        .concat(extra.filter(function (c) { return have.indexOf(c) >= 0; }));
+      X.utils.book_append_sheet(wb, tableGrid(order, rows, nf).sheet(X), safeSheetName(s.label, used));
+    });
+    if (exclusive && exclusive.length) {
+      var ef = { 'Relative Index': '0.0' }; ef[SNORM_COL] = '0.0';
+      X.utils.book_append_sheet(wb, tableGrid(unionCols(exclusive), exclusive, ef).sheet(X, [12, 30, 18, 18, 40]),
+                                safeSheetName('Exclusive Assignment', used));
+    }
+    return wbBlob(X, wb);
+  }
+
+  function formatDiagnostics(diag) {
+    var L = [], cov = diag.coverage;
+    var pl = function (s, w) { return String(s).padEnd(w); }, pr = function (s, w) { return String(s).padStart(w); };
+    L.push('mode=' + diag.mode + '  gate=' + fmtG(diag.gate) + '  tier_sizes=' + diag.tier_sizes);
+    L.push('coverage: ' + comma(cov.common) + ' common of smallest ' + comma(cov.smallest_input) + ' (' + pctf(cov.coverage) + ')');
+    Object.keys(cov.per_input).forEach(function (l) {
+      L.push('  ' + pl(l, 30) + ' ' + pr(comma(cov.per_input[l]), 7) + ' rows  (' + comma(cov.dropped_per_input[l]) + ' dropped)');
+    });
+    if (diag.single_segment_fallback) {
+      L.push('SINGLE SEGMENT — differentiation skipped, original tiers passed through.');
+      return L.join('\n');
+    }
+    L.push('');
+    L.push(pl('segment', 30) + ' ' + pr('pri before', 11) + ' ' + pr('pri after', 10) + ' ' + pr('reach kept', 11) + ' ' + pr('mean S-N idx', 13));
+    diag.per_segment.forEach(function (p) {
+      var rr = p['Reach retained'] != null ? pctf(p['Reach retained']) : '—';
+      var mi = p['Mean State-Norm Index (after)'];
+      L.push(pl(p.Segment, 30) + ' ' + pr(comma(p['Priority ZIPs (before)']), 11) + ' ' +
+             pr(comma(p['Priority ZIPs (after)']), 10) + ' ' + pr(rr, 11) + ' ' + pr(mi != null ? mi.toFixed(1) : '—', 13));
+    });
+    L.push('');
+    L.push(pl('pair', 56) + ' ' + pr('jaccard before', 15) + ' ' + pr('after', 8));
+    diag.pairs.forEach(function (p) {
+      L.push(pl(p['Segment A'] + ' / ' + p['Segment B'], 56) + ' ' + pr(p['Priority Jaccard (before)'].toFixed(3), 15) +
+             ' ' + pr(p['Priority Jaccard (after)'].toFixed(3), 8));
+    });
+    L.push('\nmean pairwise Priority Jaccard: ' + diag.mean_jaccard_before.toFixed(3) + ' -> ' + diag.mean_jaccard_after.toFixed(3));
+    var ov = diag.priority_overlap || {};
+    if (ov.pairs && ov.pairs.length) {
+      L.push('');
+      L.push(pl('pair', 56) + ' ' + pr('shared before', 14) + ' ' + pr('shared after', 13) + ' ' + pr('de-duped', 10));
+      ov.pairs.forEach(function (p) {
+        L.push(pl(p['Segment A'] + ' / ' + p['Segment B'], 56) + ' ' + pr(comma(p['Shared ZIPs (before)']), 14) + ' ' +
+               pr(comma(p['Shared ZIPs (after)']), 13) + ' ' + pr(comma(p['ZIPs de-duplicated']), 10));
+      });
+      L.push('still Priority for 2+ segments:  ' + comma(ov.contested) + ' geographies' +
+             (ov.contested_target ? ' (' + comma(ov.contested_target) + ' target)' : ''));
+    }
+    L.push('geos in every Priority tier:    ' + comma(diag.in_all_priority_before) + ' -> ' + comma(diag.in_all_priority_after));
+    if (diag.residual) L.push('\n' + diag.residual.note);
+    if (diag.gate_sweep && diag.gate_sweep.length) {
+      L.push('');
+      L.push(pr('gate', 6) + ' ' + pr('mean reach', 11) + ' ' + pr('mean S-N idx', 13) + ' ' + pr('mean jaccard', 13));
+      diag.gate_sweep.forEach(function (r) {
+        var mr = r['Mean reach retained'], mi = r['Mean State-Norm Index'], mj = r['Mean pairwise Priority Jaccard'];
+        L.push(pr(r['Gate (State-Norm Index >=)'].toFixed(0), 6) + ' ' + pr(mr != null ? pctf(mr) : '-', 11) + ' ' +
+               pr(mi != null ? mi.toFixed(1) : '-', 13) + ' ' + pr(mj != null ? mj.toFixed(3) : '-', 13));
+      });
+    }
+    return L.join('\n');
+  }
+
+  var diffJobs = {}, diffOrder = [];
+  M.route('POST', '/us-geo/api/differentiate', async function (req) {
+    var form = req.form;
+    var files = form ? form.getAll('files').filter(function (f) { return f && f.name; }) : [];
+    if (!files.length) return M.json({ error: 'Upload at least one geo report (.xlsx) first.' }, 400);
+    var gate = Number(form.get('gate') || DEFAULT_GATE), minCov = Number(form.get('min_coverage') || DEFAULT_MIN_COVERAGE);
+    if (isNaN(gate) || isNaN(minCov)) return M.json({ error: 'Gate and minimum coverage must be numbers.' }, 400);
+    var labels = String(form.get('labels') || '').split('|').filter(function (x) { return x.trim(); });
+    var opts = { gate: gate, min_coverage: minCov, mode: String(form.get('mode') || 'relative').trim(),
+                 tier_sizes: String(form.get('tier_sizes') || 'original').trim(), labels: labels.length ? labels : null,
+                 sweep: ['0', 'false', 'off'].indexOf(String(form.get('sweep') == null ? '1' : form.get('sweep')).toLowerCase()) < 0 };
+    var out;
+    try { out = await runDifferentiation(files, opts); }
+    catch (e) {
+      if (e.notImpl) return M.json({ error: e.message, not_implemented: true }, 501);
+      if (e.spec) return M.json({ error: e.message }, 400);
+      console.error(e);
+      return M.json({ error: 'Differentiation failed: ' + (e.name || 'Error') + ': ' + e.message }, 500);
+    }
+    var job = Math.random().toString(16).slice(2, 14).padEnd(12, '0');
+    diffJobs[job] = { blob: out.blob, diag: out.diag };
+    diffOrder.push(job);
+    while (diffOrder.length > 4) delete diffJobs[diffOrder.shift()];
+    var diag = out.diag;
+    diag.job = job;
+    diag.log_text = formatDiagnostics(diag);
+    var payload = Object.assign({}, diag);
+    delete payload.excluded_geos;
+    if (payload.priority_overlap) {
+      var ov = Object.assign({}, payload.priority_overlap); delete ov.detail; payload.priority_overlap = ov;
+    }
+    return payload;
+  });
+
+  M.route('GET', '/us-geo/api/differentiate/download', function (req) {
+    var e = diffJobs[req.query.job || ''];
+    if (!e) return M.json({ error: 'That run has expired — run the differentiation again.' }, 404);
+    if (req.query.format === 'json')
+      return M.file(JSON.stringify(e.diag, null, 2), 'geo_differentiation_diagnostics.json', 'application/json');
+    return M.file(e.blob, 'Differentiated_Geo_' + today() + '.xlsx', XLSX_MIME);
+  });
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>US Geo Analysis – Audience Analytics Engine</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0d0d2b;--deep:#131447;--violet:#7c5ce8;--purple:#5b4fcf;
+  --lavender:#a78bfa;--teal:#2dd4bf;--sky:#60a5fa;--amber:#fbbf24;--red:#f87171;--green:#3fb950;
+  --card-bg:rgba(255,255,255,0.05);--card-border:rgba(180,160,255,0.28);
+  --text:#f0eeff;--text-sec:#cdc6ec;--muted:#9d95c9;
+  --input-bg:rgba(255,255,255,0.07);--input-border:rgba(180,160,255,0.30);
+}
+html,body{min-height:100vh;position:relative;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:var(--text);background:var(--navy);overflow-x:hidden}
+body::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 70% 55% at 8% 15%,rgba(91,79,207,0.28)0%,transparent 60%),radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12)0%,transparent 55%),radial-gradient(ellipse 30% 25% at 88% 8%,rgba(96,165,250,0.10)0%,transparent 60%),radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%);pointer-events:none;z-index:0}
+body::after{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(162,140,250,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(162,140,250,0.03) 1px,transparent 1px);background-size:52px 52px;pointer-events:none;z-index:0}
+.shell{position:relative;z-index:1}
+@keyframes pageIn{from{opacity:0}to{opacity:1}}
+body{animation:pageIn .35s ease both}
+body.leaving{opacity:0;transform:scale(.99);transition:opacity .2s ease,transform .2s ease}
+@keyframes riseIn{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+.card{animation:riseIn .45s ease both}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:0 44px;height:84px;background:rgba(13,13,43,0.70);backdrop-filter:blur(18px);border-bottom:1px solid rgba(180,160,255,0.12)}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.brand-dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7);animation:pdot 2.6s ease-in-out infinite;flex-shrink:0}
+@keyframes pdot{0%,100%{box-shadow:0 0 8px rgba(124,92,232,0.7)}50%{box-shadow:0 0 18px rgba(45,212,191,0.9)}}
+.brand-name{font-size:1.2rem;font-weight:700;color:#e8e0ff;letter-spacing:0.01em}
+.brand-sep{width:1px;height:24px;background:var(--card-border)}
+.brand-sub{font-size:0.8rem;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase}
+.back-link{display:flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--muted);text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--card-border);background:rgba(255,255,255,0.03);transition:all .2s}
+.back-link:hover{color:var(--lavender);border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.08)}
+.back-link svg{width:13px;height:13px;stroke:currentColor}
+
+.container{max-width:960px;margin:0 auto;padding:32px 24px 72px}
+.hero{padding:8px 0 26px}
+.hero .eyebrow{font-size:11px;color:var(--teal);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:10px}
+.hero h1{font-size:26px;font-weight:700;letter-spacing:-0.4px;margin-bottom:8px}
+.hero p{color:var(--muted);max-width:640px;font-size:14px;line-height:1.7}
+
+.sec-head{font-size:0.65rem;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:var(--lavender);margin:26px 0 12px;display:flex;align-items:center;gap:10px}
+.sec-head::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--card-border),transparent)}
+
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:14px;padding:22px 24px;margin-bottom:16px;backdrop-filter:blur(12px);position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,0.4),transparent)}
+
+label{font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:6px;letter-spacing:0.03em}
+input[type=text]{width:100%;padding:11px 13px;border:1px solid var(--input-border);border-radius:9px;font-size:13px;font-family:inherit;background:var(--input-bg);color:var(--text);transition:border-color .15s,box-shadow .15s}
+input[type=text]:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+
+.dropzone{border:1.5px dashed var(--input-border);border-radius:11px;padding:38px 26px;text-align:center;cursor:pointer;color:var(--muted);font-size:14px;transition:all .2s;background:var(--input-bg)}
+.dropzone:hover,.dropzone.drag{border-color:rgba(167,139,250,0.7);color:var(--text-sec);background:rgba(124,92,232,0.08)}
+.dropzone.has-file{border-color:var(--teal);color:var(--teal)}
+.hidden{display:none}
+
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;font-size:13.5px;font-weight:600;border-radius:9px;cursor:pointer;border:none;font-family:inherit;transition:all .18s;min-height:44px}
+.btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+.btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:0.5;cursor:default;transform:none;box-shadow:none}
+.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}
+
+.status{padding:12px 16px;border-radius:9px;font-size:13px;margin-top:14px;display:none;border:1px solid transparent}
+.status.info{background:rgba(96,165,250,0.10);color:var(--sky);border-color:rgba(96,165,250,0.25)}
+.status.ok{background:rgba(45,212,191,0.10);color:var(--teal);border-color:rgba(45,212,191,0.25)}
+.status.err{background:rgba(248,113,113,0.10);color:var(--red);border-color:rgba(248,113,113,0.25)}
+.spinner{display:inline-block;width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px}
+@media(max-width:640px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+.stat{background:rgba(255,255,255,0.04);border:1px solid var(--card-border);border-radius:10px;padding:14px;text-align:center}
+.stat .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .l{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px}
+.tier-row{display:flex;justify-content:space-between;font-size:12.5px;padding:6px 0;border-bottom:1px solid rgba(180,160,255,0.10)}
+.tier-row:last-child{border-bottom:none}
+.tier-dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:8px}
+.info-box{background:rgba(96,165,250,0.07);border:1px solid rgba(96,165,250,0.22);border-radius:8px;padding:12px 16px;font-size:12px;color:var(--sky);line-height:1.7;margin-bottom:16px}
+
+.page-footer{text-align:center;padding:20px;font-size:0.68rem;color:var(--muted);border-top:1px solid rgba(162,140,250,0.07);letter-spacing:0.04em;position:relative;z-index:1}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<div class="container">
+
+  <div class="sec-head">Upload export</div>
+  <div class="card">
+    <div class="dropzone" id="dz" onclick="document.getElementById('file').click()">
+      Click or drop the audience platform export (.xlsx) here
+    </div>
+    <div class="hint" style="margin-top:12px">No export handy? Press <b>Run sample</b> above.</div>
+    <input type="file" id="file" accept=".xlsx" class="hidden">
+    <div id="fileChip" style="margin-top:10px"></div>
+
+    <div style="margin-top:16px">
+      <label>Report title suffix <span style="font-weight:400;color:var(--muted)">(shown at the top of the Tier Summary tab)</span></label>
+      <input type="text" id="filterLabel" value="1PD (No Age Filter)" placeholder="e.g. 1PD (No Age Filter)">
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-primary" id="runBtn" onclick="runTransform()" disabled>Generate report</button>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div id="resultsCard" class="card hidden">
+    <div class="sec-head" style="margin-top:0">Run summary</div>
+    <div class="stat-grid">
+      <div class="stat"><div class="v" id="stZips">–</div><div class="l">ZIPs reported</div></div>
+      <div class="stat"><div class="v" id="stDropped">–</div><div class="l">Dropped (zero target)</div></div>
+      <div class="stat"><div class="v" id="stTarget">–</div><div class="l">Total target (IN)</div></div>
+    </div>
+    <div style="margin-top:16px" id="tierBreakdown"></div>
+  </div>
+
+  <!-- ── Audience differentiation ─────────────────────────────────────── -->
+  <div class="card">
+    <div class="sec-head" style="margin-top:0">Differentiate multiple audiences</div>
+    <p class="hint" style="margin-top:-6px">Compare two or more finished reports and remove the overlap between segments.</p>
+
+    <div class="field" style="margin-top:14px">
+      <label>Geo reports (two or more .xlsx)</label>
+      <input type="file" id="dFiles" accept=".xlsx" multiple>
+      <div class="hint">Select all files at once.</div>
+      <div class="hint"><a href="#" id="dSample" style="color:var(--teal)">Use 3 sample geo reports</a></div>
+      <div class="hint" id="dFilesInfo"></div>
+    </div>
+
+    <div class="grid-3" style="margin-top:12px">
+      <div class="field"><label>Mode</label>
+        <select id="dMode"></select>
+        <div class="hint" id="dModeDesc"></div></div>
+      <div class="field"><label>Qualification gate (State-Norm Index &ge;)</label>
+        <input type="number" id="dGate" value="120" min="0" max="400" step="5">
+        <div class="hint">The absolute-quality floor. Distinctiveness only orders what clears it.</div></div>
+      <div class="field"><label>Tier sizes</label>
+        <select id="dTierSizes">
+          <option value="original">Original counts &mdash; reach stays comparable</option>
+          <option value="percentile">Same proportions, applied to the qualified pool</option>
+        </select></div>
+    </div>
+
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:14px">
+      <button class="btn btn-primary" id="dRun" disabled>Differentiate</button>
+      <button class="btn" id="dXlsx" style="display:none">&#8681; Combined workbook</button>
+      <button class="btn" id="dJson" style="display:none">&#8681; Diagnostics JSON</button>
+      <span class="hint" id="dStatus"></span>
+    </div>
+
+    <div id="dResults" class="hidden" style="margin-top:18px">
+      <div class="stat-grid">
+        <div class="stat"><div class="v" id="dJacBefore">&ndash;</div><div class="l">Mean Priority overlap before</div></div>
+        <div class="stat"><div class="v" id="dJacAfter">&ndash;</div><div class="l">&hellip;and after</div></div>
+        <div class="stat"><div class="v" id="dAllPri">&ndash;</div><div class="l">In every Priority tier (before &rarr; after)</div></div>
+        <div class="stat"><div class="v" id="dContested">&ndash;</div><div class="l">Still Priority for 2+ audiences</div></div>
+      </div>
+      <div style="overflow:auto;margin-top:16px">
+        <table class="tbl" id="dPerSeg"></table>
+      </div>
+      <div style="overflow:auto;margin-top:16px">
+        <table class="tbl" id="dOverlap"></table>
+      </div>
+      <div class="hint" id="dOverlapNote" style="margin-top:6px"></div>
+      <div style="overflow:auto;margin-top:16px">
+        <table class="tbl" id="dSweep"></table>
+      </div>
+      <pre id="dLog" style="margin-top:16px;max-height:260px;overflow:auto;font-size:11px;
+        line-height:1.6;background:rgba(0,0,0,0.22);padding:12px;border-radius:8px"></pre>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const fmt=n=>Number(n).toLocaleString('en-US');
+let _file=null;
+
+const TIER_COLORS={Priority:'#2dd4bf',Efficiency:'#7fe3c8',Scale:'#a78bfa',Marginal:'#fbbf24',Suppress:'#f87171'};
+
+$('file').addEventListener('change', e=>setFile(e.target.files[0]));
+const dz=$('dz');
+['dragover','dragenter'].forEach(ev=>dz.addEventListener(ev, e=>{e.preventDefault(); dz.classList.add('drag');}));
+['dragleave','drop'].forEach(ev=>dz.addEventListener(ev, e=>{e.preventDefault(); dz.classList.remove('drag');}));
+dz.addEventListener('drop', e=>setFile(e.dataTransfer.files[0]));
+
+function setFile(f){
+  if(!f) return;
+  if(!/\.xlsx$/i.test(f.name)){ showStatus('Please choose an .xlsx file.', 'err'); return; }
+  _file=f;
+  dz.classList.add('has-file');
+  dz.textContent='📄 '+f.name;
+  $('fileChip').innerHTML='';
+  $('runBtn').disabled=false;
+  $('resultsCard').classList.add('hidden');
+  hideStatus();
+}
+
+function showStatus(msg, cls){
+  const s=$('status'); s.className='status '+cls; s.innerHTML=msg; s.style.display='block';
+}
+function hideStatus(){ $('status').style.display='none'; }
+
+async function runTransform(){
+  if(!_file) return;
+  const btn=$('runBtn');
+  btn.disabled=true;
+  showStatus('<span class="spinner"></span> Building the report… this can take a little while for large national exports.', 'info');
+  const fd=new FormData();
+  fd.append('file', _file);
+  fd.append('filter_label', $('filterLabel').value.trim() || '1PD (No Age Filter)');
+  try{
+    const r=await fetch('/us-geo/api/transform', {method:'POST', body:fd});
+    if(!r.ok){
+      const j=await r.json().catch(()=>({error:'Server error '+r.status}));
+      throw new Error(j.error||'Server error');
+    }
+    const blob=await r.blob();
+    const cd=r.headers.get('Content-Disposition')||'';
+    const fname=(cd.match(/filename="?([^";]+)/)||[])[1]||'US_Geo_Report.xlsx';
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=fname;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    showStatus('✓ Report downloaded as "'+fname+'".', 'ok');
+    await fetchPreviewStats();
+  }catch(e){
+    showStatus('✗ '+e.message, 'err');
+  }finally{
+    btn.disabled=false;
+  }
+}
+
+async function fetchPreviewStats(){
+  const fd=new FormData();
+  fd.append('file', _file);
+  fd.append('filter_label', $('filterLabel').value.trim() || '1PD (No Age Filter)');
+  try{
+    const r=await fetch('/us-geo/api/preview', {method:'POST', body:fd});
+    const j=await r.json();
+    if(!r.ok) return;
+    $('stZips').textContent=fmt(j.zips_reported);
+    $('stDropped').textContent=fmt(j.zips_dropped_zero_target);
+    $('stTarget').textContent=fmt(j.total_target);
+    const total=j.zips_reported||1;
+    $('tierBreakdown').innerHTML=Object.entries(j.tiers).map(([t,n])=>
+      `<div class="tier-row"><span><span class="tier-dot" style="background:${TIER_COLORS[t]}"></span>${t}</span>
+       <span>${fmt(n)} ZIPs &nbsp;·&nbsp; ${(n/total*100).toFixed(1)}%</span></div>`).join('');
+    $('resultsCard').classList.remove('hidden');
+  }catch(e){ /* preview is best-effort; download already succeeded */ }
+}
+
+/* ── Audience differentiation ──────────────────────────────────────────── */
+let _dFiles = [], _dInfo = null, _dJob = null;
+
+(async function initDiff(){
+  try{
+    const r = await fetch('/us-geo/api/differentiate/info');
+    _dInfo = await r.json();
+    $('dMode').innerHTML = _dInfo.modes.map(m =>
+      `<option value="${m.id}">${m.name}</option>`).join('');
+    $('dGate').value = _dInfo.default_gate;
+    syncModeDesc();
+  }catch(e){ $('dStatus').textContent = 'Could not load options: ' + e.message; }
+})();
+
+function syncModeDesc(){
+  const m = (_dInfo?.modes || []).find(x => x.id === $('dMode').value);
+  $('dModeDesc').textContent = m ? m.desc : '';
+}
+$('dMode').addEventListener('change', syncModeDesc);
+
+$('dFiles').addEventListener('change', e => setDFiles([...e.target.files]));
+$('dSample').addEventListener('click', async e => {
+  e.preventDefault();
+  $('dStatus').textContent = 'Building 3 sample geo reports…';
+  try{
+    const files = [];
+    for(let i = 1; i <= 3; i++){
+      const r = await fetch('/us-geo/api/demo-sample-report?seg=' + i);
+      if(!r.ok) throw new Error('Could not build sample report ' + i);
+      const cd = r.headers.get('Content-Disposition') || '';
+      const name = (cd.match(/filename="?([^";]+)/) || [])[1] || ('Sample_' + i + '_ZIP.xlsx');
+      files.push(new File([await r.blob()], name, {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
+    }
+    $('dStatus').textContent = '';
+    setDFiles(files);
+  }catch(err){ $('dStatus').innerHTML = `<b style="color:var(--red)">${err.message}</b>`; }
+});
+function setDFiles(list){
+  _dFiles = list;
+  const n = _dFiles.length;
+  $('dFilesInfo').innerHTML = n
+    ? `${n} file${n===1?'':'s'}: ${_dFiles.map(f=>f.name).join(', ')}` +
+      (n === 1 ? ` <b style="color:var(--amber)">— one file has no peer set to differentiate
+         against. It will run, pass the original tiers through unchanged, and say so.</b>` : '')
+    : '';
+  $('dRun').disabled = n === 0;
+  $('dResults').classList.add('hidden');
+  $('dXlsx').style.display = $('dJson').style.display = 'none';
+}
+
+$('dRun').addEventListener('click', async () => {
+  if(!_dFiles.length) return;
+  const btn = $('dRun');
+  btn.disabled = true;
+  // A live elapsed counter and a size-based estimate. Without these the status
+  // line sat unchanged for the whole run, which is indistinguishable from hung —
+  // and on large files this legitimately takes tens of seconds.
+  const rows = _dFiles.reduce((a,f) => a + f.size, 0) / 1e6;
+  const est = Math.max(5, Math.round(rows * 6));
+  const t0 = Date.now();
+  const tick = setInterval(() => {
+    const s = Math.round((Date.now() - t0) / 1000);
+    $('dStatus').textContent =
+      `Reading ${_dFiles.length} workbook(s) and differentiating… ${s}s elapsed` +
+      (s < est * 2 ? ` (roughly ${est}s expected for ${rows.toFixed(1)} MB)`
+                   : ' — longer than expected, still working');
+  }, 1000);
+  $('dStatus').textContent = `Reading ${_dFiles.length} workbook(s) and differentiating… ` +
+    `roughly ${est}s expected for ${rows.toFixed(1)} MB`;
+  $('dXlsx').style.display = $('dJson').style.display = 'none';
+  const fd = new FormData();
+  _dFiles.forEach(f => fd.append('files', f));
+  fd.append('mode', $('dMode').value);
+  fd.append('gate', $('dGate').value);
+  fd.append('tier_sizes', $('dTierSizes').value);
+  try{
+    const r = await fetch('/us-geo/api/differentiate', {method:'POST', body:fd});
+    const txt = await r.text();
+    let d;
+    try{ d = JSON.parse(txt); }
+    catch(_){ throw new Error(`HTTP ${r.status} — ${txt.replace(/<[^>]*>/g,' ').slice(0,200)}`); }
+    if(!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+    _dJob = d.job;
+    renderDiff(d);
+    $('dStatus').textContent = `Done in ${d.elapsed_secs}s.`;
+    $('dXlsx').style.display = $('dJson').style.display = '';
+  }catch(e){
+    $('dStatus').innerHTML = `<b style="color:var(--red)">${e.message}</b>`;
+  }finally{ clearInterval(tick); btn.disabled = false; }
+});
+
+$('dXlsx').addEventListener('click', () => {
+  if(_dJob) Mock.downloadFrom('/us-geo/api/differentiate/download?job=' + _dJob);
+});
+$('dJson').addEventListener('click', () => {
+  if(_dJob) Mock.downloadFrom('/us-geo/api/differentiate/download?format=json&job=' + _dJob);
+});
+
+function renderDiff(d){
+  const pct = v => v == null ? '–' : (v*100).toFixed(1) + '%';
+  $('dJacBefore').textContent = d.mean_jaccard_before == null ? '–' : d.mean_jaccard_before.toFixed(3);
+  $('dJacAfter').textContent  = d.mean_jaccard_after  == null ? '–' : d.mean_jaccard_after.toFixed(3);
+  $('dAllPri').textContent    = `${fmt(d.in_all_priority_before)} → ${fmt(d.in_all_priority_after)}`;
+
+  $('dPerSeg').innerHTML =
+    '<thead><tr><th>Segment</th><th>Priority before</th><th>Priority after</th>' +
+    '<th>Reach retained</th><th>Mean State-Norm Index</th></tr></thead><tbody>' +
+    d.per_segment.map(p => `<tr><td><b>${p.Segment}</b></td>
+      <td>${fmt(p['Priority ZIPs (before)'])}</td>
+      <td>${fmt(p['Priority ZIPs (after)'])}</td>
+      <td>${pct(p['Reach retained'])}</td>
+      <td>${p['Mean State-Norm Index (after)'] ?? '–'}</td></tr>`).join('') + '</tbody>';
+
+  const ov = d.priority_overlap || {};
+  $('dContested').textContent = ov.contested == null ? '–' : fmt(ov.contested);
+  if((ov.pairs || []).length){
+    $('dOverlap').innerHTML =
+      '<thead><tr><th>Audience A</th><th>Audience B</th><th>Shared ZIPs before</th>' +
+      '<th>Shared ZIPs after</th><th>De-duplicated</th><th>% of A still shared</th></tr></thead><tbody>' +
+      ov.pairs.map(p => `<tr><td><b>${p['Segment A']}</b></td><td><b>${p['Segment B']}</b></td>
+        <td>${fmt(p['Shared ZIPs (before)'])}</td>
+        <td>${fmt(p['Shared ZIPs (after)'])}</td>
+        <td>${fmt(p['ZIPs de-duplicated'])}</td>
+        <td>${pct(p['Share of A still shared'])}</td></tr>`).join('') + '</tbody>';
+    $('dOverlapNote').textContent = ov.contested
+      ? `${fmt(ov.contested)} ZIP code(s) are still Priority for more than one audience`
+        + (ov.contested_target ? ` (${fmt(ov.contested_target)} target individuals).` : '.')
+        + ' Every one is listed on the Overlap Summary tab of the workbook.'
+      : 'No ZIP code is Priority for more than one audience — the tiers are fully distinct.';
+  } else { $('dOverlap').innerHTML = ''; $('dOverlapNote').textContent = ''; }
+
+  if((d.gate_sweep || []).length){
+    $('dSweep').innerHTML =
+      '<thead><tr><th>Gate</th><th>Qualified pool</th><th>Priority slots</th>' +
+      '<th>Mean reach</th><th>Mean overlap</th><th></th></tr></thead><tbody>' +
+      d.gate_sweep.map(r => {
+        const warn = r.Warning ? ` style="color:var(--amber)"` : '';
+        return `<tr${warn}><td>${r['Gate (State-Norm Index >=)']}</td>
+          <td>${fmt(r['Qualified geos (min across segments)'])}</td>
+          <td>${fmt(r['Priority slots to fill (max)'])}</td>
+          <td>${pct(r['Mean reach retained'])}</td>
+          <td>${r['Mean pairwise Priority Jaccard'] == null ? '–' : r['Mean pairwise Priority Jaccard'].toFixed(3)}</td>
+          <td>${r.Warning || ''}</td></tr>`;
+      }).join('') + '</tbody>';
+  } else { $('dSweep').innerHTML = ''; }
+
+  $('dLog').textContent = d.log_text || '';
+  $('dResults').classList.remove('hidden');
+}
+
+</script>
+</body>
+</html>

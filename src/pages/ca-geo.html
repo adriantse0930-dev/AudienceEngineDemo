@@ -1,0 +1,2059 @@
+<script data-demo="ca_geo">
+// CA Geo Analysis (FSA level) — demo back-end.
+// Mirrors tools/ca_geo.py: geo lookup, FSA filtering, the multi-tab index
+// workbook, the per-trait choropleth data and the POI search — all on
+// generated data for the 100 synthetic Ontario FSAs in Mock.fsaList.
+(function () {
+  'use strict';
+
+  // ── Geography ──────────────────────────────────────────────────────────────
+  var FSA_LETTER_PROVINCE = {
+    A: 'NL', B: 'NS', C: 'PE', E: 'NB', G: 'QC', H: 'QC', J: 'QC',
+    K: 'ON', L: 'ON', M: 'ON', N: 'ON', P: 'ON', R: 'MB', S: 'SK', T: 'AB', V: 'BC',
+    X: 'Northwest T or Nunavut', Y: 'YK'
+  };
+  function fsaProvince(fsa) { return FSA_LETTER_PROVINCE[String(fsa).charAt(0).toUpperCase()] || ''; }
+
+  var GEO = {};       // FSA -> {city, province, region, pop, hh}
+  Mock.fsaList.forEach(function (f) {
+    GEO[f.FSA] = { city: f.CITY.toUpperCase(), province: f.PROVINCE, region: f.REGION,
+                   pop: f.POPULATION, hh: f.HOUSEHOLDS, lat: f.LAT, lon: f.LON };
+  });
+  var GEOM = {};      // FSA -> geometry
+  (Mock.fsaGeoJSON.features || []).forEach(function (ft) {
+    GEOM[String(ft.properties.FSA).toUpperCase()] = ft.geometry;
+  });
+  var ALL_FSAS = Object.keys(GEO).sort();
+  var CITIES = Object.keys(ALL_FSAS.reduce(function (o, k) { o[GEO[k].city] = 1; return o; }, {})).sort();
+  var PROVINCES = Object.keys(ALL_FSAS.reduce(function (o, k) { o[GEO[k].province] = 1; return o; }, {})).sort();
+
+  // ── Latent FSA profile (keeps the generated traits coherent on the map) ───
+  var fr = Mock.rng('ca-geo-latent-v1');
+  var CITY_TILT = {   // [affluence, urbanity, youth, family]
+    TORONTO: [0.2, 1.2, 0.6, -0.4], MISSISSAUGA: [0.2, 0.5, 0.1, 0.6], BRAMPTON: [-0.1, 0.3, 0.3, 1.0],
+    MARKHAM: [0.8, 0.3, -0.1, 0.7], OAKVILLE: [1.3, -0.1, -0.2, 0.6], OTTAWA: [0.5, 0.6, 0.2, 0.1],
+    HAMILTON: [-0.3, 0.2, 0.0, 0.1], KITCHENER: [0.0, 0.1, 0.5, 0.3], LONDON: [-0.2, 0.0, 0.4, 0.0],
+    WINDSOR: [-0.6, -0.1, -0.1, 0.1], KINGSTON: [-0.1, -0.3, 0.5, -0.3], SUDBURY: [-0.5, -0.8, -0.5, 0.0],
+    'THUNDER BAY': [-0.6, -0.9, -0.7, -0.1]
+  };
+  var LATENT = {};
+  ALL_FSAS.forEach(function (k) {
+    var t = CITY_TILT[GEO[k].city] || [0, 0, 0, 0];
+    LATENT[k] = {
+      aff: t[0] + Mock.gauss(0, 0.6, fr), urb: t[1] + Mock.gauss(0, 0.45, fr),
+      yng: t[2] + Mock.gauss(0, 0.55, fr), fam: t[3] + Mock.gauss(0, 0.5, fr)
+    };
+  });
+
+  // ── Dataset definitions ────────────────────────────────────────────────────
+  // Trait: [code, description, category, rate, loadings{aff,urb,yng,fam}]
+  // rate is the share of the base (count traits) or $ per base unit (spend/wealth).
+  // Category '' = none in the taxonomy (derived from the description, like the
+  // original does for variables with a blank CATEGORY).
+  var DATASETS = {
+    Demographics: {
+      label: 'Demographic stats', base: 'Total Population', baseOf: 'pop', useTaxonomy: false, kind: 'count',
+      traits: [
+        ['Total Households', '', '', 0, null, 'hh'],
+        ['Population Aged 0 to 14', '', '', 0.16, { yng: 0.3, fam: 0.6 }],
+        ['Population Aged 15 to 24', '', '', 0.12, { yng: 0.5 }],
+        ['Population Aged 25 to 34', '', '', 0.14, { yng: 0.8, urb: 0.4 }],
+        ['Population Aged 35 to 44', '', '', 0.13, { fam: 0.5 }],
+        ['Population Aged 45 to 54', '', '', 0.13, { aff: 0.2 }],
+        ['Population Aged 55 to 64', '', '', 0.13, { yng: -0.5 }],
+        ['Population Aged 65 and Over', '', '', 0.19, { yng: -0.9, urb: -0.2 }],
+        ['Households with 1 Person', '', '', 0.11, { urb: 0.6, fam: -0.6 }],
+        ['Households with 2 Persons', '', '', 0.12, {}],
+        ['Households with 3 or More Persons', '', '', 0.14, { fam: 0.7 }],
+        ['Households Income Under $60,000', '', '', 0.15, { aff: -0.8 }],
+        ['Households Income $60,000 to $124,999', '', '', 0.14, { aff: 0.1 }],
+        ['Households Income $125,000 and Over', '', '', 0.12, { aff: 1.0 }],
+        ['University Degree Holders', '', '', 0.24, { aff: 0.7, urb: 0.4 }],
+        ['Visible Minority Population', '', '', 0.30, { urb: 0.8 }],
+        ['Immigrant Population', '', '', 0.28, { urb: 0.7 }],
+        ['Renter Households', '', '', 0.12, { urb: 0.9, aff: -0.4 }],
+        ['Owner Households', '', '', 0.25, { urb: -0.5, aff: 0.5 }],
+        // Non-summable — present in the table, excluded from indexing (NONSUMMABLE)
+        ['Median Age', '', '', 0, null, 'medianAge'],
+        ['Average Household Income', '', '', 0, null, 'avgIncome']
+      ]
+    },
+    HouseholdSpend: {
+      label: 'Household Spend', base: 'HSBASHHD', baseOf: 'hh', useTaxonomy: true, kind: 'spend',
+      baseDesc: 'Basics - Total households', baseCat: 'Basics',
+      traits: [
+        ['HSSH001', 'Shelter - Rent', 'Shelter', 9500, { urb: 0.8, aff: -0.3 }],
+        ['HSSH002', 'Shelter - Mortgage payments', 'Shelter', 11000, { aff: 0.6, urb: -0.3 }],
+        ['HSSH010', 'Shelter - Utilities', 'Shelter', 3200, { urb: -0.3 }],
+        ['HSTR001', 'Transportation - Vehicle purchases', 'Transportation', 6200, { urb: -0.6, aff: 0.4 }],
+        ['HSTR010', 'Transportation - Public transit', 'Transportation', 900, { urb: 1.0 }],
+        ['HSTR020', 'Transportation - Gasoline & fuel', 'Transportation', 3100, { urb: -0.7 }],
+        ['HSRE001', 'Recreation - Sports & athletic equipment', 'Recreation', 520, { yng: 0.4, aff: 0.4 }],
+        ['HSRE010', 'Recreation - Home entertainment equipment', 'Recreation', 780, { yng: 0.3 }],
+        ['HSRE020', 'Recreation - Travel tours & packages', 'Recreation', 1600, { aff: 0.9, yng: -0.2 }],
+        ['HSCL001', "Clothing - Women's apparel", 'Clothing', 1300, { aff: 0.4 }],
+        ['HSCL010', "Clothing - Children's apparel", 'Clothing', 420, { fam: 1.0 }],
+        ['HSHO001', 'Household operation - Childcare', 'Household Operation', 1100, { fam: 1.1 }],
+        ['HSHO010', 'Household operation - Pet food & care', 'Household Operation', 820, { urb: -0.4 }],
+        ['HSHO020', 'Household operation - Home internet', 'Household Operation', 1050, { yng: 0.3 }],
+        ['HSPC001', 'Personal care - Cosmetics & fragrances', 'Personal Care', 390, { yng: 0.3 }],
+        ['HSED001', 'Education - Tuition fees', 'Education', 1400, { yng: 0.6, aff: 0.3 }]
+      ]
+    },
+    FoodSpend: {
+      label: 'Food Spend', base: 'FSBASHHD', baseOf: 'hh', useTaxonomy: true, kind: 'spend',
+      baseDesc: 'Basics - Total households', baseCat: 'Basics',
+      traits: [
+        ['FSGR001', 'Food from stores - Fresh vegetables', 'Food from Stores', 900, {}],
+        ['FSGR002', 'Food from stores - Fresh fruit', 'Food from Stores', 820, { aff: 0.2 }],
+        ['FSGR010', 'Food from stores - Meat', 'Food from Stores', 1500, { urb: -0.2, fam: 0.3 }],
+        ['FSGR020', 'Food from stores - Bakery products', 'Food from Stores', 540, {}],
+        ['FSGR030', 'Food from stores - Dairy & eggs', 'Food from Stores', 1100, { fam: 0.4 }],
+        ['FSGR040', 'Food from stores - Frozen prepared meals', 'Food from Stores', 380, { yng: 0.4 }],
+        ['FSGR050', 'Food from stores - Snacks & confectionery', 'Food from Stores', 460, { fam: 0.5 }],
+        ['FSGR060', 'Food from stores - Non-alcoholic beverages', 'Food from Stores', 520, {}],
+        ['FSRS001', 'Restaurants - Table-service dining', 'Restaurants', 1500, { aff: 0.7, urb: 0.5 }],
+        ['FSRS010', 'Restaurants - Fast food & take-out', 'Restaurants', 1300, { yng: 0.7 }],
+        ['FSRS020', 'Restaurants - Coffee shops & cafés', 'Restaurants', 350, { urb: 0.8, yng: 0.4 }],
+        ['FSRS030', 'Restaurants - Meal delivery apps', 'Restaurants', 610, { urb: 0.9, yng: 0.8 }],
+        ['FSAL001', 'Alcohol - Beer from stores', 'Alcohol', 620, { urb: -0.3 }],
+        ['FSAL010', 'Alcohol - Wine from stores', 'Alcohol', 700, { aff: 0.7 }]
+      ]
+    },
+    MediaHabits: {
+      label: 'Media Habits', base: 'MHBAS18P', baseOf: 'adults', useTaxonomy: true, kind: 'count',
+      baseDesc: 'Basics - Total population 18+', baseCat: 'Basics',
+      traits: [
+        ['MHSM001', 'Social media - Uses social media daily', 'Social Media', 0.72, { yng: 0.7 }],
+        ['MHSM010', 'Social media - Posts short videos weekly', 'Social Media', 0.28, { yng: 1.1 }],
+        ['MHSM020', 'Social media - Follows brands', 'Social Media', 0.41, { yng: 0.6 }],
+        ['MHSM030', 'Social media - Uses professional networking sites', 'Social Media', 0.24, { aff: 0.6, urb: 0.5 }],
+        ['MHSV001', 'Streaming - Subscribes to 3+ video services', 'Streaming', 0.33, { yng: 0.6, aff: 0.3 }],
+        ['MHSV010', 'Streaming - Listens to podcasts weekly', 'Streaming', 0.31, { yng: 0.6, urb: 0.4 }],
+        ['MHSV020', 'Streaming - Paid music streaming subscriber', 'Streaming', 0.45, { yng: 0.8 }],
+        ['MHTV001', 'Traditional media - Watches live TV daily', 'Traditional Media', 0.48, { yng: -0.9 }],
+        ['MHTV010', 'Traditional media - Reads a printed newspaper weekly', 'Traditional Media', 0.18, { yng: -1.0, urb: -0.3 }],
+        ['MHTV020', 'Traditional media - Listens to AM/FM radio daily', 'Traditional Media', 0.44, { yng: -0.5, urb: -0.4 }],
+        ['MHMB001', 'Mobile - Shops on a smartphone monthly', 'Mobile', 0.52, { yng: 0.6 }],
+        ['MHMB010', 'Mobile - Uses a mobile banking app', 'Mobile', 0.63, { yng: 0.5, aff: 0.2 }],
+        ['MHMB020', 'Mobile - Pays with a mobile wallet in-store', 'Mobile', 0.34, { yng: 0.7, urb: 0.5 }],
+        ['MHMB030', 'Mobile - Plays mobile games daily', 'Mobile', 0.29, { yng: 0.6, aff: -0.3 }]
+      ]
+    },
+    FinancialHabits: {
+      label: 'Financial Habits', base: 'FNBASHHD', baseOf: 'hh', useTaxonomy: true, kind: 'count',
+      baseDesc: 'Basics - Total households', baseCat: 'Basics',
+      traits: [
+        ['FNBK001', 'Banking - Has a chequing account', '', 0.96, {}],
+        ['FNBK010', 'Banking - Uses an online-only bank', '', 0.19, { yng: 0.8, urb: 0.4 }],
+        ['FNBK020', 'Banking - Switched banks in the past year', '', 0.07, { yng: 0.6 }],
+        ['FNCC001', 'Credit Cards - Holds a premium travel card', '', 0.22, { aff: 1.0 }],
+        ['FNCC010', 'Credit Cards - Carries a monthly balance', '', 0.31, { aff: -0.6 }],
+        ['FNCC020', 'Credit Cards - Holds 3 or more cards', '', 0.27, { aff: 0.5 }],
+        ['FNIN001', 'Investments - Holds a TFSA', '', 0.58, { aff: 0.5 }],
+        ['FNIN010', 'Investments - Holds an RRSP', '', 0.54, { aff: 0.6, yng: -0.3 }],
+        ['FNIN020', 'Investments - Uses a robo-advisor', '', 0.09, { yng: 0.8, aff: 0.3 }],
+        ['FNIN030', 'Investments - Owns cryptocurrency', '', 0.08, { yng: 1.0 }],
+        ['FNIS001', 'Insurance - Has life insurance', '', 0.49, { fam: 0.6, aff: 0.3 }],
+        ['FNIS010', 'Insurance - Bundles home & auto policies', '', 0.33, { urb: -0.6 }],
+        ['FNLN001', 'Loans - Has a home equity line of credit', '', 0.16, { aff: 0.5, urb: -0.2 }],
+        ['FNLN010', 'Loans - Has a car loan or lease', '', 0.34, { urb: -0.6, fam: 0.3 }],
+        ['FNLN020', 'Loans - Has a student loan', '', 0.12, { yng: 1.0 }]
+      ]
+    },
+    WealthProfile: {
+      label: 'Wealth Profile', base: 'WSHHDTOT', baseOf: 'hh', useTaxonomy: true, kind: 'spend',
+      baseDesc: 'Basics - Total households', baseCat: 'Basics',
+      traits: [
+        ['WSLIQ001', 'Liquid assets - Savings deposits', 'Liquid Assets', 28000, { aff: 1.0, yng: -0.4 }],
+        ['WSLIQ010', 'Liquid assets - Chequing deposits', 'Liquid Assets', 9000, { aff: 0.6 }],
+        ['WSINV001', 'Investments - Stocks', 'Investments', 42000, { aff: 1.3 }],
+        ['WSINV010', 'Investments - Mutual funds & ETFs', 'Investments', 55000, { aff: 1.1 }],
+        ['WSINV020', 'Investments - Bonds & GICs', 'Investments', 18000, { aff: 0.8, yng: -0.6 }],
+        ['WSRET001', 'Retirement - RRSP holdings', 'Retirement Savings', 90000, { aff: 1.0, yng: -0.3 }],
+        ['WSRET010', 'Retirement - Employer pension value', 'Retirement Savings', 120000, { aff: 0.6, yng: -0.4 }],
+        ['WSRET020', 'Retirement - TFSA holdings', 'Retirement Savings', 38000, { aff: 0.8 }],
+        ['WSRE001', 'Real estate - Principal residence value', 'Real Estate', 780000, { aff: 1.0, urb: 0.2 }],
+        ['WSRE010', 'Real estate - Other property value', 'Real Estate', 150000, { aff: 1.1, urb: -0.2 }],
+        ['WSDBT001', 'Debt - Mortgage balance', 'Debt', 240000, { aff: 0.4, yng: 0.3 }],
+        ['WSDBT010', 'Debt - Consumer credit balance', 'Debt', 21000, { aff: -0.2, yng: 0.3 }],
+        ['WSNW001', 'Net worth - Total household net worth', 'Net Worth', 1100000, { aff: 1.2, yng: -0.4 }]
+      ]
+    }
+  };
+  var DATASET_ORDER = ['Demographics', 'HouseholdSpend', 'FoodSpend', 'MediaHabits', 'FinancialHabits', 'WealthProfile'];
+  var NONSUMMABLE = ['average', 'median', 'rate', 'percentage', 'per '];
+
+  // ── Taxonomy lookup (VARIABLE -> DESCRIPTION / CATEGORY) ───────────────────
+  var TAX = { desc: {}, cat: {} };
+  DATASET_ORDER.forEach(function (name) {
+    var ds = DATASETS[name];
+    if (!ds.useTaxonomy) return;
+    TAX.desc[ds.base] = ds.baseDesc; TAX.cat[ds.base] = ds.baseCat;
+    ds.traits.forEach(function (t) { TAX.desc[t[0]] = t[1]; TAX.cat[t[0]] = t[2]; });
+  });
+  // Blank CATEGORY -> first " - " segment of the description, else "Other".
+  Object.keys(TAX.cat).forEach(function (v) {
+    var c = TAX.cat[v];
+    if (!c || !String(c).trim()) {
+      var d = TAX.desc[v];
+      TAX.cat[v] = (d && d.indexOf(' - ') >= 0) ? d.split(' - ')[0].trim() : 'Other';
+    }
+  });
+
+  // ── Generate the tables: one row per FSA, CODE / GEO / base / traits ───────
+  var TABLES = {};
+  function buildTable(name) {
+    if (TABLES[name]) return TABLES[name];
+    var ds = DATASETS[name], r = Mock.rng('ca-geo-table:' + name);
+    var cols = ['CODE', 'GEO', ds.base].concat(ds.traits.map(function (t) { return t[0]; }));
+    var rows = ALL_FSAS.map(function (fsa) {
+      var g = GEO[fsa], lat = LATENT[fsa];
+      var baseVal = ds.baseOf === 'pop' ? g.pop : ds.baseOf === 'adults' ? Math.round(g.pop * (0.74 + 0.1 * r())) : g.hh;
+      var row = { CODE: fsa, GEO: g.city };
+      row[ds.base] = baseVal;
+      ds.traits.forEach(function (t) {
+        var special = t[5];
+        if (special === 'hh') { row[t[0]] = g.hh; return; }
+        if (special === 'medianAge') { row[t[0]] = Mock.round(41 - 4 * lat.yng + Mock.gauss(0, 1.5, r), 1); return; }
+        if (special === 'avgIncome') { row[t[0]] = Math.round(104000 * Math.exp(0.28 * lat.aff) * (1 + Mock.gauss(0, 0.05, r))); return; }
+        var L = t[4] || {};
+        var z = (L.aff || 0) * lat.aff + (L.urb || 0) * lat.urb + (L.yng || 0) * lat.yng + (L.fam || 0) * lat.fam;
+        var v = baseVal * t[3] * Math.exp(0.32 * z + Mock.gauss(0, 0.08, r));
+        if (ds.kind === 'count') v = Math.min(v, baseVal * 0.985);
+        row[t[0]] = Math.round(v);
+      });
+      return row;
+    });
+    TABLES[name] = { cols: cols, rows: rows };
+    return TABLES[name];
+  }
+
+  function isNumericCol(tbl, c) {
+    return tbl.rows.every(function (row) { return typeof row[c] === 'number' && isFinite(row[c]); });
+  }
+  // Mirrors mappable_columns() / the column selection in generate().
+  function mappableColumns(name) {
+    var ds = DATASETS[name], tbl = buildTable(name);
+    return tbl.cols.filter(function (c) {
+      if (c === 'CODE' || c === 'GEO') return false;
+      if (!isNumericCol(tbl, c)) return false;
+      if (!ds.useTaxonomy && NONSUMMABLE.some(function (x) { return c.toLowerCase().indexOf(x) >= 0; })) return false;
+      return true;
+    });
+  }
+  function sumCol(rows, c) { return rows.reduce(function (s, row) { return s + (Number(row[c]) || 0); }, 0); }
+  function r2(x) { return Math.round(x * 100) / 100; }
+  function r1(x) { return Math.round(x * 10) / 10; }
+  function cleanList(list) {
+    return (list || []).map(function (f) { return String(f).trim().toUpperCase(); }).filter(Boolean);
+  }
+
+  // ── Lifestyle clusters (FSA groups for the Step-1 picker) ─────────────────
+  var CLUSTER_NAMES = ['Downtown Dynamos', 'Condo Climbers', 'Suburban Nesters', 'Commuter Families',
+    'Established Estates', 'Heritage Neighbourhoods', 'Campus Crowd', 'New-Build Pioneers',
+    'Lakeside Retirees', 'Blue-Collar Backbone', 'Northern Outdoors', 'Multicultural Mosaic',
+    'Empty-Nest Comfort', 'Starter-Home Strivers', 'Urban Creatives', 'Quiet Country Lanes'];
+  var cr = Mock.rng('ca-geo-clusters-v1');
+  var CLUSTERS = CLUSTER_NAMES.map(function (name, i) {
+    var n = Mock.randInt(6, 18, cr);
+    return { num: i + 1, name: name, fsas: Mock.shuffle(ALL_FSAS, cr).slice(0, n).sort() };
+  });
+
+  var SAMPLE_FSAS = Mock.shuffle(ALL_FSAS, Mock.rng('ca-geo-sample')).slice(0, 28).sort();
+
+  // Constants the page used to embed (real geo tables) — now generated here.
+  var GEO_FSA = {};
+  ALL_FSAS.forEach(function (k) { GEO_FSA[k] = { city: GEO[k].city, province: GEO[k].province }; });
+  window.CA_GEO_DEMO = {
+    GEO_FSA: GEO_FSA, CITIES: CITIES, PROVINCES: PROVINCES, CLUSTERS: CLUSTERS,
+    SAMPLE_FSAS: SAMPLE_FSAS,
+    DATASETS: DATASET_ORDER.map(function (k) { return { value: k, label: DATASETS[k].label }; })
+  };
+
+  // ── Routes ────────────────────────────────────────────────────────────────
+  Mock.route('GET', '/ca-geo/api/geo_filters', function () {
+    return { provinces: PROVINCES, cities: CITIES };
+  });
+
+  Mock.route('POST', '/ca-geo/api/filter_fsa', function (req) {
+    var data = req.json || {};
+    var fsaList = cleanList(data.fsa_list);
+    var provinces = (data.provinces || []).map(function (p) { return String(p).toUpperCase(); });
+    var cities = (data.cities || []).map(function (c) { return String(c).toUpperCase(); });
+    var matched = [], notFound = [];
+    fsaList.forEach(function (fsa) {
+      var g = GEO[fsa];
+      if (g) {
+        var keep = (!provinces.length || provinces.indexOf(g.province) >= 0) &&
+                   (!cities.length || cities.indexOf(g.city) >= 0);
+        if (keep) matched.push({ fsa: fsa, city: g.city, province: g.province });
+      } else notFound.push(fsa);
+    });
+    return { matched: matched, not_found: notFound };
+  });
+
+  Mock.route('POST', '/ca-geo/api/generate', async function (req) {
+    var data = req.json || {};
+    var fsaList = cleanList(data.fsa_list);
+    var label = String(data.label || 'Audience').trim() || 'Audience';
+    var slim = (data.report_style || 'full') === 'index_pct';
+    if (!fsaList.length) return Mock.json({ error: 'No FSA codes provided' }, 400);
+
+    var X = await Mock.loadXLSX();
+    var wb = X.utils.book_new();
+
+    // Summary sheet
+    var sum = [['FSA Audience Analysis Report'], ['Audience: ' + label + '   |   FSAs included: ' + fsaList.length], [],
+               ['FSA', 'City', 'Province']];
+    fsaList.forEach(function (fsa) {
+      var g = GEO[fsa];
+      sum.push([fsa, g ? g.city : 'Unknown', g ? g.province : 'Unknown']);
+    });
+    var wsS = X.utils.aoa_to_sheet(sum);
+    wsS['!cols'] = [{ wch: 10 }, { wch: 28 }, { wch: 12 }];
+    X.utils.book_append_sheet(wb, wsS, 'Summary');
+
+    var inSet = {}; fsaList.forEach(function (f) { inSet[f] = 1; });
+    DATASET_ORDER.forEach(function (name) {
+      var ds = DATASETS[name], tbl = buildTable(name);
+      var dataCols = mappableColumns(name);
+      var subset = tbl.rows.filter(function (row) { return inSet[row.CODE]; });
+      var agg = {}, nat = {};
+      dataCols.forEach(function (c) { agg[c] = sumCol(subset, c); nat[c] = sumCol(tbl.rows, c); });
+      var aggBase = agg[ds.base] || 1, natBase = nat[ds.base] || 1;
+
+      var headers = slim ? ['Category', 'Variable', 'Description', 'Nat. %', label + ' %', 'Index']
+                         : ['Category', 'Variable', 'Description', 'Nat. Total', 'Nat. %', label + ' Total', label + ' %', 'Index'];
+      var audStart = slim ? 4 : 5;   // 0-based first audience column
+      var audLabels = slim ? [label + ' %', 'Index'] : [label + ' Total', label + ' %', 'Index'];
+      var ncols = headers.length;
+      var row1 = headers.map(function (h, i) { return i < audStart ? h : (i === audStart ? label : ''); });
+      var row2 = headers.map(function (h, i) { return i < audStart ? '' : audLabels[i - audStart]; });
+      var aoa = [row1, row2];
+      var merges = [];
+      for (var ci = 0; ci < audStart; ci++) merges.push({ s: { r: 0, c: ci }, e: { r: 1, c: ci } });
+      merges.push({ s: { r: 0, c: audStart }, e: { r: 0, c: ncols - 1 } });
+
+      var prevCat = null;
+      dataCols.forEach(function (col) {
+        var cat, desc;
+        if (ds.useTaxonomy) { cat = TAX.cat[col] || 'Other'; desc = TAX.desc[col] || col; }
+        else { cat = 'Demographics'; desc = col; }
+        var aggP = r2(agg[col] / aggBase * 100), natP = r2(nat[col] / natBase * 100);
+        var idx = natP !== 0 ? r1(aggP / natP * 100) : 'N/A';
+        if (cat !== prevCat) {
+          var band = new Array(ncols).fill(''); band[0] = cat; aoa.push(band); prevCat = cat;
+        }
+        aoa.push(slim ? [cat, col, desc, natP, aggP, idx]
+                      : [cat, col, desc, Math.round(nat[col]), natP, Math.round(agg[col]), aggP, idx]);
+      });
+      var ws = X.utils.aoa_to_sheet(aoa);
+      ws['!merges'] = merges;
+      ws['!cols'] = (slim ? [20, 55, 55, 10, 12, 10] : [20, 55, 55, 14, 10, 16, 12, 10]).map(function (w) { return { wch: w }; });
+      X.utils.book_append_sheet(wb, ws, name.slice(0, 31));
+    });
+
+    var out = X.write(wb, { bookType: 'xlsx', type: 'array' });
+    var safe = label.replace(/[^A-Za-z0-9 _-]/g, '').trim().replace(/ /g, '_');
+    await Mock.delay(600, 1200);
+    return Mock.file(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+                     'fsa_' + safe + '_' + fsaList.length + 'FSAs.xlsx');
+  });
+
+  Mock.route('GET', '/ca-geo/api/traits', function (req) {
+    var file = req.query.file || '';
+    if (!DATASETS[file]) return Mock.json({ error: 'Unknown dataset' }, 400);
+    var ds = DATASETS[file];
+    var out = mappableColumns(file).map(function (col) {
+      return ds.useTaxonomy
+        ? { column: col, description: TAX.desc[col] || col, category: TAX.cat[col] || 'Other' }
+        : { column: col, description: col, category: 'Demographics' };
+    });
+    return { file: file, traits: out };
+  });
+
+  Mock.route('POST', '/ca-geo/api/map_data', function (req) {
+    var data = req.json || {};
+    var fsaList = cleanList(data.fsa_list);
+    var file = data.file || '', column = data.column || '';
+    if (data.all) fsaList = Object.keys(GEOM).sort();
+    if (!fsaList.length) return Mock.json({ error: 'No FSAs provided' }, 400);
+    if (!DATASETS[file]) return Mock.json({ error: 'Unknown dataset' }, 400);
+    var ds = DATASETS[file], tbl = buildTable(file);
+    if (tbl.cols.indexOf(column) < 0 || tbl.cols.indexOf(ds.base) < 0)
+      return Mock.json({ error: 'Trait not found in dataset' }, 400);
+
+    var natVal = sumCol(tbl.rows, column);
+    var natBase = sumCol(tbl.rows, ds.base) || 1;
+    var natPct = natVal / natBase * 100;
+    var byCode = {}; tbl.rows.forEach(function (row) { byCode[row.CODE] = row; });
+
+    var features = [], mapped = 0, noGeom = [];
+    fsaList.forEach(function (fsa) {
+      var row = byCode[fsa];
+      var value = row && row[column] != null ? Number(row[column]) : null;
+      var base = row && row[ds.base] != null ? Number(row[ds.base]) : 0;
+      var index = (value != null && base && natPct) ? r1((value / base * 100) / natPct * 100) : null;
+      var g = GEOM[fsa];
+      if (!g) { noGeom.push(fsa); return; }
+      features.push({ type: 'Feature', geometry: g, properties: {
+        fsa: fsa, city: GEO[fsa] ? GEO[fsa].city : '', province: fsaProvince(fsa), value: value, index: index } });
+      mapped++;
+    });
+    return {
+      type: 'FeatureCollection', features: features,
+      meta: { column: column, column_desc: ds.useTaxonomy ? (TAX.desc[column] || column) : column,
+              national_pct: Math.round(natPct * 10000) / 10000, requested: fsaList.length,
+              mapped: mapped, no_geometry: noGeom }
+    };
+  });
+
+  // ── POI search (replaces the external POI service) ────────────────
+  // A fixed, seeded "world" of made-up store locations per brand; a search
+  // returns the ones inside the requested bbox, capped at `limit`, with the
+  // same saturated / large_area / area_km fields as the original.
+  var BRANDS = ['Maple Grind Coffee', 'Lakeshore Coffee Co.', 'FreshCart Grocers', 'Harvest Basket Market',
+    'Northline Hardware', 'Burger Barn', 'Pizza Pronto', 'PetPal Supplies', 'Pinewood Pharmacy',
+    'QuickFuel Gas', 'Trailhead Outfitters', 'Brightside Fitness', 'Dollar Depot', 'Glow Beauty Bar',
+    'Cedar & Oak Furniture', 'Rapid Wash Laundromat'];
+  var STREETS = ['King St', 'Queen St', 'Main St', 'Dundas St', 'Bloor St', 'Yonge St', 'Bank St',
+    'Wellington St', 'Richmond St', 'Lakeshore Rd', 'Maple Ave', 'Park Rd', 'Victoria St', 'Elm St'];
+  function poiRegex(term) {
+    var words = String(term).trim().split(/\s+/).filter(Boolean);
+    var esc = words.map(function (w) {
+      return w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/['\u2019]/g, "'?");
+    });
+    return new RegExp(esc.join('[ -]*'), 'i');
+  }
+  function titleCase(s) { return String(s).replace(/\w\S*/g, function (w) { return w.charAt(0).toUpperCase() + w.slice(1); }); }
+  var poiWorld = {};
+  function brandPoints(brand) {
+    var key = brand.toLowerCase();
+    if (poiWorld[key]) return poiWorld[key];
+    var r = Mock.rng('poi:' + key), density = 0.4 + r() * 1.8, pts = [];
+    ALL_FSAS.forEach(function (fsa) {
+      var g = GEO[fsa];
+      var lam = density * g.pop / 30000 * (0.6 + 0.8 * r());
+      var n = Math.floor(lam) + (r() < lam - Math.floor(lam) ? 1 : 0);
+      for (var i = 0; i < n; i++) {
+        pts.push({ lat: Mock.round(g.lat + (r() - 0.5) * 0.03, 6), lng: Mock.round(g.lon + (r() - 0.5) * 0.04, 6),
+                   name: brand + (r() < 0.6 ? ' – ' + Mock.pick(STREETS, r) : '') });
+      }
+    });
+    return (poiWorld[key] = pts);
+  }
+
+  Mock.route('POST', '/ca-geo/api/poi', function (req) {
+    var data = req.json || {};
+    var query = String(data.query || '').trim();
+    var bbox = data.bbox || [];
+    if (!query) return Mock.json({ error: 'No search term' }, 400);
+    if (bbox.length !== 4) return Mock.json({ error: 'Invalid map area' }, 400);
+    var limit = parseInt(data.limit, 10);
+    limit = isNaN(limit) ? 200 : Math.max(1, Math.min(500, limit));
+    var south = +bbox[0], west = +bbox[1], north = +bbox[2], east = +bbox[3], t;
+    if (south > north) { t = south; south = north; north = t; }
+    if (west > east) { t = west; west = east; east = t; }
+    if ((north - south) < 1e-6 || (east - west) < 1e-6)
+      return Mock.json({ error: 'Map area is too small or not fully loaded — zoom or pan the map, then search again.' }, 400);
+    var meanLat = (south + north) / 2;
+    var widthKm = (east - west) * 111 * Math.cos(meanLat * Math.PI / 180);
+    var heightKm = (north - south) * 111;
+
+    var re = poiRegex(query);
+    var brands = BRANDS.filter(function (b) { return re.test(b); });
+    // Unknown but word-like terms still get a (made-up) set of locations so any
+    // brand a visitor types works; gibberish returns nothing, like a real search.
+    if (!brands.length && query.length >= 3 && /[aeiouy]/i.test(query)) brands = [titleCase(query)];
+    var all = [];
+    brands.forEach(function (b) { all = all.concat(brandPoints(b)); });
+    var inBox = all.filter(function (p) { return p.lat >= south && p.lat <= north && p.lng >= west && p.lng <= east; });
+    var raw = inBox.length;
+    var seen = {}, points = [];
+    inBox.slice(0, limit).forEach(function (p) {
+      var k = p.lat.toFixed(5) + ',' + p.lng.toFixed(5);
+      if (seen[k]) return; seen[k] = 1;
+      points.push({ lat: p.lat, lng: p.lng, name: p.name });
+    });
+    return { points: points, count: points.length, large_area: widthKm > 70 || heightKm > 70,
+             elapsed: Mock.round(0.3 + Math.random() * 0.8, 1), saturated: raw >= limit, limit: limit,
+             area_km: [Math.round(widthKm), Math.round(heightKm)] };
+  }, { latency: [350, 900] });
+
+  // ── Sample input file ─────────────────────────────────────────────────────
+  Mock.route('GET', '/ca-geo/api/demo-sample', function () {
+    var r = Mock.rng('ca-geo-sample-counts');
+    var rows = SAMPLE_FSAS.map(function (f) { return { FSA: f, AUDIENCE_COUNT: Mock.randInt(120, 4800, r) }; });
+    // Two codes outside the demo geography, to show the "not in geo file" path.
+    rows.push({ FSA: 'V6B', AUDIENCE_COUNT: 310 }, { FSA: 'T2P', AUDIENCE_COUNT: 145 });
+    return Mock.file(Mock.csv.stringify(rows, ['FSA', 'AUDIENCE_COUNT']), 'sample_fsa_audience.csv');
+  }, { latency: 0 });
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CA Geo Analysis (FSA Level) – Audience Analytics Engine</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/leaflet-image@0.4.0/leaflet-image.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root{
+  --navy:#0d0d2b;
+  --deep:#131447;
+  --violet:#7c5ce8;
+  --purple:#5b4fcf;
+  --lavender:#a78bfa;
+  --teal:#2dd4bf;
+  --sky:#60a5fa;
+  --card-bg:rgba(255,255,255,0.05);
+  --card-border:rgba(180,160,255,0.28);
+  --text:#f0eeff;
+  --text-sec:#c8c0e8;
+  --muted:#8880b8;
+  --input-bg:rgba(255,255,255,0.06);
+  --input-border:rgba(180,160,255,0.30);
+  --grn:#2dd4bf;
+  --grn-bg:rgba(45,212,191,0.12);
+  --grn-border:rgba(45,212,191,0.25);
+  --red:#f87171;
+  --red-bg:rgba(248,113,113,0.10);
+  --red-border:rgba(248,113,113,0.25);
+  --warn:#fbbf24;
+  --warn-bg:rgba(251,191,36,0.10);
+  --warn-border:rgba(251,191,36,0.25);
+  --info-bg:rgba(96,165,250,0.10);
+  --info-border:rgba(96,165,250,0.25);
+  --r:10px;
+}
+
+html,body{min-height:100vh;position:relative;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:var(--text);background:var(--navy);overflow-x:hidden}
+
+body::before{
+  content:'';position:absolute;inset:0;
+  background:
+    radial-gradient(ellipse 70% 55% at 8% 15%, rgba(91,79,207,0.28) 0%,transparent 60%),
+    radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12) 0%,transparent 55%),
+    radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%);
+  pointer-events:none;z-index:0;
+}
+body::after{
+  content:'';position:absolute;inset:0;
+  background-image:linear-gradient(rgba(162,140,250,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(162,140,250,0.03) 1px,transparent 1px);
+  background-size:52px 52px;pointer-events:none;z-index:0;
+}
+
+/* ── TOPBAR ── */
+.topbar{
+  position:sticky;top:0;z-index:100;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 44px;height:84px;
+  background:rgba(13,13,43,0.70);
+  backdrop-filter:blur(18px);
+  border-bottom:1px solid rgba(180,160,255,0.12);
+}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.brand-dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7);animation:pdot 2.6s ease-in-out infinite;flex-shrink:0}
+@keyframes pdot{0%,100%{box-shadow:0 0 8px rgba(124,92,232,0.7)}50%{box-shadow:0 0 18px rgba(45,212,191,0.9)}}
+.brand-name{font-size:1.2rem;font-weight:700;color:#e8e0ff;letter-spacing:0.01em}
+.brand-sep{width:1px;height:24px;background:var(--card-border)}
+.brand-sub{font-size:0.8rem;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase}
+.back-link{display:flex;align-items:center;gap:6px;font-size:0.75rem;color:var(--muted);text-decoration:none;padding:5px 12px;border-radius:8px;border:1px solid var(--card-border);background:rgba(255,255,255,0.03);transition:all 0.2s}
+.back-link:hover{color:var(--lavender);border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.08)}
+.back-link svg{width:12px;height:12px;stroke:currentColor}
+
+/* ── LAYOUT ── */
+.shell{position:relative;z-index:1}
+.container{max-width:900px;margin:0 auto;padding:32px 24px 60px}
+
+/* ── STEP BAR ── */
+.steps{display:flex;gap:0;margin-bottom:28px;border-radius:10px;overflow:hidden;border:1px solid var(--card-border)}
+.step{flex:1;padding:11px 16px;background:var(--card-bg);font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px;transition:all 0.2s;border:none}
+.step+.step{border-left:1px solid var(--card-border)}
+.step.active{background:rgba(124,92,232,0.15);color:var(--lavender);font-weight:600}
+.step.done{background:rgba(45,212,191,0.08);color:var(--teal)}
+.step-num{width:20px;height:20px;border-radius:50%;background:rgba(255,255,255,0.08);color:var(--muted);font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid var(--card-border)}
+.step.active .step-num{background:var(--violet);color:#fff;border-color:transparent;box-shadow:0 0 10px rgba(124,92,232,0.5)}
+.step.done .step-num{background:var(--teal);color:#0d0d2b;border-color:transparent}
+
+/* ── GLOW-UP: motion + Canada accents ── */
+@keyframes riseIn{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+@keyframes pageIn{from{opacity:0}to{opacity:1}}
+@keyframes stepPulse{0%,100%{box-shadow:0 0 10px rgba(124,92,232,0.5)}50%{box-shadow:0 0 20px rgba(45,212,191,0.85)}}
+@keyframes leafFloat{0%,100%{transform:translateY(0) rotate(-6deg)}50%{transform:translateY(-4px) rotate(6deg)}}
+@keyframes shimmer{0%{transform:translateX(-130%) skewX(-18deg)}100%{transform:translateX(230%) skewX(-18deg)}}
+body{animation:pageIn .35s ease both}
+body.leaving{opacity:0;transform:scale(.99);transition:opacity .2s ease,transform .2s ease}
+.steps,.card{animation:riseIn .45s ease both}
+.panel-anim{animation:riseIn .4s cubic-bezier(.22,.9,.35,1.08) both}
+.step.active .step-num{animation:stepPulse 2.4s ease-in-out infinite}
+.step.active{position:relative}
+.step.active::after{content:'';position:absolute;left:12%;right:12%;bottom:0;height:2px;
+  background:linear-gradient(90deg,transparent,#e0353f,transparent);opacity:0.85}
+.card{transition:transform .2s,border-color .2s,box-shadow .2s}
+.card:hover{border-color:rgba(167,139,250,0.42);box-shadow:0 10px 34px rgba(0,0,0,0.30),0 0 24px rgba(124,92,232,0.10)}
+.btn-primary{position:relative;overflow:hidden}
+.btn-primary::after{content:'';position:absolute;top:0;bottom:0;width:38%;left:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,0.22),transparent);
+  transform:translateX(-130%) skewX(-18deg);pointer-events:none}
+.btn-primary:hover::after{animation:shimmer .8s ease}
+/* Maple accents: floating leaf beside the brand + faint leaf watermark bottom-left */
+.maple{display:inline-block;animation:leafFloat 3.6s ease-in-out infinite;filter:drop-shadow(0 0 6px rgba(224,53,63,0.55));font-size:15px}
+body::before{
+  background:
+    radial-gradient(ellipse 70% 55% at 8% 15%,rgba(91,79,207,0.28) 0%,transparent 60%),
+    radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12) 0%,transparent 55%),
+    radial-gradient(ellipse 30% 25% at 88% 8%,rgba(224,53,63,0.10) 0%,transparent 60%),
+    radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%) !important;
+}
+body::after{
+  background-image:
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='340' height='340' viewBox='0 0 512 512'><path fill='rgba(224,53,63,0.045)' d='M256 32l36 84 74-40-20 88 90 8-62 62 62 62-90 8 20 88-74-40-36 84-36-84-74 40 20-88-90-8 62-62-62-62 90-8-20-88 74 40z'/></svg>"),
+    linear-gradient(rgba(162,140,250,0.03) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(162,140,250,0.03) 1px,transparent 1px) !important;
+  background-repeat:no-repeat,repeat,repeat !important;
+  background-position:right -70px bottom -70px,0 0,0 0 !important;
+  background-size:340px 340px,52px 52px,52px 52px !important;
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* ── CARDS ── */
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:14px;padding:24px 28px;margin-bottom:16px;backdrop-filter:blur(12px);position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,0.4),transparent)}
+.card h2{font-size:11px;font-weight:700;color:var(--lavender);text-transform:uppercase;letter-spacing:0.12em;margin-bottom:18px;display:flex;align-items:center;gap:8px}
+.card h2 .badge{background:var(--violet);color:#fff;font-size:10px;padding:2px 8px;border-radius:99px;font-weight:600;letter-spacing:0}
+
+/* ── FORM ELEMENTS ── */
+label{font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:5px;letter-spacing:0.03em}
+input[type=text],select,textarea{
+  width:100%;padding:9px 12px;
+  border:1px solid var(--input-border);border-radius:8px;
+  font-size:13px;font-family:inherit;
+  background:var(--input-bg);color:var(--text);
+  transition:border-color 0.15s,box-shadow 0.15s;
+}
+input[type=text]::placeholder,textarea::placeholder{color:var(--muted)}
+input[type=text]:focus,select:focus,textarea:focus{
+  outline:none;
+  border-color:rgba(167,139,250,0.6);
+  box-shadow:0 0 0 3px rgba(124,92,232,0.15);
+}
+select option{background:#fff;color:#1a1a2e}
+textarea{resize:vertical;min-height:88px;font-family:monospace;font-size:12px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+select[multiple]{height:110px}
+
+/* ── DROPZONE ── */
+.dropzone{
+  border:1.5px dashed var(--input-border);border-radius:8px;
+  padding:28px 10px;text-align:center;cursor:pointer;
+  color:var(--muted);font-size:12px;
+  transition:border-color 0.2s,background 0.2s;
+}
+.dropzone:hover{border-color:rgba(167,139,250,0.55);background:rgba(167,139,250,0.05);color:var(--lavender)}
+
+/* ── BUTTONS ── */
+.btn{display:inline-flex;align-items:center;gap:7px;padding:9px 20px;font-size:13px;font-weight:600;border-radius:8px;cursor:pointer;border:none;transition:all 0.18s;font-family:inherit}
+.btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+.btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:0.45;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-secondary{background:rgba(255,255,255,0.05);color:var(--text-sec);border:1px solid var(--card-border)}
+.btn-secondary:hover{background:rgba(167,139,250,0.1);border-color:rgba(167,139,250,0.4);color:var(--lavender)}
+.btn-sm{padding:6px 14px;font-size:12px}
+
+/* ── STATUS ── */
+.status{padding:11px 15px;border-radius:8px;font-size:13px;margin-top:12px;display:none;border:1px solid transparent}
+.status.info{background:var(--info-bg);color:var(--sky);border-color:var(--info-border)}
+.status.ok{background:var(--grn-bg);color:var(--grn);border-color:var(--grn-border)}
+.status.err{background:var(--red-bg);color:var(--red);border-color:var(--red-border)}
+.status.warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn-border)}
+
+/* ── TABLE ── */
+.table-wrap{max-height:240px;overflow-y:auto;border:1px solid var(--card-border);border-radius:8px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{background:rgba(124,92,232,0.25);color:var(--lavender);padding:8px 12px;text-align:left;font-weight:700;font-size:11px;letter-spacing:0.06em;text-transform:uppercase;position:sticky;top:0}
+td{padding:7px 12px;border-bottom:1px solid rgba(180,160,255,0.08);color:var(--text-sec)}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,0.03)}
+
+/* ── CHIPS ── */
+.chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;padding:3px 9px;border-radius:99px;border:1px solid;margin:2px}
+.c-bl{background:rgba(96,165,250,0.10);color:var(--sky);border-color:rgba(96,165,250,0.25)}
+.c-gn{background:var(--grn-bg);color:var(--grn);border-color:var(--grn-border)}
+.c-yl{background:var(--warn-bg);color:var(--warn);border-color:var(--warn-border)}
+.c-rd{background:var(--red-bg);color:var(--red);border-color:var(--red-border)}
+
+/* ── MISC ── */
+.hint{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5}
+.info-box{background:rgba(96,165,250,0.07);border:1px solid var(--info-border);border-radius:8px;padding:12px 16px;font-size:12px;color:var(--sky);line-height:1.7;margin-bottom:18px}
+.actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+.spinner{display:inline-block;width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── CONFIRM SUMMARY BOX ── */
+.confirm-box{background:rgba(45,212,191,0.06);border:1px solid var(--grn-border);border-radius:8px;padding:16px 18px;margin-bottom:18px}
+
+/* ── FOOTER ── */
+.page-footer{text-align:center;padding:20px;font-size:0.68rem;color:var(--muted);border-top:1px solid rgba(162,140,250,0.07);letter-spacing:0.04em;position:relative;z-index:1}
+
+/* ── CLUSTER MODAL ── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:500;display:flex;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(4px)}
+.modal-box{background:var(--deep);border:1px solid var(--card-border);border-radius:14px;width:100%;max-width:580px;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.modal-box::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,0.4),transparent);pointer-events:none}
+.modal-head{padding:16px 20px;border-bottom:1px solid rgba(180,160,255,0.14);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.modal-head-title{font-size:13px;font-weight:700;color:var(--lavender);text-transform:uppercase;letter-spacing:.1em}
+.modal-x{background:none;border:none;cursor:pointer;color:var(--muted);font-size:20px;line-height:1;padding:2px 6px;border-radius:6px;transition:color .15s}
+.modal-x:hover{color:var(--text)}
+.modal-search{padding:12px 20px;border-bottom:1px solid rgba(180,160,255,0.10);flex-shrink:0}
+.modal-search input{background:var(--input-bg);border:1px solid var(--input-border);border-radius:8px;padding:8px 12px;font-size:13px;color:var(--text);width:100%}
+.modal-search input:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+.modal-search input::placeholder{color:var(--muted)}
+.modal-list{flex:1;overflow-y:auto;padding:8px}
+.cluster-item{display:flex;align-items:center;gap:10px;padding:7px 12px;border-radius:8px;cursor:pointer;transition:background .1s;user-select:none}
+.cluster-item:hover{background:rgba(255,255,255,0.04)}
+.cluster-item.sel{background:rgba(124,92,232,0.14)}
+.cluster-item input[type=checkbox]{width:14px;height:14px;cursor:pointer;accent-color:var(--violet);flex-shrink:0}
+.cluster-seg-num{font-size:10px;font-weight:700;font-family:monospace;color:var(--muted);min-width:24px}
+.cluster-seg-name{font-size:13px;flex:1;color:var(--text-sec)}
+.cluster-item.sel .cluster-seg-name{color:var(--lavender)}
+.cluster-seg-fsa{font-size:10px;font-weight:600;font-family:monospace;color:var(--muted)}
+.modal-foot{padding:12px 20px;border-top:1px solid rgba(180,160,255,0.14);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-shrink:0}
+.modal-foot-info{font-size:12px;color:var(--muted)}
+.modal-foot-btns{display:flex;gap:8px}
+
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+<!-- TOPBAR -->
+<div class="container">
+
+  <!-- STEP BAR -->
+  <div class="steps">
+    <div class="step active" id="step1"><span class="step-num">1</span> Load FSAs</div>
+    <div class="step"        id="step2"><span class="step-num">2</span> Filter &amp; Confirm</div>
+    <div class="step"        id="step3"><span class="step-num">3</span> Generate Report</div>
+    <div class="step"        id="step4"><span class="step-num">4</span> View Map</div>
+  </div>
+
+  <!-- STEP 1 -->
+  <div id="p1">
+  <div class="card">
+    <h2>Load your FSA list</h2>
+    <div style="margin-bottom:16px">
+      <label>Audience label <span style="font-weight:400;color:var(--muted)">(becomes the column header in the report)</span></label>
+      <input type="text" id="audienceLabel" placeholder="e.g. HVA Audience, Toronto Prospects, Campaign Market" maxlength="50">
+    </div>
+    <div class="row">
+      <div>
+        <label>Paste FSA codes</label>
+        <textarea id="fsaPaste" placeholder="M5V&#10;V6B&#10;H3A, T2P&#10;..."></textarea>
+        <p class="hint">Comma, newline, space or semicolon — any mix works</p>
+      </div>
+      <div>
+        <label>Or upload a .csv / .txt file</label>
+        <div class="dropzone" id="dropzone" onclick="document.getElementById('fsaFile').click()">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="display:block;margin:0 auto 8px;opacity:.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          Click to upload
+        </div>
+        <input type="file" id="fsaFile" accept=".csv,.txt" style="display:none">
+        <p class="hint" id="fileHint"></p>
+      </div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="loadFSAs()">Load FSAs →</button>
+      <button class="btn btn-secondary" onclick="openClusterModal()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        By Lifestyle Cluster
+      </button>
+      <button class="btn btn-secondary btn-sm" onclick="useSampleFSAs()">Use sample data</button>
+      <a class="btn btn-secondary btn-sm" href="/ca-geo/api/demo-sample" style="text-decoration:none">Download sample file</a>
+    </div>
+    <div class="status" id="st1"></div>
+  </div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div id="p2" style="display:none">
+  <div class="card">
+    <h2>Filter &amp; Confirm
+      <span class="badge" id="loadedCount"></span>
+    </h2>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:16px">Leave blank to keep all FSAs.</p>
+    <div class="row" style="margin-bottom:14px">
+      <div>
+        <label>Province</label>
+        <select id="provFilter" multiple></select>
+        <p class="hint">Ctrl / Cmd to multi-select</p>
+      </div>
+      <div>
+        <label>City</label>
+        <select id="cityFilter" multiple></select>
+        <p class="hint">Ctrl / Cmd to multi-select</p>
+      </div>
+    </div>
+    <div class="actions" style="margin-top:0">
+      <button class="btn btn-secondary btn-sm" onclick="applyFilters()">Apply filters</button>
+      <button class="btn btn-secondary btn-sm" onclick="clearFilters()">Clear</button>
+      <span id="filtCount" style="font-size:12px;color:var(--muted)"></span>
+    </div>
+    <div class="status" id="st2"></div>
+    <div id="previewWrap" style="display:none;margin-top:18px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;font-size:12px">
+        <strong style="color:var(--text-sec)">FSA Preview</strong>
+        <span style="color:var(--muted);font-size:11px">
+          <span style="color:var(--grn)">● included</span> &nbsp;
+          <span style="color:var(--warn)">● filtered out</span> &nbsp;
+          <span style="color:var(--red)">● not found</span>
+        </span>
+      </div>
+      <div class="table-wrap">
+        <table><thead><tr><th>FSA</th><th>City</th><th>Province</th><th>Status</th></tr></thead>
+        <tbody id="previewBody"></tbody></table>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" onclick="confirmAndNext()">Confirm &amp; Continue →</button>
+        <button class="btn btn-secondary btn-sm" onclick="goTo(1)">← Back</button>
+      </div>
+    </div>
+  </div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div id="p3" style="display:none">
+  <div class="card">
+    <h2>Generate Report</h2>
+    <div class="confirm-box" id="confirmSummary"></div>
+    <div class="info-box">One Excel tab per dataset: audience vs national, with index.</div>
+    <div style="margin-bottom:14px">
+      <label>Report style</label>
+      <div class="style-toggle">
+        <label class="st-opt"><input type="radio" name="reportStyle" value="full" checked>
+          <span><b>Full metrics</b><small>Totals + % compositions + index</small></span></label>
+        <label class="st-opt"><input type="radio" name="reportStyle" value="index_pct">
+          <span><b>Index &amp; % only</b><small>Just % compositions and index — cleaner for sharing</small></span></label>
+      </div>
+    </div>
+    <style>
+      .style-toggle{ display:flex; gap:10px; flex-wrap:wrap; }
+      .st-opt{ flex:1; min-width:220px; display:flex; gap:10px; align-items:flex-start; cursor:pointer;
+        border:1px solid var(--input-border); border-radius:10px; padding:12px 14px;
+        background:var(--input-bg); transition:all .18s; }
+      .st-opt:hover{ border-color:rgba(167,139,250,0.55); }
+      .st-opt:has(input:checked){ border-color:rgba(45,212,191,0.6); background:rgba(45,212,191,0.08);
+        box-shadow:0 0 14px rgba(45,212,191,0.15); }
+      .st-opt input{ accent-color:var(--teal); margin-top:3px; }
+      .st-opt span{ display:flex; flex-direction:column; gap:2px; font-size:13px; }
+      .st-opt small{ color:var(--muted); font-size:11px; }
+    </style>
+    <div class="actions" style="margin-top:0">
+      <button class="btn btn-primary" id="genBtn" onclick="generate()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download Excel Report
+      </button>
+      <button class="btn btn-secondary" onclick="goToMap()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg>
+        View on Map →
+      </button>
+      <button class="btn btn-secondary btn-sm" onclick="goTo(2)">← Back</button>
+    </div>
+    <div class="status" id="st3"></div>
+  </div>
+  </div>
+
+  <!-- STEP 4: MAP -->
+  <div id="p4" style="display:none">
+  <div class="card">
+    <h2>View on Map</h2>
+    <div class="info-box">Selected FSAs shaded by index vs national (100 = average; green over, red under). Optional store overlay.</div>
+
+    <div class="row" style="margin-bottom:14px">
+      <div>
+        <label>Dataset</label>
+        <select id="mapDataset">
+          <option value="">— Choose a dataset —</option>
+          <option value="Demographics">Demographic stats</option>
+          <option value="HouseholdSpend">Household Spend</option>
+          <option value="FoodSpend">Food Spend</option>
+          <option value="MediaHabits">Media Habits</option>
+          <option value="FinancialHabits">Financial Habits</option>
+          <option value="WealthProfile">Wealth Profile</option>
+        </select>
+      </div>
+      <div>
+        <label>Trait</label>
+        <div class="trait-dd">
+          <input type="text" id="traitInput" autocomplete="off" disabled
+                 placeholder="Select a dataset first"
+                 oninput="filterTraits()" onfocus="openTraitList()">
+          <input type="hidden" id="mapTrait" value="">
+          <div id="traitList" class="trait-list" style="display:none"></div>
+        </div>
+        <p class="hint" id="traitHint">Pick a dataset, then a trait to colour the map.</p>
+      </div>
+    </div>
+
+    <!-- Map filters -->
+    <div class="map-filters" id="mapFilters">
+      <div>
+        <label>Province <span style="font-weight:400;color:var(--muted)">— leave blank for your selected audience</span></label>
+        <select id="mapProvince" multiple onchange="renderChoropleth()"></select>
+        <p class="hint">Maps every national FSA in the province, not just your audience.</p>
+      </div>
+      <div class="idx-filter">
+        <label>Index range <span id="idxRangeLbl" style="font-weight:400;color:var(--muted)">— draw the map first</span></label>
+        <div class="idx-sliders">
+          <input type="range" id="idxMin" disabled oninput="onIdxSlider('min')">
+          <input type="range" id="idxMax" disabled oninput="onIdxSlider('max')">
+        </div>
+        <p class="hint" id="mapFilterCount"></p>
+      </div>
+    </div>
+    <style>
+      .map-filters{ display:grid; grid-template-columns:1fr 1.4fr; gap:14px; margin-bottom:14px; align-items:start; }
+      #mapProvince{ height:76px; }
+      @media(max-width:760px){ .map-filters{ grid-template-columns:1fr; } }
+      .idx-sliders{ position:relative; height:34px; margin-top:6px; }
+      .idx-sliders input[type=range]{
+        position:absolute; left:0; right:0; top:8px; width:100%; margin:0;
+        -webkit-appearance:none; appearance:none; background:none; pointer-events:none; height:18px;
+      }
+      .idx-sliders input[type=range]::-webkit-slider-runnable-track{ height:5px; border-radius:3px; background:transparent; }
+      .idx-sliders input[type=range]::-webkit-slider-thumb{
+        -webkit-appearance:none; appearance:none; pointer-events:auto; cursor:pointer;
+        width:17px; height:17px; border-radius:50%; margin-top:-6px;
+        background:linear-gradient(135deg,var(--violet),var(--teal));
+        border:2px solid #fff; box-shadow:0 1px 6px rgba(0,0,0,0.4);
+      }
+      .idx-sliders input[type=range]:disabled::-webkit-slider-thumb{ background:#5b5b7a; cursor:default; }
+      .idx-sliders::before{ content:''; position:absolute; left:0; right:0; top:14px; height:5px;
+        border-radius:3px; background:rgba(255,255,255,0.10); }
+    </style>
+    <style>
+      .trait-dd{ position:relative; }
+      .trait-list{
+        position:absolute; z-index:1200; left:0; right:0; top:calc(100% + 4px);
+        max-height:280px; overflow-y:auto;
+        background:var(--deep); border:1px solid var(--input-border);
+        border-radius:10px; box-shadow:0 12px 32px rgba(0,0,0,0.45);
+      }
+      .trait-opt{ padding:9px 12px; cursor:pointer; border-bottom:1px solid rgba(180,160,255,0.08);
+        display:flex; flex-direction:column; gap:2px; }
+      .trait-opt:last-child{ border-bottom:none; }
+      .trait-opt:hover, .trait-opt.active{ background:rgba(124,92,232,0.16); }
+      .trait-opt .to-name{ font-size:13px; color:var(--text); }
+      .trait-opt .to-cat{ font-size:11px; color:var(--muted); }
+      .trait-empty{ padding:16px; text-align:center; font-size:12px; color:var(--muted); }
+    </style>
+
+    <div id="leafletMap" style="aspect-ratio:16/9;width:100%;border:1px solid var(--card-border);border-radius:10px;overflow:hidden;background:rgba(255,255,255,0.02);margin-bottom:14px"></div>
+
+    <!-- POINTS OF INTEREST -->
+    <div style="border:1px solid var(--card-border);border-radius:10px;padding:14px 16px;margin-bottom:14px">
+      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+        <div style="flex:1;min-width:220px">
+          <label>Overlay points of interest <span style="font-weight:400;color:var(--muted)">(demo — generated store locations)</span></label>
+          <input type="text" id="poiQuery" placeholder="e.g. Maple Grind Coffee, FreshCart, Burger Barn" onkeydown="if(event.key==='Enter')searchPOI()">
+          <p class="hint" id="poiAreaHint">Searches the current map view. Zoom/pan first to set the area.</p>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="poiSearchBtn" onclick="searchPOI()">Search POIs</button>
+        <button class="btn btn-secondary btn-sm" id="poiCancelBtn" onclick="cancelPOISearch()" style="display:none">Cancel</button>
+        <button class="btn btn-secondary btn-sm" onclick="clearPOI()">Clear</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);padding-bottom:8px"><input type="checkbox" id="poiToggle" checked onchange="togglePOI()"> Show</label>
+      </div>
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;font-size:12px;color:var(--muted)">Or add custom locations manually</summary>
+        <textarea id="poiManual" placeholder="lat,lng,label&#10;43.6532,-79.3832,Downtown Toronto&#10;45.4215,-75.6972,Downtown Ottawa" style="margin-top:8px;height:90px"></textarea>
+        <button class="btn btn-secondary btn-sm" style="margin-top:8px" onclick="addManualPOI()">Add locations</button>
+      </details>
+    </div>
+
+    <div style="margin-bottom:12px">
+      <label>Map title for export <span style="font-weight:400;color:var(--muted)">(shown top-left on the image)</span></label>
+      <input type="text" id="exportTitle" maxlength="80" placeholder="e.g. Affluent Luxury Travellers">
+    </div>
+    <div class="actions" style="margin-top:0">
+      <button class="btn btn-primary" id="mapExportBtn" onclick="exportMap()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download map (16:9)
+      </button>
+      <button class="btn btn-secondary" id="mapCsvBtn" onclick="exportMapData()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/><path d="M9 13h6M9 17h6"/></svg>
+        Export FSA data (CSV)
+      </button>
+      <button class="btn btn-secondary btn-sm" onclick="goTo(3)">← Back</button>
+    </div>
+    <div class="status" id="st4"></div>
+  </div>
+  </div>
+
+</div><!-- /container -->
+
+</div><!-- /shell -->
+
+<script>
+var allFSAs=[], filteredFSAs=[], confirmedFSAs=[];
+
+// Geo lookup tables are generated by the demo back-end (mocks/ca_geo.js).
+const GEO_FSA   = window.CA_GEO_DEMO.GEO_FSA;
+const PROVINCES = window.CA_GEO_DEMO.PROVINCES;
+const CITIES    = window.CA_GEO_DEMO.CITIES;
+
+// Populate dropdowns from embedded data
+(function(){
+  const ps=document.getElementById('provFilter');
+  const cs=document.getElementById('cityFilter');
+  PROVINCES.forEach(p=>{const o=document.createElement('option');o.value=o.textContent=p;ps.appendChild(o)});
+  CITIES.forEach(c=>{const o=document.createElement('option');o.value=o.textContent=c;cs.appendChild(o)});
+})();
+
+function goTo(n){
+  [1,2,3,4].forEach(i=>{
+    const p=document.getElementById('p'+i);
+    p.style.display=i===n?'':'none';
+    if(i===n){ p.classList.remove('panel-anim'); void p.offsetWidth; p.classList.add('panel-anim'); }
+    const s=document.getElementById('step'+i);
+    s.className='step'+(i<n?' done':i===n?' active':'');
+  });
+}
+
+function showStatus(id,type,msg){
+  const el=document.getElementById(id);
+  el.className='status '+type;
+  el.innerHTML=msg;
+  el.style.display='block';
+}
+
+// Smooth exit back to the menu (matches the other tools).
+
+function parseFSAs(raw){
+  return [...new Set(
+    raw.split(/[\n,;\s]+/)
+       .map(s=>s.trim().toUpperCase())
+       .filter(s=>/^[A-Z]\d[A-Z]$/.test(s))
+  )];
+}
+
+document.getElementById('fsaFile').addEventListener('change',function(e){
+  const f=e.target.files[0];if(!f)return;
+  const r=new FileReader();
+  r.onload=ev=>{
+    document.getElementById('fsaPaste').value=ev.target.result;
+    document.getElementById('fileHint').textContent=f.name+' loaded';
+  };
+  r.readAsText(f);
+});
+
+function loadFSAs(){
+  const raw=document.getElementById('fsaPaste').value.trim();
+  const parsed=parseFSAs(raw);
+  if(!parsed.length){showStatus('st1','err','No valid FSA codes found. Format: letter-digit-letter (e.g. M5V).');return;}
+  allFSAs=parsed;
+  filteredFSAs=[...allFSAs];
+  document.getElementById('loadedCount').textContent=parsed.length+' FSA'+(parsed.length>1?'s':'');
+  showStatus('st1','ok','✓ '+parsed.length+' FSA'+(parsed.length>1?'s':'')+' loaded.');
+  goTo(2);
+  applyFilters();
+}
+
+function useSampleFSAs(){
+  var d=window.CA_GEO_DEMO;
+  document.getElementById('fsaPaste').value=d.SAMPLE_FSAS.join(String.fromCharCode(10));
+  var lbl=document.getElementById('audienceLabel');
+  if(!lbl.value.trim()) lbl.value='Sample Audience';
+  document.getElementById('fileHint').textContent='Sample data: '+d.SAMPLE_FSAS.length+' generated FSAs loaded into text area';
+}
+
+function getSelected(id){
+  return [...document.getElementById(id).selectedOptions].map(o=>o.value);
+}
+
+async function applyFilters(){
+  const provinces=getSelected('provFilter');
+  const cities=getSelected('cityFilter');
+  showStatus('st2','info','<span class="spinner"></span> Looking up FSAs in geo file…');
+  let data;
+  try{
+    const res=await fetch('/ca-geo/api/filter_fsa',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({fsa_list:allFSAs,provinces,cities})
+    });
+    data=await res.json();
+    if(data.error)throw new Error(data.error);
+  }catch(e){
+    showStatus('st2','err','Error looking up FSAs: '+e.message);return;
+  }
+  const matchedSet=new Set(data.matched.map(r=>r.fsa));
+  const notFoundSet=new Set(data.not_found);
+  const matched=data.matched;
+  const notFound=data.not_found;
+  const filtOut=allFSAs.filter(f=>!matchedSet.has(f)&&!notFoundSet.has(f)).map(f=>{
+    const g=GEO_FSA[f];
+    return {fsa:f,city:g?g.city:'—',province:g?g.province:'—'};
+  });
+  filteredFSAs=matched.map(r=>r.fsa);
+  document.getElementById('filtCount').textContent=filteredFSAs.length+' FSA'+(filteredFSAs.length!==1?'s':'')+' included';
+  const tbody=document.getElementById('previewBody');
+  tbody.innerHTML='';
+  matched.forEach(r=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td><strong style="color:var(--text)">'+r.fsa+'</strong></td><td>'+r.city+'</td><td>'+r.province+'</td><td><span class="chip c-gn">✓ Included</span></td>';
+    tbody.appendChild(tr);
+  });
+  filtOut.forEach(r=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td><strong style="color:var(--text)">'+r.fsa+'</strong></td><td>'+r.city+'</td><td>'+r.province+'</td><td><span class="chip c-yl">Filtered out</span></td>';
+    tbody.appendChild(tr);
+  });
+  notFound.forEach(fsa=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td><strong style="color:var(--text)">'+fsa+'</strong></td><td>—</td><td>—</td><td><span class="chip c-rd">Not in geo file</span></td>';
+    tbody.appendChild(tr);
+  });
+  document.getElementById('previewWrap').style.display='';
+  showStatus('st2',filteredFSAs.length?'ok':'warn',
+    filteredFSAs.length
+      ?'✓ '+filteredFSAs.length+' FSA'+(filteredFSAs.length>1?'s':'')+' will be aggregated into the audience profile.'
+      :'⚠ No FSAs match the current filters.');
+}
+
+function clearFilters(){
+  [...document.getElementById('provFilter').options].forEach(o=>o.selected=false);
+  [...document.getElementById('cityFilter').options].forEach(o=>o.selected=false);
+  applyFilters();
+}
+
+function confirmAndNext(){
+  if(!filteredFSAs.length){showStatus('st2','err','No FSAs to proceed with. Adjust filters or go back.');return;}
+  confirmedFSAs=[...filteredFSAs];
+  const label=document.getElementById('audienceLabel').value.trim()||'Audience';
+  document.getElementById('confirmSummary').innerHTML=
+    '<div style="font-size:13px;margin-bottom:10px;color:var(--text-sec)"><strong style="color:var(--text)">Audience:</strong> '+label+
+    ' &nbsp;|&nbsp; <strong style="color:var(--text)">FSAs:</strong> '+confirmedFSAs.length+'</div>'+
+    '<div>'+confirmedFSAs.slice(0,40).map(f=>'<span class="chip c-bl">'+f+'</span>').join('')+
+    (confirmedFSAs.length>40?'<span style="font-size:11px;color:var(--muted);padding:4px">+' +(confirmedFSAs.length-40)+' more</span>':'')+
+    '</div>';
+  goTo(3);
+}
+
+async function generate(){
+  const btn=document.getElementById('genBtn');
+  const label=document.getElementById('audienceLabel').value.trim()||'Audience';
+  btn.disabled=true;
+  btn.innerHTML='<span class="spinner"></span> Generating…';
+  showStatus('st3','info',
+    '<span class="spinner"></span> Aggregating '+confirmedFSAs.length+
+    ' FSAs into the <strong>'+label+'</strong> profile… ~15–30 seconds.');
+  try{
+    const res=await fetch('/ca-geo/api/generate',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({fsa_list:confirmedFSAs,label,
+        report_style:(document.querySelector('input[name="reportStyle"]:checked')||{}).value||'full'})
+    });
+    if(!res.ok){
+      const err=await res.json().catch(()=>({error:'Server error '+res.status}));
+      throw new Error(err.error||'Server error');
+    }
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;
+    a.download='fsa_'+label.replace(/\s+/g,'_')+'_'+confirmedFSAs.length+'FSAs.xlsx';
+    a.click();
+    URL.revokeObjectURL(url);
+    showStatus('st3','ok','✓ Report downloaded — '+confirmedFSAs.length+' FSAs aggregated into the "'+label+'" profile.');
+  }catch(e){
+    showStatus('st3','err','Error: '+e.message);
+  }finally{
+    btn.disabled=false;
+    btn.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download Excel Report';
+  }
+}
+
+// ── CLUSTER DATA & MODAL ──────────────────────────────────────────────────────
+const CLUSTER_DATA = window.CA_GEO_DEMO.CLUSTERS;
+var pendingCluster = new Set();
+
+function openClusterModal(){
+  pendingCluster = new Set();
+  document.getElementById('clusterSearch').value = '';
+  document.getElementById('clusterModal').style.display = 'flex';
+  renderClusterList('');
+  updateClusterFooter();
+  setTimeout(function(){document.getElementById('clusterSearch').focus();}, 60);
+}
+
+function closeClusterModal(){
+  document.getElementById('clusterModal').style.display = 'none';
+}
+
+function renderClusterList(q){
+  var lc = q.trim().toLowerCase();
+  var filtered = CLUSTER_DATA.filter(function(p){
+    return !lc || p.name.toLowerCase().includes(lc) || String(p.num).includes(lc);
+  });
+  var list = document.getElementById('clusterList');
+  if(!filtered.length){
+    list.innerHTML = '<div style="padding:24px;text-align:center;font-size:13px;color:var(--muted)">No segments match</div>';
+    return;
+  }
+  list.innerHTML = filtered.map(function(p){
+    var sel = pendingCluster.has(p.num);
+    return '<div class="cluster-item '+(sel?'sel':'')+'" onclick="toggleCluster('+p.num+')">'+
+      '<input type="checkbox" '+(sel?'checked':'')+' onclick="event.stopPropagation();toggleCluster('+p.num+')">'+
+      '<span class="cluster-seg-num">#'+String(p.num).padStart(2,'0')+'</span>'+
+      '<span class="cluster-seg-name">'+p.name+'</span>'+
+      '<span class="cluster-seg-fsa">'+p.fsas.length+' FSAs</span>'+
+      '</div>';
+  }).join('');
+}
+
+function toggleCluster(num){
+  if(pendingCluster.has(num)) pendingCluster.delete(num); else pendingCluster.add(num);
+  renderClusterList(document.getElementById('clusterSearch').value);
+  updateClusterFooter();
+}
+
+function updateClusterFooter(){
+  var n = pendingCluster.size;
+  var total = 0;
+  pendingCluster.forEach(function(num){
+    var p = CLUSTER_DATA.find(function(x){return x.num===num;});
+    if(p) total += p.fsas.length;
+  });
+  document.getElementById('clusterFootInfo').textContent =
+    n===0 ? '0 segments selected'
+          : n+' segment'+(n!==1?'s':'')+' selected · ~'+total.toLocaleString()+' FSAs (pre-dedup)';
+  document.getElementById('clusterApplyBtn').disabled = n===0;
+}
+
+function applyCluster(){
+  if(!pendingCluster.size) return;
+  var fsa_set = new Set();
+  pendingCluster.forEach(function(num){
+    var p = CLUSTER_DATA.find(function(x){return x.num===num;});
+    if(p) p.fsas.forEach(function(f){fsa_set.add(f);});
+  });
+  var codes = Array.from(fsa_set).sort();
+  var ta = document.getElementById('fsaPaste');
+  var existing = ta.value.trim();
+  ta.value = existing ? existing+'\n'+codes.join('\n') : codes.join('\n');
+  var names = Array.from(pendingCluster).map(function(num){
+    var p = CLUSTER_DATA.find(function(x){return x.num===num;});
+    return p ? '#'+String(p.num).padStart(2,'0')+' '+p.name : '';
+  }).filter(Boolean).join(', ');
+  document.getElementById('fileHint').textContent =
+    'Lifestyle clusters: '+names+' — '+codes.length+' FSAs loaded into text area';
+  closeClusterModal();
+}
+
+// ── STEP 4: MAP ─────────────────────────────────────────────────────────────
+var _map=null, _fsaLayer=null, _poiLayer=null, _legend=null;
+var _mapGeojson=null, _mapTraitDesc='', _poiPoints=[];
+var _idxBounds={min:0,max:200};   // slider scale for the current dataset
+var _traitOptions=[];   // [{column, description, category}] for the searchable trait dropdown
+
+function escapeHtml(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+function goToMap(){
+  if(!confirmedFSAs.length){showStatus('st3','err','No FSAs confirmed to map.');return;}
+  goTo(4);
+  initMap();
+}
+
+// Editable title used on the exported image. Prefilled from the Step-1
+// audience label but freely editable before download.
+function exportTitleValue(){
+  var el=document.getElementById('exportTitle');
+  if(el && el.value.trim()) return el.value.trim();
+  var lbl=document.getElementById('audienceLabel');
+  return (lbl && lbl.value.trim()) || 'Audience';
+}
+function prefillExportTitle(){
+  var el=document.getElementById('exportTitle');
+  var lbl=document.getElementById('audienceLabel');
+  if(el && !el.value.trim() && lbl && lbl.value.trim()) el.value=lbl.value.trim();
+}
+
+function initMap(){
+  if(!_map){
+    _map = L.map('leafletMap',{scrollWheelZoom:true,preferCanvas:true}).setView([56.13,-106.35],4);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+      maxZoom:19, attribution:'&copy; OpenStreetMap contributors'
+    }).addTo(_map);
+    // featureGroup (not layerGroup) so bringToFront() exists once markers are added.
+    _poiLayer = L.featureGroup().addTo(_map);
+    _map.on('moveend zoomend', updatePoiAreaHint);
+    // The container's size changes with window width (locked to a 16:9
+    // aspect ratio) — keep Leaflet in sync so the preview never falls out
+    // of alignment with the exported image.
+    window.addEventListener('resize', function(){ if(_map) _map.invalidateSize(); });
+  }
+  initMapProvinceSelect();
+  // Container was display:none until now — force Leaflet to recompute size.
+  setTimeout(function(){ _map.invalidateSize(); updatePoiAreaHint(); }, 80);
+  prefillExportTitle();
+  var file=document.getElementById('mapDataset').value;
+  var col =document.getElementById('mapTrait').value;
+  if(file && col){ renderChoropleth(); }
+  else{ showStatus('st4','info','Choose a dataset and trait above to colour the '+confirmedFSAs.length+' selected FSAs.'); }
+}
+
+document.getElementById('mapDataset').addEventListener('change', async function(){
+  var file=this.value;
+  var input=document.getElementById('traitInput');
+  var hidden=document.getElementById('mapTrait');
+  // Reset current selection whenever the dataset changes.
+  _traitOptions=[]; hidden.value=''; input.value='';
+  closeTraitList();
+  if(!file){ input.disabled=true; input.placeholder='Select a dataset first'; return; }
+  input.disabled=true; input.placeholder='Loading traits…';
+  try{
+    var r=await fetch('/ca-geo/api/traits?file='+encodeURIComponent(file));
+    var d=await r.json(); if(d.error) throw new Error(d.error);
+    _traitOptions=(d.traits||[]).slice().sort(function(a,b){
+      return (a.category+a.description).localeCompare(b.category+b.description);
+    });
+    input.disabled=false;
+    input.placeholder='Search '+_traitOptions.length+' traits…';
+    showStatus('st4','info','Type to search, then pick a trait to colour the map.');
+  }catch(e){
+    input.disabled=true; input.placeholder='Error loading traits';
+    showStatus('st4','err','Could not load traits: '+e.message);
+  }
+});
+
+// ── Searchable trait dropdown ───────────────────────────────────────────────
+function openTraitList(){ if(!document.getElementById('traitInput').disabled){ renderTraitList(); } }
+function closeTraitList(){ var l=document.getElementById('traitList'); if(l) l.style.display='none'; }
+function filterTraits(){ renderTraitList(); }
+
+function renderTraitList(){
+  var list=document.getElementById('traitList');
+  var q=document.getElementById('traitInput').value.trim().toLowerCase();
+  var matches=_traitOptions.filter(function(t){
+    if(!q) return true;
+    return (t.description||'').toLowerCase().indexOf(q)>=0
+        || (t.category||'').toLowerCase().indexOf(q)>=0
+        || (t.column||'').toLowerCase().indexOf(q)>=0;
+  }).slice(0,300);   // cap rendered rows for responsiveness
+  if(!matches.length){
+    list.innerHTML='<div class="trait-empty">No matching traits</div>';
+  }else{
+    // No inline JS handlers: descriptions can contain quotes/apostrophes
+    // (e.g. "FREE applications ('apps')…") which broke the generated
+    // attribute and made those traits unclickable. Use data attributes +
+    // one delegated listener instead.
+    list.innerHTML=matches.map(function(t,i){
+      return '<div class="trait-opt" data-i="'+i+'">'+
+        '<span class="to-name">'+escapeHtml(t.description)+'</span>'+
+        '<span class="to-cat">'+escapeHtml(t.category||'')+'</span></div>';
+    }).join('');
+    var rendered=matches;   // capture for the click handlers below
+    list.querySelectorAll('.trait-opt').forEach(function(el){
+      el.addEventListener('mousedown', function(){
+        var t=rendered[+el.getAttribute('data-i')];
+        if(t) selectTrait(t.column, t.description);
+      });
+    });
+  }
+  list.style.display='block';
+}
+
+function selectTrait(column, desc){
+  document.getElementById('mapTrait').value=column;
+  document.getElementById('traitInput').value=desc;
+  closeTraitList();
+  renderChoropleth();
+}
+
+// Close the dropdown when clicking away from it.
+document.addEventListener('mousedown', function(e){
+  var dd=e.target.closest && e.target.closest('.trait-dd');
+  if(!dd) closeTraitList();
+});
+
+function colorForIndex(idx){
+  if(idx==null) return '#5b5b7a';       // no data — grey
+  if(idx>=120)  return '#2dd4bf';       // strongly over-indexed
+  if(idx>=105)  return '#7fe3c8';       // mildly over
+  if(idx>=95)   return '#c8c0e8';       // ~ national average
+  if(idx>=80)   return '#fca5a5';       // mildly under
+  return '#f87171';                     // strongly under-indexed
+}
+
+async function renderChoropleth(){
+  var file=document.getElementById('mapDataset').value;
+  var column=document.getElementById('mapTrait').value;
+  if(!file||!column) return;
+  // Picking any province switches to a national fetch so the map can show
+  // every FSA in that province, not just whichever of your selected FSAs
+  // happen to fall inside it — this is what makes the province filter
+  // actually do something on its own, rather than just narrowing a handful
+  // of already-selected FSAs down to an even smaller, often-empty subset.
+  var selectedProvinces=getSelectedProvinces();
+  var national=selectedProvinces.length>0;
+  var scopeTxt=national?selectedProvinces.join(', ')+' (national)':confirmedFSAs.length+' FSAs';
+  showStatus('st4','info','<span class="spinner"></span> Building map for '+scopeTxt+'…');
+  var d;
+  try{
+    var r=await fetch('/ca-geo/api/map_data',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(national ? {all:true, file:file, column:column}
+                                   : {fsa_list:confirmedFSAs, file:file, column:column})
+    });
+    d=await r.json(); if(d.error) throw new Error(d.error);
+  }catch(e){ showStatus('st4','err','Error building map: '+e.message); return; }
+
+  _mapGeojson=d;
+  _mapTraitDesc=(d.meta&&d.meta.column_desc)||column;
+
+  // Wrapped: a malformed feature or any other draw-time error must surface as
+  // a status message, never leave the "Building map…" spinner stuck forever.
+  try{
+    setupIdxSlider(d);
+    drawFsaLayer(true);
+    updateLegend();
+  }catch(e){
+    showStatus('st4','err','Could not draw the map: '+(e&&e.message?e.message:e));
+  }
+}
+
+// Fixed province list — same source of truth as Step 2's filter, always
+// populated regardless of what's in the currently-rendered data.
+function initMapProvinceSelect(){
+  var sel=document.getElementById('mapProvince');
+  if(sel.options.length) return;   // already populated
+  sel.innerHTML=PROVINCES.map(function(p){ return '<option>'+escapeHtml(p)+'</option>'; }).join('');
+}
+function getSelectedProvinces(){ return getSelected('mapProvince'); }
+
+// ── Map filters: index range ─────────────────────────────────────────────────
+function setupIdxSlider(d){
+  // Index slider scale from the data (padded to sane bounds)
+  var idxs=(d.features||[]).map(function(f){ return f.properties.index; })
+                           .filter(function(v){ return v!=null && isFinite(v); });
+  var lo=idxs.length?Math.floor(Math.min.apply(null,idxs)):0;
+  var hi=idxs.length?Math.ceil(Math.max.apply(null,idxs)):200;
+  if(lo===hi){ hi=lo+1; }
+  _idxBounds={min:lo,max:hi};
+  var mn=document.getElementById('idxMin'), mx=document.getElementById('idxMax');
+  mn.min=lo; mn.max=hi; mn.value=lo; mn.disabled=!idxs.length;
+  mx.min=lo; mx.max=hi; mx.value=hi; mx.disabled=!idxs.length;
+  updateIdxLabel();
+}
+
+function onIdxSlider(which){
+  var mn=document.getElementById('idxMin'), mx=document.getElementById('idxMax');
+  // keep the thumbs from crossing
+  if(+mn.value > +mx.value){
+    if(which==='min') mx.value=mn.value; else mn.value=mx.value;
+  }
+  updateIdxLabel();
+  applyMapFilters();
+}
+
+function updateIdxLabel(){
+  var mn=+document.getElementById('idxMin').value, mx=+document.getElementById('idxMax').value;
+  var full=(mn<=_idxBounds.min && mx>=_idxBounds.max);
+  document.getElementById('idxRangeLbl').textContent=
+    full ? '('+_idxBounds.min+'–'+_idxBounds.max+', showing all)' : '('+mn+' – '+mx+')';
+}
+
+function mapFilterState(){
+  return {
+    provinces: new Set(getSelectedProvinces()),
+    min: +document.getElementById('idxMin').value,
+    max: +document.getElementById('idxMax').value,
+    full: (+document.getElementById('idxMin').value <= _idxBounds.min &&
+           +document.getElementById('idxMax').value >= _idxBounds.max)
+  };
+}
+
+function filteredFeatures(){
+  if(!_mapGeojson) return [];
+  var f=mapFilterState();
+  return (_mapGeojson.features||[]).filter(function(ft){
+    var p=ft.properties||{};
+    if(f.provinces.size && !f.provinces.has(p.province)) return false;
+    if(p.index==null) return f.full;   // N/A areas show only at the full range
+    return p.index>=f.min && p.index<=f.max;
+  });
+}
+
+function applyMapFilters(){ if(_mapGeojson) drawFsaLayer(false); }
+
+function drawFsaLayer(fitView){
+  if(_fsaLayer){ _map.removeLayer(_fsaLayer); _fsaLayer=null; }
+  var feats=filteredFeatures();
+  _fsaLayer = L.geoJSON({type:'FeatureCollection',features:feats}, {
+    style: function(f){
+      return { fillColor: colorForIndex(f.properties.index),
+               weight:1, color:'#0d0d2b', opacity:0.9, fillOpacity:0.65 };
+    },
+    onEachFeature: function(f,layer){
+      var p=f.properties;
+      layer.bindPopup('<strong>'+escapeHtml(p.fsa)+'</strong>'+
+        (p.city?' — '+escapeHtml(p.city):'')+(p.province?', '+escapeHtml(p.province):'')+
+        '<br>Index: <strong>'+(p.index==null?'N/A':p.index)+'</strong>'+
+        '<br>Value: '+(p.value==null?'N/A':Number(p.value).toLocaleString()));
+      layer.on('mouseover',function(){ layer.setStyle({weight:2.5,fillOpacity:0.85}); });
+      layer.on('mouseout', function(){ _fsaLayer.resetStyle(layer); });
+    }
+  }).addTo(_map);
+
+  if(fitView){
+    try{ if(feats.length) _map.fitBounds(_fsaLayer.getBounds(),{padding:[20,20]}); }catch(e){}
+  }
+  // Only vector layers gain bringToFront once they hold markers — guard it.
+  if(_poiLayer && _poiLayer.getLayers && _poiLayer.getLayers().length && _poiLayer.bringToFront){
+    _poiLayer.bringToFront();
+  }
+
+  var meta=_mapGeojson.meta||{};
+  var total=(_mapGeojson.features||[]).length;
+  var miss=(meta.no_geometry&&meta.no_geometry.length)||0;
+  var fs=mapFilterState();
+  var filterOn=fs.provinces.size || !fs.full;
+  document.getElementById('mapFilterCount').textContent=
+    filterOn ? 'Showing '+feats.length+' of '+total+' mapped FSAs after filters.' : '';
+  showStatus('st4', meta.mapped?'ok':'warn',
+    '✓ '+(meta.mapped||0)+' of '+(meta.requested||0)+' FSAs mapped'+
+    (filterOn?' — '+feats.length+' shown after filters':'')+
+    (miss?' — '+miss+' had no boundary and were skipped':'')+'.');
+}
+
+function updateLegend(){
+  if(_legend){ _map.removeControl(_legend); }
+  _legend = L.control({position:'bottomright'});
+  _legend.onAdd=function(){
+    var div=L.DomUtil.create('div');
+    div.style.cssText='background:rgba(13,13,43,0.88);color:#f0eeff;padding:9px 11px;'+
+      'border-radius:8px;font-size:11px;line-height:1.6;border:1px solid rgba(180,160,255,0.28)';
+    var rows=[['≥120','#2dd4bf','Over-indexed'],['105–120','#7fe3c8',''],
+              ['95–105','#c8c0e8','~ average'],['80–95','#fca5a5',''],
+              ['<80','#f87171','Under-indexed'],['N/A','#5b5b7a','No data']];
+    div.innerHTML='<div style="font-weight:700;margin-bottom:3px">Index vs national</div>'+
+      rows.map(function(r){
+        return '<div style="display:flex;align-items:center;gap:6px">'+
+          '<span style="width:12px;height:12px;background:'+r[1]+';display:inline-block;border-radius:2px"></span>'+
+          r[0]+(r[2]?' · '+r[2]:'')+'</div>';
+      }).join('')+
+      '<div style="display:flex;align-items:center;gap:6px;margin-top:4px;padding-top:4px;border-top:1px solid rgba(180,160,255,0.18)">'+
+        '<span style="width:10px;height:10px;background:#fbbf24;border:1.5px solid #fff;display:inline-block;border-radius:50%"></span>'+
+        'Point of interest</div>';
+    return div;
+  };
+  _legend.addTo(_map);
+}
+
+function plotPOI(points, clearFirst){
+  if(!_poiLayer) return;
+  if(clearFirst){ _poiLayer.clearLayers(); _poiPoints=[]; }
+  points.forEach(function(p){ _poiPoints.push(p); });
+  points.forEach(function(p){
+    L.circleMarker([p.lat,p.lng],{radius:5,color:'#fff',weight:1,fillColor:'#fbbf24',fillOpacity:0.95})
+      .bindPopup('<strong>'+escapeHtml(p.name||'POI')+'</strong><br>'+
+        Number(p.lat).toFixed(5)+', '+Number(p.lng).toFixed(5))
+      .addTo(_poiLayer);
+  });
+  if(!document.getElementById('poiToggle').checked){
+    document.getElementById('poiToggle').checked=true;
+  }
+  _poiLayer.addTo(_map);
+}
+
+var _poiBusy=false, _poiAbort=null, _poiTimers=[];
+
+// Give a heads-up about search cost *before* firing the request — a big or
+// dense (large-city) view is the actual reason lookups get slow, not
+// something retries fix, so set expectations up front.
+function bboxKm(){
+  if(!_map) return null;
+  var b=_map.getBounds();
+  var south=b.getSouth(), north=b.getNorth(), west=b.getWest(), east=b.getEast();
+  var mean=(south+north)/2;
+  var w=Math.abs(east-west)*111*Math.cos(mean*Math.PI/180);
+  var h=Math.abs(north-south)*111;
+  return {w:w,h:h};
+}
+function updatePoiAreaHint(){
+  var hint=document.getElementById('poiAreaHint');
+  if(!hint || _poiBusy) return;
+  var km=bboxKm();
+  var grid=chooseGrid(km);
+  var n=grid.cols*grid.rows;
+  if(n>1){
+    var tw=Math.round(km.w/grid.cols), th=Math.round(km.h/grid.rows);
+    var huge=(tw>150||th>150);
+    hint.innerHTML=(huge?'⚠ ':'')+'Large view (~'+Math.round(km.w)+'×'+Math.round(km.h)+
+      ' km) — will be searched as '+n+' areas of ~'+tw+'×'+th+' km'+
+      (huge?'. Still very large; zoom in for reliable coverage.':', plotted as each finishes.');
+    hint.style.color=huge?'var(--amber)':'';
+  }else{
+    hint.textContent='Searches the current map view. Zoom/pan first to set the area.';
+    hint.style.color='';
+  }
+}
+
+function clearPoiTimers(){ _poiTimers.forEach(clearTimeout); _poiTimers=[]; }
+
+function cancelPOISearch(){
+  _poiCancelled=true;
+  if(_poiAbort) _poiAbort.abort();
+}
+
+// ── Tiled POI search ────────────────────────────────────────────────────────
+// One the POI service query over a wide view reliably times out — the area is too big
+// for the public servers to scan inside their limit, and no amount of retrying
+// changes that. Splitting the view into a grid and searching each cell makes
+// each query small enough to answer, and the results are unioned back together.
+// Tiles are searched a couple at a time and plotted as they land, so markers
+// appear progressively and one failed cell doesn't lose the rest.
+
+var POI_TILE_TARGET_KM = 55;   // aim for cells the POI service can answer comfortably
+var POI_MAX_TILES      = 12;   // ceiling on requests per search — these are
+                               // the free shared POI servers
+var POI_TILE_LIMIT     = 120;  // results per cell
+var POI_MAX_POINTS     = 3000; // marker budget, so the map stays responsive
+var POI_CONCURRENCY    = 2;
+
+// Split a bbox into cols x rows sub-boxes, ordered centre-outwards so the most
+// likely area of interest is searched first and shows up on the map soonest.
+function poiTiles(bbox, cols, rows){
+  var south=bbox[0], west=bbox[1], north=bbox[2], east=bbox[3];
+  var dLat=(north-south)/rows, dLng=(east-west)/cols;
+  var tiles=[];
+  for(var r=0;r<rows;r++){
+    for(var c=0;c<cols;c++){
+      tiles.push({
+        bbox:[south+r*dLat, west+c*dLng, south+(r+1)*dLat, west+(c+1)*dLng],
+        dist:Math.abs(r-(rows-1)/2)+Math.abs(c-(cols-1)/2)
+      });
+    }
+  }
+  tiles.sort(function(a,b){ return a.dist-b.dist; });
+  return tiles.map(function(t){ return t.bbox; });
+}
+
+// Grid shape from the view's real dimensions, so tiles stay roughly square in
+// km rather than in degrees (a degree of longitude is much shorter than a
+// degree of latitude at Canadian latitudes).
+function chooseGrid(km){
+  if(!km) return {cols:1, rows:1};
+  var cols=Math.max(1, Math.ceil(km.w/POI_TILE_TARGET_KM));
+  var rows=Math.max(1, Math.ceil(km.h/POI_TILE_TARGET_KM));
+  // Trim to the request budget by always coarsening whichever axis currently has
+  // the *smaller* cell dimension — that axis is the over-divided one, so this
+  // keeps cells roughly square in km. Comparing counts instead would shrink one
+  // axis repeatedly (a 300x200km view became 3x4 cells of 100x50km rather than
+  // 4x3 of 75x67km, making every cell twice as wide as it needed to be).
+  while(cols*rows>POI_MAX_TILES && (cols>1 || rows>1)){
+    if(rows<=1 || (cols>1 && km.w/cols <= km.h/rows)) cols--;
+    else rows--;
+  }
+  return {cols:Math.max(1,cols), rows:Math.max(1,rows)};
+}
+
+var _poiCancelled=false;
+
+// Run the tile requests with bounded concurrency, reporting each result as it
+// arrives. Never rejects: a tile that fails resolves as a failure record so the
+// search continues and reports honestly at the end.
+async function runPoiTiles(query, tiles, onTile){
+  var next=0, active=[];
+  async function worker(){
+    while(next<tiles.length && !_poiCancelled){
+      var i=next++;
+      var res;
+      try{
+        var r=await fetch('/ca-geo/api/poi',{
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({query:query, bbox:tiles[i], limit:POI_TILE_LIMIT}),
+          signal:_poiAbort.signal
+        });
+        var d=await r.json();
+        res = d.error ? {ok:false, error:d.error} : {ok:true, data:d};
+      }catch(e){
+        if(e && e.name==='AbortError') return;
+        res = {ok:false, error:e.message};
+      }
+      if(_poiCancelled) return;
+      onTile(i, res);
+    }
+  }
+  for(var w=0; w<Math.min(POI_CONCURRENCY, tiles.length); w++) active.push(worker());
+  await Promise.all(active);
+}
+
+async function searchPOI(){
+  if(_poiBusy) return;   // ignore rapid re-fire / Enter repeats while a search is in flight
+  var q=document.getElementById('poiQuery').value.trim();
+  if(!q){ showStatus('st4','warn','Enter a name or brand to search (e.g. Burger Barn).'); return; }
+  if(!_map){ showStatus('st4','err','Open the map first.'); return; }
+  // Force Leaflet to resync its size before reading bounds — if the map
+  // container only just became visible, a stale/zero size here can hand back
+  // degenerate or reversed bounds that the POI service rejects with a 400.
+  _map.invalidateSize();
+  var b=_map.getBounds();
+  var south=b.getSouth(), north=b.getNorth(), west=b.getWest(), east=b.getEast();
+  if(south>north){ var tmp=south; south=north; north=tmp; }
+  if(west>east){ var tmp2=west; west=east; east=tmp2; }
+  var bbox=[south, west, north, east];
+  var km=bboxKm();
+  var grid=chooseGrid(km);
+  var tiles=poiTiles(bbox, grid.cols, grid.rows);
+  var tileKm=km?{w:km.w/grid.cols, h:km.h/grid.rows}:null;
+  // Tiling makes large views searchable, but it isn't unlimited — past the tile
+  // budget the cells themselves are too big to answer, and saying so beats
+  // grinding through a dozen doomed requests.
+  var tilesStillHuge = tileKm && (tileKm.w>150 || tileKm.h>150);
+
+  _poiBusy=true; _poiCancelled=false;
+  var btn=document.getElementById('poiSearchBtn'), oldHtml=btn?btn.innerHTML:'';
+  var cancelBtn=document.getElementById('poiCancelBtn');
+  if(btn){ btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Searching…'; }
+  if(cancelBtn) cancelBtn.style.display='';
+  var t0=performance.now();
+
+  var total=tiles.length, done=0, failed=0, saturated=0, found=0, first=true;
+  var seen={};
+
+  function progress(){
+    var pct=Math.round(done/total*100);
+    showStatus('st4','info','<span class="spinner"></span> Searching "'+escapeHtml(q)+'" — '+
+      (total>1 ? 'area '+done+' of '+total+' ('+pct+'%)' : 'scanning the current view')+
+      ' · '+found+' found so far'+
+      (failed?' · <span style="color:var(--amber)">'+failed+' area'+(failed!==1?'s':'')+' failed</span>':''));
+  }
+  showStatus('st4','info','<span class="spinner"></span> Searching "'+escapeHtml(q)+'"…'+
+    (total>1?' Splitting the view into '+total+' areas ('+grid.cols+'×'+grid.rows+
+             ', ~'+Math.round(tileKm.w)+'×'+Math.round(tileKm.h)+' km each).':''));
+
+  // Hard client-side ceiling so the UI can never wait indefinitely, scaled to
+  // the number of tiles rather than a single fixed budget.
+  clearPoiTimers();
+  _poiAbort=new AbortController();
+  var hardCap=setTimeout(function(){ cancelPOISearch(); },
+                         Math.min(180000, 25000 + total*12000));
+
+  try{
+    await runPoiTiles(q, tiles, function(i, res){
+      done++;
+      if(!res.ok){ failed++; progress(); return; }
+      if(res.data.saturated) saturated++;
+      // Dedupe across tiles: The POI service returns ways that merely *intersect* a
+      // cell, so a large feature straddling a boundary comes back from both.
+      var fresh=(res.data.points||[]).filter(function(p){
+        var k=p.lat.toFixed(5)+','+p.lng.toFixed(5);
+        if(seen[k]) return false;
+        seen[k]=1; return true;
+      });
+      if(found+fresh.length>POI_MAX_POINTS) fresh=fresh.slice(0, Math.max(0, POI_MAX_POINTS-found));
+      found+=fresh.length;
+      if(fresh.length){ plotPOI(fresh, first); first=false; }
+      progress();
+      if(found>=POI_MAX_POINTS) cancelPOISearch();
+    });
+  }catch(e){
+    showStatus('st4','err','✗ POI search failed: '+e.message);
+    return;
+  }finally{
+    clearTimeout(hardCap); clearPoiTimers();
+    _poiBusy=false; _poiAbort=null;
+    if(btn){ btn.disabled=false; btn.innerHTML=oldHtml; }
+    if(cancelBtn) cancelBtn.style.display='none';
+  }
+
+  var secs=((performance.now()-t0)/1000).toFixed(0);
+  var notes=[];
+  // Only worth noting when *some* areas failed — if they all did, the headline
+  // already says so and repeating it just pads the message.
+  if(failed && failed<total) notes.push(failed+' of '+total+' area'+(failed!==1?'s':'')+
+    ' could not be searched (POI service busy or still too dense) — results below are partial.');
+  if(saturated) notes.push(saturated+' area'+(saturated!==1?'s':'')+' hit the '+POI_TILE_LIMIT+
+    '-result cap, so some locations there are not shown. Zoom in on those areas for the full set.');
+  if(found>=POI_MAX_POINTS) notes.push('Stopped at the '+POI_MAX_POINTS+
+    '-marker display limit, with '+(total-done)+' area'+((total-done)!==1?'s':'')+' unsearched.');
+  if(tilesStillHuge) notes.push('Even split up, each area is ~'+Math.round(tileKm.w)+'×'+
+    Math.round(tileKm.h)+' km — zoom in for more reliable coverage.');
+
+  var cancelledEarly=_poiCancelled && found<POI_MAX_POINTS && done<total;
+  if(cancelledEarly && found) notes.push('Cancelled with '+(total-done)+' of '+total+
+    ' area'+(total!==1?'s':'')+' unsearched — the markers shown are only from the areas that finished.');
+  var kind = found ? (failed||saturated||cancelledEarly ? 'warn' : 'ok')
+                   : (failed===total ? 'err' : 'warn');
+  var head = found
+    ? '✓ Found '+found+' "'+escapeHtml(q)+'" location'+(found!==1?'s':'')+
+      (total>1?' across '+(done-failed)+' of '+total+' areas':' in the current view')+' ('+secs+'s).'
+    : (cancelledEarly ? '✗ Search cancelled after '+secs+'s.'
+       : failed===total ? '✗ Every area failed — the POI service is busy. Wait a few seconds and try again.'
+       : 'No matching POIs in the current map area ('+secs+'s).');
+  showStatus('st4', kind, head + (notes.length?'<br><span style="font-size:12px;opacity:0.85">'+notes.join(' ')+'</span>':''));
+}
+
+function clearPOI(){ if(_poiLayer) _poiLayer.clearLayers(); _poiPoints=[]; showStatus('st4','info','POI markers cleared.'); }
+
+function togglePOI(){
+  if(!_map||!_poiLayer) return;
+  if(document.getElementById('poiToggle').checked){ _poiLayer.addTo(_map); }
+  else{ _map.removeLayer(_poiLayer); }
+}
+
+function addManualPOI(){
+  var raw=document.getElementById('poiManual').value.trim();
+  if(!raw){ showStatus('st4','warn','Paste at least one "lat,lng,label" row.'); return; }
+  var pts=[];
+  raw.split(/\n/).forEach(function(line){
+    var parts=line.split(',');
+    if(parts.length>=2){
+      var lat=parseFloat(parts[0]), lng=parseFloat(parts[1]);
+      var label=parts.slice(2).join(',').trim()||'Location';
+      if(!isNaN(lat)&&!isNaN(lng)) pts.push({lat:lat,lng:lng,name:label});
+    }
+  });
+  if(!pts.length){ showStatus('st4','err','No valid "lat,lng,label" rows found.'); return; }
+  plotPOI(pts,false);
+  showStatus('st4','ok','✓ Added '+pts.length+' custom location'+(pts.length!==1?'s':'')+'.');
+}
+
+// Export the FSAs currently shown on the map (honouring the province/index
+// filters) with their value + index for the selected trait, as CSV.
+function exportMapData(){
+  if(!_mapGeojson || !(_mapGeojson.features||[]).length){
+    showStatus('st4','warn','Pick a dataset and trait to draw the map before exporting.'); return;
+  }
+  var feats=filteredFeatures();
+  if(!feats.length){ showStatus('st4','warn','No FSAs match the current filters — nothing to export.'); return; }
+  var esc=function(v){
+    v=(v==null?'':String(v));
+    return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v;
+  };
+  var rows=[['FSA','City','Province','Index vs National (100 = avg)']];
+  feats.slice().sort(function(a,b){
+    var ai=a.properties.index, bi=b.properties.index;
+    return (bi==null?-1:bi)-(ai==null?-1:ai);   // highest index first
+  }).forEach(function(f){
+    var p=f.properties||{};
+    rows.push([p.fsa, p.city||'', p.province||'', p.index==null?'N/A':p.index]);
+  });
+  var csv=rows.map(function(r){ return r.map(esc).join(','); }).join('\r\n');
+  // BOM so Excel opens UTF-8 (accented city names) correctly.
+  var blob=new Blob(['﻿'+csv],{type:'text/csv;charset=utf-8'});
+  var safeTrait=_mapTraitDesc.replace(/[^\w\-]+/g,'_').slice(0,40);
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='fsa_index_'+safeTrait+'_'+feats.length+'FSAs.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showStatus('st4','ok','✓ Exported '+feats.length+' FSAs with index values for "'+escapeHtml(_mapTraitDesc)+'".');
+}
+
+// Export the current choropleth to a 16:9 high-resolution PNG (PowerPoint-friendly).
+// Renders an off-screen map at 1920x1080 with CORS tiles, then paints the POI
+// markers, a title, and the legend onto the resulting canvas.
+async function exportMap(){
+  if(!_mapGeojson || !(_mapGeojson.features||[]).length){
+    showStatus('st4','warn','Pick a dataset and trait to draw the map before exporting.'); return;
+  }
+  if(typeof leafletImage!=='function'){
+    showStatus('st4','err','Map export library not loaded.'); return;
+  }
+  var btn=document.getElementById('mapExportBtn');
+  btn.disabled=true;
+  var oldHtml=btn.innerHTML;
+  btn.innerHTML='<span class="spinner"></span> Rendering…';
+  showStatus('st4','info','<span class="spinner"></span> Rendering a high-resolution image… this can take a few seconds.');
+
+  // Frame the export on exactly the on-screen extent.
+  //
+  // Copying centre + zoom is NOT enough: zoom fixes metres-per-pixel, so a
+  // 1920px-wide canvas at the preview's zoom covers ~2x more ground than an
+  // ~870px preview — which is why exports came back showing whole regions when
+  // the preview was zoomed to one city.
+  //
+  // Raising the zoom by an integer k while scaling the pixel size by 2^k keeps
+  // the ground covered identical (metres-per-pixel halves k times, pixel count
+  // doubles k times) and keeps the zoom an integer, which leaflet-image needs
+  // for its tile maths. A fractional preview zoom, if the map is ever
+  // configured for one, is absorbed into the pixel scale instead.
+  var MAXZ=19;
+  var mapEl=document.getElementById('leafletMap');
+  var pw=(mapEl&&mapEl.clientWidth)||960, ph=(mapEl&&mapEl.clientHeight)||540;
+  var pz=_map?_map.getZoom():4, zi=Math.floor(pz), frac=pz-zi;
+  var k=0;
+  while(zi+k<MAXZ && pw*Math.pow(2,k-frac)<1920) k++;
+  var mul=Math.pow(2,k-frac);
+  var renderW=Math.max(1,Math.round(pw*mul)), renderH=Math.max(1,Math.round(ph*mul));
+  var zExp=zi+k;
+  // Output never upscales, and keeps the preview's aspect so nothing is
+  // stretched. The container declares aspect-ratio:16/9 but its integer pixel
+  // size lands a hair off (e.g. 792x445 = 1.7798), which would emit an odd
+  // 1920x1079; snap back to a true 16:9 when the measured box is within 1% of
+  // it, since a 0.1% stretch is invisible and clean dimensions matter in a deck.
+  var W=Math.min(1920,renderW), H=Math.round(W*renderH/renderW);
+  if(Math.abs((renderW/renderH)/(16/9)-1)<0.01) H=Math.round(W*9/16);
+  var sx=W/renderW, sy=H/renderH;
+
+  var holder=document.createElement('div');
+  holder.style.cssText='position:absolute;left:-99999px;top:0;width:'+renderW+'px;height:'+renderH+'px';
+  document.body.appendChild(holder);
+
+  // preferCanvas is REQUIRED here: leaflet-image can only capture layers drawn
+  // to <canvas>. Without it the polygons render as SVG and vanish from the export.
+  var emap=L.map(holder,{zoomControl:false,attributionControl:true,fadeAnimation:false,
+                         zoomAnimation:false,preferCanvas:true});
+  var tiles=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+    crossOrigin:true, maxZoom:19, attribution:'© OpenStreetMap contributors'
+  }).addTo(emap);
+  // Export exactly what's on screen: same province/index-range filters.
+  var exportFeats=filteredFeatures();
+  var egj=L.geoJSON({type:'FeatureCollection',features:exportFeats},{
+    renderer:L.canvas(),
+    style:function(f){ return {fillColor:colorForIndex(f.properties.index),weight:1,color:'#0d0d2b',opacity:0.9,fillOpacity:0.7}; }
+  }).addTo(emap);
+  // Same centre, zoom raised by k to match the enlarged canvas — together these
+  // reproduce the preview's geographic bounds exactly (see the maths above).
+  try{
+    if(_map){ emap.setView(_map.getCenter(), zExp); }
+    else    { emap.fitBounds(egj.getBounds(),{padding:[40,40]}); }
+  }catch(e){ try{ emap.fitBounds(egj.getBounds(),{padding:[40,40]}); }catch(_e){} }
+
+  function cleanup(){ try{ emap.remove(); }catch(e){} if(holder.parentNode) holder.parentNode.removeChild(holder); }
+
+  // Wait for tiles to finish (with a hard fallback).
+  await new Promise(function(res){
+    var done=false, finish=function(){ if(!done){ done=true; setTimeout(res,500); } };
+    tiles.on('load', finish);
+    setTimeout(res, 6000);
+  });
+
+  leafletImage(emap, function(err, rendered){
+    try{
+      if(err) throw err;
+      // Resample the rendered map down to the output size, then draw the
+      // overlays on top at their normal pixel sizes — so the title and legend
+      // stay legible instead of shrinking with the resample.
+      var canvas=document.createElement('canvas');
+      canvas.width=W; canvas.height=H;
+      var ctx=canvas.getContext('2d');
+      ctx.imageSmoothingEnabled=true;
+      if(ctx.imageSmoothingQuality) ctx.imageSmoothingQuality='high';
+      ctx.drawImage(rendered, 0,0,rendered.width,rendered.height, 0,0,W,H);
+
+      // POI markers. Projected in the render canvas's coordinates, so scale
+      // into output space by the same factor the map image was resampled by.
+      if(document.getElementById('poiToggle').checked){
+        _poiPoints.forEach(function(p){
+          var pt;
+          try{ pt=emap.latLngToContainerPoint([p.lat,p.lng]); }catch(e){ return; }
+          var x=pt.x*sx, y=pt.y*sy;
+          if(x<0||y<0||x>W||y>H) return;
+          ctx.beginPath(); ctx.arc(x,y,7,0,Math.PI*2);
+          ctx.fillStyle='#fbbf24'; ctx.fill();
+          ctx.lineWidth=2; ctx.strokeStyle='#ffffff'; ctx.stroke();
+        });
+      }
+
+      // Title (top-left).
+      // Title = the editable export title only (trait deliberately excluded).
+      var label=exportTitleValue();
+      var n=exportFeats.length;
+      ctx.font='700 30px Helvetica, Arial, sans-serif';
+      var t1=label;
+      var t2=n+' FSAs · index vs national (100 = average)';
+      var tw=Math.max(ctx.measureText(t1).width, 420)+36;
+      ctx.fillStyle='rgba(13,13,43,0.82)';
+      ctx.fillRect(18,18,tw,84);
+      ctx.fillStyle='#f0eeff'; ctx.fillText(t1,36,56);
+      ctx.font='400 18px Helvetica, Arial, sans-serif';
+      ctx.fillStyle='#c8c0e8'; ctx.fillText(t2,36,86);
+
+      // Legend (bottom-right). No trait name here — index buckets are always
+      // the same regardless of what's plotted — plus a POI swatch when any
+      // point-of-interest markers are shown on the export.
+      var rows=[['≥120','#2dd4bf','Over-indexed'],['105–120','#7fe3c8',''],
+                ['95–105','#c8c0e8','~ average'],['80–95','#fca5a5',''],
+                ['<80','#f87171','Under-indexed'],['N/A','#5b5b7a','No data']];
+      var showPoiRow=document.getElementById('poiToggle').checked;
+      var lw=210, lh=34+rows.length*26+(showPoiRow?30:0), lx=W-lw-24, ly=H-lh-40;
+      ctx.fillStyle='rgba(13,13,43,0.86)'; ctx.fillRect(lx,ly,lw,lh);
+      ctx.font='700 16px Helvetica, Arial, sans-serif'; ctx.fillStyle='#f0eeff';
+      ctx.fillText('Index vs national', lx+14, ly+24);
+      ctx.font='400 14px Helvetica, Arial, sans-serif';
+      rows.forEach(function(r,i){
+        var ry=ly+34+i*26;
+        ctx.fillStyle=r[1]; ctx.fillRect(lx+14,ry,14,14);
+        ctx.fillStyle='#e8e0ff';
+        ctx.fillText(r[0]+(r[2]?'  ·  '+r[2]:''), lx+34, ry+12);
+      });
+      if(showPoiRow){
+        var py=ly+34+rows.length*26+14;
+        ctx.strokeStyle='rgba(180,160,255,0.25)'; ctx.beginPath();
+        ctx.moveTo(lx+14,py-14); ctx.lineTo(lx+lw-14,py-14); ctx.stroke();
+        ctx.beginPath(); ctx.arc(lx+21,py,6,0,Math.PI*2);
+        ctx.fillStyle='#fbbf24'; ctx.fill();
+        ctx.lineWidth=1.5; ctx.strokeStyle='#ffffff'; ctx.stroke();
+        ctx.fillStyle='#e8e0ff'; ctx.fillText('Point of interest', lx+34, py+5);
+      }
+
+      canvas.toBlob(function(blob){
+        if(!blob){ showStatus('st4','err','Could not encode image (a map tile may have blocked cross-origin access).'); cleanup(); resetBtn(); return; }
+        var safe=label.replace(/[^\w\-]+/g,'_');
+        var a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);
+        a.download='fsa_map_'+safe+'_'+n+'FSAs.png';
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showStatus('st4','ok','✓ Map image downloaded ('+W+'×'+H+
+          ') — framed on the current map view.');
+        cleanup(); resetBtn();
+      }, 'image/png');
+    }catch(e){
+      showStatus('st4','err','Export failed: '+(e&&e.message?e.message:e)+'. Some OSM tiles may block cross-origin capture — try again.');
+      cleanup(); resetBtn();
+    }
+  });
+
+  function resetBtn(){ btn.disabled=false; btn.innerHTML=oldHtml; }
+}
+</script>
+
+<!-- ── CLUSTER MODAL ────────────────────────────────────────────────────────── -->
+<div id="clusterModal" class="modal-overlay" style="display:none" onclick="if(event.target===this)closeClusterModal()">
+  <div class="modal-box">
+    <div class="modal-head">
+      <span class="modal-head-title">Select Lifestyle Clusters</span>
+      <button class="modal-x" onclick="closeClusterModal()">×</button>
+    </div>
+    <div class="modal-search">
+      <input id="clusterSearch" type="text" placeholder="Search by name or number…" oninput="renderClusterList(this.value)">
+    </div>
+    <div class="modal-list" id="clusterList"></div>
+    <div class="modal-foot">
+      <span class="modal-foot-info" id="clusterFootInfo">0 segments selected</span>
+      <div class="modal-foot-btns">
+        <button class="btn btn-secondary btn-sm" onclick="closeClusterModal()">Cancel</button>
+        <button class="btn btn-primary btn-sm" id="clusterApplyBtn" disabled onclick="applyCluster()">Load FSAs</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,716 @@
+<script data-demo="onboarding">
+// Onboarding — per-employee kanban schedule, templates and shared deck links.
+// Mirrors tools/onboarding.py; state lives in Mock.store('onboarding') instead of CSV files.
+(function () {
+  'use strict';
+  var S = Mock.store('onboarding');
+  var STATUSES = ['todo', 'in_progress', 'done'];
+  var BUILTIN = 'Default onboarding (built-in)';
+  var BLANK = '— Blank (no tasks) —';
+
+  var TEMPLATE = [
+    ['Week 1 · Setup', 'Accounts & system access provisioned'],
+    ['Week 1 · Setup', 'Intro to team, roles & communication channels'],
+    ['Week 1 · Foundations', 'Data stack overview'],
+    ['Week 1 · Foundations', 'Audience taxonomy & demographic stats training'],
+    ['Week 2 · Core Tools', 'Audience & Campaign Tracker walkthrough'],
+    ['Week 2 · Core Tools', 'CA Geo Analysis training'],
+    ['Week 2 · Core Tools', 'Taxonomy Search training'],
+    ['Week 2 · Process', 'DMP Insights & 1P·2P Cross Impute overview'],
+    ['Week 3 · Applied', 'Shadow a live audience build'],
+    ['Week 3 · Applied', 'First supervised project']
+  ];
+
+  // ── Seed data (made-up people, generic tasks, example.com links) ─────────
+  function seed() {
+    var r = Mock.rng('onboarding-seed-v1');
+    var deck = function (slug) { return 'https://example.com/decks/' + slug; };
+    var extra = [
+      ['Week 1 · Setup', 'Laptop, VPN & password manager set up', ''],
+      ['Week 1 · Setup', 'Read the team handbook', deck('team-handbook')],
+      ['Week 1 · Foundations', 'Glossary of audience & media terms', deck('glossary')],
+      ['Week 1 · Foundations', 'Privacy & data-handling basics', deck('privacy-basics')],
+      ['Week 2 · Core Tools', 'Survey Conversion walkthrough', deck('survey-conversion')],
+      ['Week 2 · Core Tools', 'Media Consumption dashboard tour', ''],
+      ['Week 2 · Process', 'Audience brief intake process', deck('brief-intake')],
+      ['Week 2 · Process', 'QA checklist for audience delivery', deck('qa-checklist')],
+      ['Week 3 · Applied', 'Build a practice lookalike model', ''],
+      ['Week 3 · Applied', 'Present findings at team stand-up', ''],
+      ['Week 4 · Wrap-up', '30-day check-in with manager', ''],
+      ['Week 4 · Wrap-up', 'Set 90-day learning goals', deck('learning-goals')]
+    ];
+    var people = ['Jordan Avery', 'Priya Castellano', 'Mateo Lindqvist', 'Hana Okafor'];
+    var tasks = [], n = 0;
+    people.forEach(function (emp, pi) {
+      var defs = TEMPLATE.map(function (d) { return [d[0], d[1], '']; });
+      if (pi !== 2) defs = defs.concat(Mock.shuffle(extra, r).slice(0, Mock.randInt(3, 7, r)));
+      defs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; });
+      var progress = [0.75, 0.35, 0.1, 0.55][pi];
+      var orders = { todo: 0, in_progress: 0, done: 0 };
+      defs.forEach(function (d, i) {
+        var f = i / defs.length;
+        var st = f < progress - 0.12 ? 'done' : f < progress + 0.05 ? 'in_progress' : 'todo';
+        tasks.push({ employee: emp, task_id: 'seed' + (n++), title: d[1], stage: d[0], status: st,
+          ppt_link: d[2] || (r() < 0.25 ? deck('topic-' + (i + 1)) : ''),
+          notes: r() < 0.15 ? 'Ask a teammate for the latest version.' : '', order: orders[st]++ });
+      });
+    });
+    var links = [
+      ['Audience Taxonomy 101', deck('audience-taxonomy-101')],
+      ['How we build lookalike audiences', deck('lookalike-primer')],
+      ['Geo analysis playbook', deck('geo-playbook')],
+      ['Client reporting templates', deck('reporting-templates')],
+      ['Media planning basics', deck('media-planning-basics')]
+    ].map(function (l, i) { return { link_id: 'l' + (1000 + i), title: l[0], url: l[1] }; });
+    var tmpl = [
+      ['Week 1', 'Meet the analytics pod', '', ''],
+      ['Week 1', 'Warehouse access & sample queries', deck('warehouse-101'), ''],
+      ['Week 2', 'Shadow a client insights readout', '', 'Pick any live account.'],
+      ['Week 2', 'Build first audience profile', '', ''],
+      ['Week 3', 'Independent insights deliverable', '', '']
+    ].map(function (t, i) {
+      return { template: 'Analyst fast-track', order: i, stage: t[0], title: t[1], ppt_link: t[2], notes: t[3] };
+    });
+    S.set('tasks', tasks); S.set('links', links); S.set('templates', tmpl); S.set('seeded', 1);
+  }
+  if (!S.get('seeded')) seed();
+
+  var getTasks = function () { return S.get('tasks', []); };
+  var getLinks = function () { return S.get('links', []); };
+  var getTmplRows = function () { return S.get('templates', []); };
+  var trim = function (v) { return String(v == null ? '' : v).trim(); };
+  var lower = function (a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0; };
+  var toInt = function (v) { var n = parseInt(parseFloat(v), 10); return isNaN(n) ? 0 : n; };
+
+  function employees(rows) {
+    var seen = [];
+    rows.forEach(function (r) { var e = trim(r.employee); if (e && seen.indexOf(e) < 0) seen.push(e); });
+    return seen.sort(lower);
+  }
+  function tasksFor(rows, emp) {
+    return rows.filter(function (r) { return trim(r.employee) === emp; }).map(function (r) {
+      var st = STATUSES.indexOf(r.status) >= 0 ? r.status : 'todo';
+      return { task_id: r.task_id || '', title: r.title || '', stage: r.stage || '', status: st,
+        ppt_link: r.ppt_link || '', notes: r.notes || '', order: toInt(r.order) };
+    }).sort(function (a, b) { return a.order - b.order; });
+  }
+  function linksList(rows) { return rows.map(function (r) { return { link_id: r.link_id, title: r.title, url: r.url }; }); }
+  function readTemplates() {
+    var t = {};
+    getTmplRows().forEach(function (r) {
+      var name = trim(r.template); if (!name) return;
+      (t[name] = t[name] || []).push({ stage: r.stage || '', title: r.title || '', ppt_link: r.ppt_link || '',
+        notes: r.notes || '', order: toInt(r.order) });
+    });
+    Object.keys(t).forEach(function (k) { t[k].sort(function (a, b) { return a.order - b.order; }); });
+    return t;
+  }
+  function templateNames() { return [BUILTIN].concat(Object.keys(readTemplates()).sort(lower)); }
+  function templateDefs(name) {
+    if (name === '' || name === BLANK) return [];
+    if (name === BUILTIN) return TEMPLATE.map(function (d) { return [d[0], d[1], '', '']; });
+    return (readTemplates()[name] || []).map(function (t) { return [t.stage, t.title, t.ppt_link, t.notes]; });
+  }
+  function makeTasks(emp, defs, start) {
+    var now = Date.now();
+    return defs.map(function (d, i) {
+      return { employee: emp, task_id: 't' + now + i, title: d[1], stage: d[0], status: 'todo',
+        ppt_link: d[2], notes: d[3], order: (start || 0) + i };
+    });
+  }
+  function statePayload(emp, fallback) {
+    var rows = getTasks(), emps = employees(rows);
+    // Demo: a remembered employee who no longer exists falls back to the first one.
+    if ((!emp || (fallback && emps.indexOf(emp) < 0)) && emps.length) emp = emps[0];
+    return { employees: emps, employee: emp, tasks: emp ? tasksFor(rows, emp) : [],
+      links: linksList(getLinks()), templates: templateNames() };
+  }
+  var err = function (m) { return Mock.json({ error: m }, 400); };
+
+  Mock.route('GET', '/onboarding-decks/api/state', function (req) {
+    return statePayload(trim(req.query.employee), true);
+  }, { latency: [60, 160] });
+
+  Mock.route('POST', '/onboarding-decks/api/employee/delete', function (req) {
+    var name = trim(req.json.name);
+    var rows = getTasks().filter(function (r) { return trim(r.employee) !== name; });
+    S.set('tasks', rows);
+    return { ok: true, employees: employees(rows) };
+  });
+
+  Mock.route('POST', '/onboarding-decks/api/employee', function (req) {
+    var name = trim(req.json.name), template = trim(req.json.template || BUILTIN);
+    if (!name) return err('Employee name is required.');
+    var rows = getTasks();
+    if (rows.some(function (r) { return trim(r.employee).toLowerCase() === name.toLowerCase(); }))
+      return err('Employee "' + name + '" already exists.');
+    S.set('tasks', rows.concat(makeTasks(name, templateDefs(template))));
+    return statePayload(name);
+  });
+
+  Mock.route('POST', '/onboarding-decks/api/save', function (req) {
+    var emp = trim(req.json.employee), tasks = req.json.tasks;
+    if (!emp) return err('employee is required');
+    if (!Array.isArray(tasks)) return err('tasks must be a list');
+    var rows = getTasks().filter(function (r) { return trim(r.employee) !== emp; });
+    tasks.forEach(function (t, i) {
+      var st = STATUSES.indexOf(t.status) >= 0 ? t.status : 'todo';
+      var o = t.order == null ? i : t.order;
+      rows.push({ employee: emp, task_id: String(t.task_id || ('t' + (i + 1))), title: trim(t.title),
+        stage: trim(t.stage), status: st, ppt_link: trim(t.ppt_link), notes: trim(t.notes),
+        order: /^-?\d+$/.test(String(o)) ? parseInt(o, 10) : i });
+    });
+    S.set('tasks', rows);
+    return { ok: true, saved: tasks.length };
+  }, { latency: [80, 200] });
+
+  Mock.route('POST', '/onboarding-decks/api/links', function (req) {
+    var d = req.json, rows = getLinks();
+    if (d.action === 'add') {
+      var title = trim(d.title), url = trim(d.url);
+      if (!title || !url) return err('Both a title and a URL are required.');
+      rows.push({ link_id: 'l' + Date.now(), title: title, url: url });
+    } else if (d.action === 'delete') {
+      rows = rows.filter(function (r) { return r.link_id !== d.link_id; });
+    } else return err('Unknown action.');
+    S.set('links', rows);
+    return { links: linksList(rows) };
+  });
+
+  Mock.route('POST', '/onboarding-decks/api/template', function (req) {
+    var d = req.json, name = trim(d.name);
+    if (d.action === 'save') {
+      var tasks = d.tasks;
+      if (!name) return err('Template name is required.');
+      if (name === BUILTIN || name === BLANK) return err('That name is reserved. Choose another.');
+      if (!Array.isArray(tasks) || !tasks.length) return err('Nothing to save — the board has no tasks.');
+      var rows = getTmplRows().filter(function (r) { return trim(r.template) !== name; });
+      tasks.forEach(function (t, i) {
+        rows.push({ template: name, order: i, stage: trim(t.stage), title: trim(t.title),
+          ppt_link: trim(t.ppt_link), notes: trim(t.notes) });
+      });
+      S.set('templates', rows);
+      return { ok: true, templates: templateNames(), saved: tasks.length };
+    }
+    if (d.action === 'delete') {
+      if (name === BUILTIN) return err('The built-in template cannot be deleted.');
+      S.set('templates', getTmplRows().filter(function (r) { return trim(r.template) !== name; }));
+      return { ok: true, templates: templateNames() };
+    }
+    if (d.action === 'apply') {
+      var emp = trim(d.employee), mode = trim(d.mode || 'replace');
+      if (!emp) return err('Select an employee first.');
+      var defs = templateDefs(name);
+      if (!defs.length) return err('That template has no tasks to apply.');
+      var all = getTasks();
+      var others = all.filter(function (r) { return trim(r.employee) !== emp; });
+      var mine = all.filter(function (r) { return trim(r.employee) === emp; });
+      var next;
+      if (mode === 'append') {
+        var orders = mine.filter(function (r) { return (r.status || 'todo') === 'todo'; }).map(function (r) { return toInt(r.order); });
+        var start = orders.length ? Math.max.apply(null, orders) + 1 : 0;
+        next = others.concat(mine, makeTasks(emp, defs, start));
+      } else next = others.concat(makeTasks(emp, defs, 0));
+      S.set('tasks', next);
+      return statePayload(emp);
+    }
+    return err('Unknown action.');
+  });
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Onboarding – Audience Analytics Engine</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0d0d2b;--deep:#131447;--violet:#7c5ce8;--purple:#5b4fcf;
+  --lavender:#a78bfa;--teal:#2dd4bf;--sky:#60a5fa;--amber:#fbbf24;--pink:#f472b6;--green:#3fb950;--red:#f87171;
+  --card-bg:rgba(255,255,255,0.05);--card-border:rgba(180,160,255,0.28);
+  --text:#f0eeff;--text-sec:#cdc6ec;--muted:#9d95c9;
+  --input-bg:rgba(255,255,255,0.07);--input-border:rgba(180,160,255,0.30);
+}
+html,body{min-height:100vh;position:relative;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:var(--text);background:var(--navy);overflow-x:hidden}
+body::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 70% 55% at 8% 15%,rgba(91,79,207,0.28)0%,transparent 60%),radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12)0%,transparent 55%),radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%);pointer-events:none;z-index:0}
+body::after{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(162,140,250,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(162,140,250,0.03) 1px,transparent 1px);background-size:52px 52px;pointer-events:none;z-index:0}
+.shell{position:relative;z-index:1}
+@keyframes pageIn{from{opacity:0}to{opacity:1}}
+body{animation:pageIn .35s ease both}
+body.leaving{opacity:0;transform:scale(.99);transition:opacity .2s ease,transform .2s ease}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:0 44px;height:84px;background:rgba(13,13,43,0.70);backdrop-filter:blur(18px);border-bottom:1px solid rgba(180,160,255,0.12)}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.brand-dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7);animation:pdot 2.6s ease-in-out infinite;flex-shrink:0}
+@keyframes pdot{0%,100%{box-shadow:0 0 8px rgba(124,92,232,0.7)}50%{box-shadow:0 0 18px rgba(45,212,191,0.9)}}
+.brand-name{font-size:1.2rem;font-weight:700;color:#e8e0ff;letter-spacing:0.01em}
+.brand-sep{width:1px;height:24px;background:var(--card-border)}
+.brand-sub{font-size:0.8rem;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase}
+.back-link{display:flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--muted);text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--card-border);background:rgba(255,255,255,0.03);transition:all .2s}
+.back-link:hover{color:var(--lavender);border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.08)}
+.back-link svg{width:13px;height:13px;stroke:currentColor}
+
+.container{max-width:1240px;margin:0 auto;padding:28px 28px 72px}
+
+.sec-head{font-size:0.65rem;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:var(--lavender);margin:24px 0 12px;display:flex;align-items:center;gap:10px}
+.sec-head::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--card-border),transparent)}
+
+/* Controls bar */
+.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.emp-select{display:flex;align-items:center;gap:8px}
+select,input[type=text],input[type=url],textarea{font-family:inherit;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border);border-radius:9px;padding:11px 14px;font-size:13.5px;transition:border-color .15s,box-shadow .15s}
+select:focus,input:focus,textarea:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+select{min-width:220px;cursor:pointer}
+select option{background:#fff;color:#1a1a2e}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:11px 20px;font-size:13px;font-weight:600;border-radius:9px;cursor:pointer;border:none;font-family:inherit;transition:all .18s;min-height:44px}
+.btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+.btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+.btn-secondary{background:rgba(255,255,255,0.05);color:var(--text-sec);border:1px solid var(--card-border)}
+.btn-secondary:hover{border-color:rgba(167,139,250,0.45);color:var(--text)}
+.btn-danger{background:rgba(248,113,113,0.12);color:var(--red);border:1px solid rgba(248,113,113,0.3)}
+.btn-danger:hover{background:rgba(248,113,113,0.2)}
+.btn-sm{padding:7px 13px;font-size:12px;min-height:auto}
+.save-ind{margin-left:auto;font-size:12px;color:var(--muted);display:flex;align-items:center;gap:9px}
+.save-ind .dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.save-ind.saving .dot{background:var(--amber)}.save-ind.saved .dot{background:var(--teal)}
+.spinner{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Progress summary */
+.progress-card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:14px;padding:18px 22px;margin-top:14px;backdrop-filter:blur(12px);display:flex;align-items:center;gap:26px;flex-wrap:wrap}
+.pc-pct{display:flex;flex-direction:column;gap:2px}
+.pc-pct .v{font-size:2rem;font-weight:700;background:linear-gradient(90deg,var(--teal),var(--sky));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1}
+.pc-pct .l{font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted)}
+.pc-track{flex:1;min-width:200px;height:12px;border-radius:7px;background:rgba(255,255,255,0.06);overflow:hidden;border:1px solid rgba(180,160,255,0.14)}
+.pc-fill{height:100%;width:0%;border-radius:7px;background:linear-gradient(90deg,var(--teal),var(--sky));transition:width .55s cubic-bezier(.22,.9,.35,1);box-shadow:0 0 12px rgba(45,212,191,0.5)}
+.pc-counts{display:flex;gap:18px}
+.pc-count{text-align:center}
+.pc-count .v{font-size:1.2rem;font-weight:700;font-variant-numeric:tabular-nums}
+.pc-count .l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em}
+
+/* Board */
+.board{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:6px}
+@media(max-width:900px){.board{grid-template-columns:1fr}}
+.column{background:rgba(255,255,255,0.03);border:1px solid var(--card-border);border-radius:14px;padding:14px;min-height:180px;transition:background .15s,border-color .15s}
+.column.drag-over{background:rgba(124,92,232,0.10);border-color:rgba(167,139,250,0.55)}
+.col-head{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:0 4px}
+.col-title{font-size:12px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase}
+.col-dot{width:9px;height:9px;border-radius:50%}
+.col-count{margin-left:auto;font-size:11px;color:var(--muted);background:rgba(255,255,255,0.06);border-radius:10px;padding:2px 9px;font-weight:700}
+.todo .col-dot{background:var(--muted)}.todo .col-title{color:var(--text-sec)}
+.in_progress .col-dot{background:var(--amber)}.in_progress .col-title{color:var(--amber)}
+.done .col-dot{background:var(--teal)}.done .col-title{color:var(--teal)}
+
+.task{background:var(--card-bg);border:1px solid var(--card-border);border-radius:11px;padding:12px 13px;margin-bottom:10px;cursor:grab;transition:transform .12s,box-shadow .12s,border-color .12s,opacity .12s;position:relative}
+.task:hover{border-color:rgba(167,139,250,0.5);box-shadow:0 4px 16px rgba(0,0,0,0.25);transform:translateY(-1px)}
+.task.dragging{opacity:0.45;cursor:grabbing}
+.task .t-stage{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;color:var(--lavender);background:rgba(124,92,232,0.14);border:1px solid rgba(167,139,250,0.28);border-radius:10px;padding:2px 8px;margin-bottom:7px}
+.task .t-title{font-size:13.5px;font-weight:600;line-height:1.4;color:var(--text);margin-bottom:9px}
+.task.done-task .t-title{color:var(--muted);text-decoration:line-through;text-decoration-color:rgba(157,149,201,0.5)}
+.task .t-actions{display:flex;gap:7px;align-items:center}
+.t-btn{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;padding:5px 10px;border-radius:7px;cursor:pointer;border:1px solid var(--card-border);background:rgba(255,255,255,0.04);color:var(--text-sec);transition:all .15s}
+.t-btn:hover{border-color:rgba(167,139,250,0.5);color:var(--text)}
+.t-btn.deck{color:var(--sky);border-color:rgba(96,165,250,0.35);background:rgba(96,165,250,0.10)}
+.t-btn.deck:hover{background:rgba(96,165,250,0.2)}
+.t-btn svg{width:12px;height:12px;stroke:currentColor;fill:none}
+.t-nolink{font-size:10.5px;color:var(--muted);opacity:0.7;font-style:italic}
+.add-task{width:100%;padding:10px;border:1.5px dashed var(--input-border);border-radius:10px;background:none;color:var(--muted);font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .15s}
+.add-task:hover{border-color:rgba(167,139,250,0.6);color:var(--text-sec);background:rgba(124,92,232,0.06)}
+
+/* Useful links */
+.links-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.link-card{display:flex;align-items:center;gap:11px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:11px;padding:13px 15px;transition:all .15s}
+.link-card:hover{border-color:rgba(96,165,250,0.5);box-shadow:0 4px 16px rgba(0,0,0,0.2)}
+.link-icon{width:34px;height:34px;border-radius:8px;background:rgba(96,165,250,0.14);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.link-body{flex:1;min-width:0}
+.link-body a{color:var(--text);font-weight:600;font-size:13px;text-decoration:none;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link-body a:hover{color:var(--sky)}
+.link-body .u{font-size:10.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link-del{color:var(--muted);cursor:pointer;font-weight:700;padding:2px 6px;border-radius:5px;flex-shrink:0}
+.link-del:hover{color:var(--red);background:rgba(248,113,113,0.1)}
+.add-link-form{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.add-link-form input{flex:1;min-width:160px}
+
+/* Template bar */
+.tmpl-bar{margin:2px 0 14px}
+.tmpl-label{font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted)}
+.tmpl-bar select{min-width:250px}
+.mini-check{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-sec);cursor:pointer;user-select:none}
+.mini-check input{accent-color:var(--violet);cursor:pointer;width:15px;height:15px}
+.bar-sep{width:1px;height:24px;background:var(--card-border)}
+
+.empty-state{text-align:center;padding:60px 20px;color:var(--muted)}
+.empty-state .ico{font-size:52px;margin-bottom:14px}
+.empty-state h3{color:var(--text-sec);font-size:1.05rem;margin-bottom:8px}
+
+/* Modal */
+.modal-back{position:fixed;inset:0;background:rgba(6,6,20,0.72);backdrop-filter:blur(4px);z-index:200;display:none;align-items:center;justify-content:center;padding:20px}
+.modal-back.open{display:flex}
+.modal{background:linear-gradient(160deg,#161638,#111130);border:1px solid var(--card-border);border-radius:16px;padding:26px;width:100%;max-width:520px;box-shadow:0 20px 60px rgba(0,0,0,0.5);animation:mIn .25s cubic-bezier(.22,.9,.35,1.1)}
+@keyframes mIn{from{opacity:0;transform:translateY(16px) scale(.97)}to{opacity:1;transform:none}}
+.modal h2{font-size:1.1rem;margin-bottom:18px;color:var(--text)}
+.mfield{margin-bottom:14px}
+.mfield label{display:block;font-size:11px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.mfield input,.mfield textarea,.mfield select{width:100%}
+.mfield textarea{resize:vertical;min-height:64px;line-height:1.5}
+.mfield .hint{font-size:10.5px;color:var(--muted);margin-top:5px}
+.modal-actions{display:flex;gap:10px;margin-top:22px;align-items:center}
+.modal-actions .spacer{flex:1}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<div class="container">
+
+  <div class="sec-head">Employee</div>
+  <div class="controls">
+    <div class="emp-select">
+      <select id="empSelect" onchange="onEmpChange()"></select>
+    </div>
+    <button class="btn btn-secondary" onclick="addEmployee()">＋ New Employee</button>
+    <button class="btn btn-danger btn-sm" onclick="deleteEmployee()" id="delEmpBtn">Remove</button>
+    <div class="save-ind" id="saveInd"><span class="dot"></span><span id="saveTxt">Ready</span></div>
+  </div>
+
+  <div id="mainArea">
+    <div class="progress-card" id="progressCard">
+      <div class="pc-pct"><span class="v" id="pcPct">0%</span><span class="l">Complete</span></div>
+      <div class="pc-track"><div class="pc-fill" id="pcFill"></div></div>
+      <div class="pc-counts">
+        <div class="pc-count"><div class="v" id="cTodo">0</div><div class="l">To Do</div></div>
+        <div class="pc-count"><div class="v" id="cProg">0</div><div class="l">In Progress</div></div>
+        <div class="pc-count"><div class="v" id="cDone">0</div><div class="l">Done</div></div>
+      </div>
+    </div>
+
+    <div class="sec-head">Schedule</div>
+    <div class="controls tmpl-bar">
+      <span class="tmpl-label">Template</span>
+      <select id="tmplSelect"></select>
+      <label class="mini-check"><input type="checkbox" id="tmplReplace" checked> replace existing</label>
+      <button class="btn btn-secondary btn-sm" onclick="applyTemplate()">Apply to employee</button>
+      <span class="bar-sep"></span>
+      <button class="btn btn-secondary btn-sm" onclick="saveAsTemplate()">💾 Save board as template</button>
+      <button class="btn btn-danger btn-sm" onclick="deleteTemplate()">Delete template</button>
+    </div>
+    <div class="board" id="board"></div>
+  </div>
+
+  <div id="emptyArea" style="display:none">
+    <div class="empty-state">
+      <div class="ico">🚀</div>
+      <h3>No employees yet</h3>
+      <p>Add an employee to generate their onboarding schedule.</p>
+      <div style="margin-top:18px"><button class="btn btn-primary" onclick="addEmployee()">＋ Add first employee</button></div>
+    </div>
+  </div>
+
+  <div class="sec-head">Deck links</div>
+  <div class="links-grid" id="linksGrid"></div>
+  <div class="add-link-form">
+    <input type="text" id="linkTitle" placeholder="Deck title (e.g. Audience Taxonomy 101)">
+    <input type="url" id="linkUrl" placeholder="PowerPoint / document link (https://…)">
+    <button class="btn btn-secondary" onclick="addLink()">＋ Add link</button>
+  </div>
+
+</div>
+</div>
+
+<!-- Task editor modal -->
+<div class="modal-back" id="modalBack">
+  <div class="modal">
+    <h2 id="modalTitle">Edit task</h2>
+    <div class="mfield"><label>Task title</label><input type="text" id="mTitle" placeholder="What needs to be done"></div>
+    <div class="mfield"><label>Stage / week</label><input type="text" id="mStage" placeholder="e.g. Week 1 · Setup"></div>
+    <div class="mfield"><label>Status</label>
+      <select id="mStatus"><option value="todo">To Do</option><option value="in_progress">In Progress</option><option value="done">Done</option></select>
+    </div>
+    <div class="mfield"><label>PowerPoint / document link</label>
+      <input type="url" id="mLink" placeholder="Paste a share link to the deck (optional)">
+    </div>
+    <div class="mfield"><label>Notes</label><textarea id="mNotes" placeholder="Optional notes"></textarea></div>
+    <div class="modal-actions">
+      <button class="btn btn-danger btn-sm" onclick="deleteTaskFromModal()" id="mDelBtn">Delete task</button>
+      <div class="spacer"></div>
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveModal()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- New employee modal -->
+<div class="modal-back" id="empModalBack">
+  <div class="modal" style="max-width:440px">
+    <h2>New employee</h2>
+    <div class="mfield"><label>Employee name</label><input type="text" id="empName" placeholder="Full name"></div>
+    <div class="mfield"><label>Start from template</label>
+      <select id="empTmpl"></select>
+    </div>
+    <div class="modal-actions">
+      <div class="spacer"></div>
+      <button class="btn btn-secondary" onclick="closeEmpModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="createEmployee()">Create</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const BUILTIN='Default onboarding (built-in)';
+const BLANK='— Blank (no tasks) —';
+const COLUMNS=[{key:'todo',label:'To Do'},{key:'in_progress',label:'In Progress'},{key:'done',label:'Done'}];
+let state={employees:[],employee:'',tasks:[],links:[],templates:[BUILTIN]};
+let saveTimer=null, editingId=null, draggedId=null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const uid=()=>'t'+Date.now().toString(36)+Math.floor(Math.random()*1e4).toString(36);
+
+/* ── Load / employees ── */
+async function loadState(employee){
+  const q = employee ? ('?employee='+encodeURIComponent(employee)) : '';
+  const r = await fetch('/onboarding-decks/api/state'+q);
+  state = await r.json();
+  if(state.employee) localStorage.setItem('ob_emp', state.employee);
+  render();
+}
+function onEmpChange(){ loadState($('empSelect').value); }
+
+function addEmployee(){
+  // populate template choices: built-in, blank, then custom templates
+  const customs=(state.templates||[]).filter(t=>t!==BUILTIN);
+  const opts=[BUILTIN,BLANK,...customs];
+  $('empTmpl').innerHTML=opts.map(o=>`<option>${esc(o)}</option>`).join('');
+  $('empName').value='';
+  $('empModalBack').classList.add('open');
+  setTimeout(()=>$('empName').focus(),50);
+}
+function closeEmpModal(){ $('empModalBack').classList.remove('open'); }
+async function createEmployee(){
+  const name=$('empName').value.trim();
+  if(!name){ $('empName').focus(); return; }
+  const template=$('empTmpl').value;
+  const r=await fetch('/onboarding-decks/api/employee',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,template})});
+  const j=await r.json();
+  if(!r.ok){ alert(j.error||'Could not add employee'); return; }
+  state=j; localStorage.setItem('ob_emp',state.employee); closeEmpModal(); render();
+}
+
+/* ── Templates ── */
+function renderTemplates(){
+  const sel=$('tmplSelect');
+  const prev=sel.value;
+  sel.innerHTML=(state.templates||[BUILTIN]).map(t=>`<option>${esc(t)}</option>`).join('');
+  if(prev && state.templates.includes(prev)) sel.value=prev;
+}
+async function applyTemplate(){
+  if(!state.employee) return;
+  const name=$('tmplSelect').value;
+  const replace=$('tmplReplace').checked;
+  const verb=replace?'replace the current board for':'add these tasks to';
+  if(!confirm(`Apply template “${name}” — this will ${verb} ${state.employee}.`)) return;
+  setSaveState('saving');
+  const r=await fetch('/onboarding-decks/api/template',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'apply',name,employee:state.employee,mode:replace?'replace':'append'})});
+  const j=await r.json();
+  if(!r.ok){ alert(j.error||'Could not apply template'); setSaveState('ready'); return; }
+  state=j; render(); setSaveState('saved');
+}
+async function saveAsTemplate(){
+  if(!state.tasks.length){ alert('This board has no tasks to save.'); return; }
+  const name=prompt('Save current board as a template named:');
+  if(!name || !name.trim()) return;
+  const r=await fetch('/onboarding-decks/api/template',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'save',name:name.trim(),tasks:state.tasks})});
+  const j=await r.json();
+  if(!r.ok){ alert(j.error||'Could not save template'); return; }
+  state.templates=j.templates; renderTemplates(); $('tmplSelect').value=name.trim();
+  alert(`Template “${name.trim()}” saved (${j.saved} tasks). You can now apply it to any employee.`);
+}
+async function deleteTemplate(){
+  const name=$('tmplSelect').value;
+  if(name===BUILTIN){ alert('The built-in template cannot be deleted.'); return; }
+  if(!confirm(`Delete template “${name}”? This does not affect employees already created from it.`)) return;
+  const r=await fetch('/onboarding-decks/api/template',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'delete',name})});
+  const j=await r.json();
+  if(!r.ok){ alert(j.error||'Could not delete template'); return; }
+  state.templates=j.templates; renderTemplates();
+}
+async function deleteEmployee(){
+  if(!state.employee) return;
+  if(!confirm('Remove '+state.employee+' and their onboarding progress? This cannot be undone.')) return;
+  await fetch('/onboarding-decks/api/employee/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:state.employee})});
+  localStorage.removeItem('ob_emp');
+  await loadState('');
+}
+
+/* ── Persistence ── */
+function scheduleSave(){
+  setSaveState('saving');
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(doSave,600);
+}
+async function doSave(){
+  if(!state.employee) return;
+  try{
+    await fetch('/onboarding-decks/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({employee:state.employee,tasks:state.tasks})});
+    setSaveState('saved');
+  }catch(e){ setSaveState('error'); }
+}
+function setSaveState(s){
+  const el=$('saveInd'), t=$('saveTxt');
+  el.className='save-ind '+(s==='saving'?'saving':s==='saved'?'saved':'');
+  t.textContent = s==='saving'?'Saving…':s==='saved'?'Saved ✓':s==='error'?'Save failed':'Ready';
+}
+
+/* ── Render ── */
+function render(){
+  // employee select
+  const sel=$('empSelect');
+  sel.innerHTML=state.employees.map(e=>`<option ${e===state.employee?'selected':''}>${esc(e)}</option>`).join('');
+  const hasEmp=!!state.employee;
+  $('mainArea').style.display=hasEmp?'':'none';
+  $('emptyArea').style.display=hasEmp?'none':'';
+  $('delEmpBtn').style.display=hasEmp?'':'none';
+  if(hasEmp) renderBoard();
+  renderProgress();
+  renderLinks();
+  renderTemplates();
+}
+function renderProgress(){
+  const t=state.tasks, total=t.length;
+  const done=t.filter(x=>x.status==='done').length;
+  const prog=t.filter(x=>x.status==='in_progress').length;
+  const todo=t.filter(x=>x.status==='todo').length;
+  const pct=total?Math.round(done/total*100):0;
+  $('pcPct').textContent=pct+'%'; $('pcFill').style.width=pct+'%';
+  $('cTodo').textContent=todo; $('cProg').textContent=prog; $('cDone').textContent=done;
+}
+function colTasks(key){ return state.tasks.filter(t=>t.status===key).sort((a,b)=>a.order-b.order); }
+function renderBoard(){
+  $('board').innerHTML=COLUMNS.map(col=>{
+    const items=colTasks(col.key);
+    return `<div class="column ${col.key}" data-col="${col.key}"
+        ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event,'${col.key}')">
+      <div class="col-head"><span class="col-dot"></span><span class="col-title">${col.label}</span><span class="col-count">${items.length}</span></div>
+      <div class="col-body">${items.map(taskHtml).join('')}</div>
+      <button class="add-task" onclick="addTask('${col.key}')">＋ Add task</button>
+    </div>`;
+  }).join('');
+}
+function taskHtml(t){
+  const deck = t.ppt_link
+    ? `<span class="t-btn deck" onclick="event.stopPropagation();openDeck('${t.task_id}')"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M18 21H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z"/></svg>Open deck</span>`
+    : `<span class="t-nolink">No deck linked</span>`;
+  return `<div class="task ${t.status==='done'?'done-task':''}" draggable="true" data-id="${t.task_id}"
+      ondragstart="onDragStart(event,'${t.task_id}')" ondragend="onDragEnd(event)" onclick="openEditor('${t.task_id}')">
+    ${t.stage?`<span class="t-stage">${esc(t.stage)}</span>`:''}
+    <div class="t-title">${esc(t.title)}</div>
+    <div class="t-actions">${deck}
+      <span class="t-btn" onclick="event.stopPropagation();openEditor('${t.task_id}')"><svg viewBox="0 0 24 24" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></svg>Edit</span>
+    </div>
+  </div>`;
+}
+function findTask(id){ return state.tasks.find(t=>t.task_id===id); }
+function openDeck(id){ const t=findTask(id); if(t&&t.ppt_link) window.open(t.ppt_link,'_blank','noopener'); }
+
+/* ── Drag & drop ── */
+function onDragStart(e,id){ draggedId=id; e.dataTransfer.effectAllowed='move';
+  const el=e.currentTarget; setTimeout(()=>el.classList.add('dragging'),0); }
+function onDragEnd(e){ e.currentTarget.classList.remove('dragging'); document.querySelectorAll('.column').forEach(c=>c.classList.remove('drag-over')); }
+function onDragOver(e){ e.preventDefault(); e.currentTarget.classList.add('drag-over'); e.dataTransfer.dropEffect='move'; }
+function onDragLeave(e){ if(!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove('drag-over'); }
+function onDrop(e,colKey){
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  const t=findTask(draggedId); if(!t) return;
+  // Determine insertion index from the card the cursor is over.
+  const body=e.currentTarget.querySelector('.col-body');
+  const cards=[...body.querySelectorAll('.task:not(.dragging)')];
+  let beforeId=null;
+  for(const c of cards){
+    const box=c.getBoundingClientRect();
+    if(e.clientY < box.top + box.height/2){ beforeId=c.dataset.id; break; }
+  }
+  t.status=colKey;
+  const list=colTasks(colKey).filter(x=>x.task_id!==draggedId);
+  const idx = beforeId ? list.findIndex(x=>x.task_id===beforeId) : list.length;
+  list.splice(idx<0?list.length:idx,0,t);
+  list.forEach((x,i)=>x.order=i);
+  // renumber source columns too
+  COLUMNS.forEach(c=>{ if(c.key!==colKey) colTasks(c.key).forEach((x,i)=>x.order=i); });
+  draggedId=null;
+  renderBoard(); renderProgress(); scheduleSave();
+}
+
+/* ── Add / edit tasks ── */
+function addTask(colKey){
+  const t={task_id:uid(),title:'New task',stage:'',status:colKey,ppt_link:'',notes:'',order:colTasks(colKey).length};
+  state.tasks.push(t);
+  renderBoard(); renderProgress(); scheduleSave();
+  openEditor(t.task_id);
+}
+function openEditor(id){
+  const t=findTask(id); if(!t) return;
+  editingId=id;
+  $('modalTitle').textContent='Edit task';
+  $('mTitle').value=t.title; $('mStage').value=t.stage; $('mStatus').value=t.status;
+  $('mLink').value=t.ppt_link; $('mNotes').value=t.notes;
+  $('modalBack').classList.add('open');
+  setTimeout(()=>$('mTitle').focus(),50);
+}
+function closeModal(){ $('modalBack').classList.remove('open'); editingId=null; }
+function saveModal(){
+  const t=findTask(editingId); if(!t){ closeModal(); return; }
+  const oldStatus=t.status;
+  t.title=$('mTitle').value.trim()||'Untitled task';
+  t.stage=$('mStage').value.trim();
+  t.status=$('mStatus').value;
+  t.ppt_link=$('mLink').value.trim();
+  t.notes=$('mNotes').value.trim();
+  if(t.status!==oldStatus){ t.order=colTasks(t.status).length; }
+  closeModal(); renderBoard(); renderProgress(); scheduleSave();
+}
+function deleteTaskFromModal(){
+  if(!editingId) return;
+  if(!confirm('Delete this task?')) return;
+  state.tasks=state.tasks.filter(t=>t.task_id!==editingId);
+  closeModal(); renderBoard(); renderProgress(); scheduleSave();
+}
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeModal(); closeEmpModal(); } });
+$('modalBack').addEventListener('click',e=>{ if(e.target===$('modalBack')) closeModal(); });
+$('empModalBack').addEventListener('click',e=>{ if(e.target===$('empModalBack')) closeEmpModal(); });
+$('empName').addEventListener('keydown',e=>{ if(e.key==='Enter') createEmployee(); });
+
+/* ── Useful links ── */
+function renderLinks(){
+  const g=$('linksGrid');
+  if(!state.links.length){ g.innerHTML='<div style="color:var(--muted);font-size:12.5px;padding:4px">No links yet — add your team’s go-to decks below.</div>'; return; }
+  g.innerHTML=state.links.map(l=>`<div class="link-card">
+    <div class="link-icon">📊</div>
+    <div class="link-body"><a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.title)}</a><div class="u">${esc(l.url)}</div></div>
+    <span class="link-del" onclick="deleteLink('${l.link_id}')" title="Remove">✕</span>
+  </div>`).join('');
+}
+async function addLink(){
+  const title=$('linkTitle').value.trim(), url=$('linkUrl').value.trim();
+  if(!title||!url){ alert('Enter both a title and a URL.'); return; }
+  const r=await fetch('/onboarding-decks/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'add',title,url})});
+  const j=await r.json();
+  if(!r.ok){ alert(j.error||'Could not add link'); return; }
+  state.links=j.links; $('linkTitle').value=''; $('linkUrl').value=''; renderLinks();
+}
+async function deleteLink(id){
+  const r=await fetch('/onboarding-decks/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete',link_id:id})});
+  const j=await r.json(); state.links=j.links; renderLinks();
+}
+
+/* Smooth exit to menu */
+
+loadState(localStorage.getItem('ob_emp')||'');
+</script>
+</body>
+</html>

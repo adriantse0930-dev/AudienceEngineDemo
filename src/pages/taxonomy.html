@@ -1,0 +1,713 @@
+<script data-demo="taxonomy">
+// Taxonomy Search — in-browser stand-in for the Flask blueprint.
+// Same tiered ranking (Exact / Contains / In description / Related), same score
+// floors and relevance normalisation. The sentence-embedding model is replaced
+// by a small "semantic-ish" scorer: token overlap + a hand-made synonym map +
+// fuzzy prefix matching. All segments below are made up.
+(function () {
+  'use strict';
+
+  var ABS_SCORE_FLOOR = 0.20;
+  var REL_SCORE_FLOOR = 0.60;
+  var TIER_EXACT = 3, TIER_NAME = 2, TIER_DESC = 1, TIER_SEMANTIC = 0;
+  var TIER_LABELS = { 3: 'Exact', 2: 'Contains', 1: 'In description', 0: 'Related' };
+
+  // ── Made-up taxonomy data ────────────────────────────────────────────────
+  // panel: columns Attribute / Data Source / Description (code = name = Attribute)
+  var PANEL = [
+    ['Age 25-34', 'CA Demographic', 'Adults aged 25 to 34 living in Canada, modelled from registration and survey signals.'],
+    ['Age 35-44', 'CA Demographic', 'Adults aged 35 to 44 living in Canada.'],
+    ['Age 65+', 'CA Demographic', 'Adults aged 65 and older, including recent retirees.'],
+    ['Female 25-54', 'CA Demographic', 'Women aged 25 to 54.'],
+    ['Home Owner', 'CA Demographic', 'Households that own their current residence.'],
+    ['Renter', 'CA Demographic', 'Households that rent their current residence, typically in urban apartments.'],
+    ['Presence of Children 0-5', 'CA Demographic', 'Households with at least one child aged 0 to 5 — young families and new parents.'],
+    ['Presence of Children 6-12', 'CA Demographic', 'Households with school-age kids aged 6 to 12.'],
+    ['Household Income $150K+', 'CA Demographic', 'Households with estimated annual income above $150,000 — affluent consumers.'],
+    ['Household Income Under $40K', 'CA Demographic', 'Households with estimated annual income below $40,000.'],
+    ['University Educated', 'CA Demographic', 'Adults holding a bachelor degree or higher.'],
+    ['Video Games - Console', 'CA Interest', 'Users who regularly engage with console gaming content and reviews.'],
+    ['Video Games - Mobile', 'CA Interest', 'Users who play casual and competitive games on smartphones.'],
+    ['Esports Fans', 'CA Interest', 'Users who follow competitive gaming tournaments and streamers.'],
+    ['Luxury Travel', 'CA Interest', 'Users researching premium hotels, first-class flights and high-end resorts.'],
+    ['Budget Travel', 'CA Interest', 'Users seeking deals on flights, hostels and package holidays.'],
+    ['Outdoor Adventure', 'CA Interest', 'Hiking, camping, paddling and other outdoor recreation enthusiasts.'],
+    ['Fitness & Gym', 'CA Interest', 'Users interested in workouts, gym memberships and fitness trackers.'],
+    ['Healthy Eating', 'CA Interest', 'Users interested in nutrition, organic food and plant-based recipes.'],
+    ['Green Living', 'CA Interest', 'Environmentally conscious consumers interested in sustainable and eco-friendly products.'],
+    ['Pet Owners - Dogs', 'CA Interest', 'Households with one or more dogs; buyers of pet food and accessories.'],
+    ['Hockey Fans', 'CA Interest', 'Users who follow professional and junior hockey.'],
+    ['Streaming Video Enthusiasts', 'CA Interest', 'Heavy viewers of on-demand streaming services.'],
+    ['Home Improvement', 'CA Interest', 'DIY renovators researching tools, flooring and home decor.'],
+    ['Auto Intenders - Electric Vehicles', 'CA Intent', 'Users showing purchase intent for a battery electric or plug-in hybrid vehicle.'],
+    ['Auto Intenders - SUV', 'CA Intent', 'Users in-market for a new or used sport utility vehicle.'],
+    ['Mortgage Shoppers', 'CA Intent', 'Users comparing mortgage rates or pre-approval offers.'],
+    ['New Mobile Phone Intenders', 'CA Intent', 'Users researching a new smartphone or wireless plan.'],
+    ['Grocery Delivery Users', 'CA Intent', 'Users who order groceries online for delivery or pickup.'],
+    ['Water', 'CA Interest', 'Users interested in bottled and sparkling water brands.'],
+    ['Small Business Owners', 'CA B2B', 'Owners and decision makers at businesses with fewer than 50 employees.'],
+    ['IT Decision Makers', 'CA B2B', 'Professionals who influence technology purchasing at their company.']
+  ];
+  // census: VARIABLE / CATEGORY / DESCRIPTION
+  var CENSUS = [
+    ['CB_HHINC_150P', 'Income', 'Households with total income of $150,000 or more'],
+    ['CB_HHINC_100_150', 'Income', 'Households with total income between $100,000 and $149,999'],
+    ['CB_HHINC_U40', 'Income', 'Households with total income under $40,000'],
+    ['CB_AVGINC', 'Income', 'Average household income (current year estimate)'],
+    ['CB_HH_KIDS', 'Household', 'Census families with children at home'],
+    ['CB_HH_KIDS_U6', 'Household', 'Families with children under 6 years old'],
+    ['CB_HH_COUPLE_NOKIDS', 'Household', 'Couple families without children'],
+    ['CB_HH_SINGLEPARENT', 'Household', 'Lone-parent families'],
+    ['CB_HH_1PERSON', 'Household', 'One-person households'],
+    ['CB_AGE_18_24', 'Age', 'Population aged 18 to 24'],
+    ['CB_AGE_25_34', 'Age', 'Population aged 25 to 34'],
+    ['CB_AGE_65P', 'Age', 'Population aged 65 and over'],
+    ['CB_EDU_UNIV', 'Education', 'Population 25+ with a university certificate, diploma or degree'],
+    ['CB_EDU_TRADES', 'Education', 'Population 25+ with an apprenticeship or trades certificate'],
+    ['CB_DWELL_OWN', 'Dwelling', 'Owner-occupied private dwellings'],
+    ['CB_DWELL_RENT', 'Dwelling', 'Renter-occupied private dwellings'],
+    ['CB_DWELL_CONDO', 'Dwelling', 'Dwellings that are part of a condominium'],
+    ['CB_DWELL_DETACHED', 'Dwelling', 'Single-detached houses'],
+    ['CB_COMMUTE_TRANSIT', 'Commute', 'Workers commuting by public transit'],
+    ['CB_COMMUTE_BIKE', 'Commute', 'Workers commuting by bicycle or on foot'],
+    ['CB_WORK_FROM_HOME', 'Commute', 'Workers who usually work from home'],
+    ['CB_LANG_FRENCH', 'Language', 'Population whose mother tongue is French'],
+    ['CB_IMMIG_RECENT', 'Immigration', 'Recent immigrants (arrived within the last five years)'],
+    ['CB_OCC_MGMT', 'Occupation', 'Employed in management occupations'],
+    ['CB_OCC_HEALTH', 'Occupation', 'Employed in health occupations'],
+    ['CB_SPEND_TRAVEL', 'Spending', 'Average household spending on travel and vacation packages'],
+    ['CB_SPEND_RESTAURANT', 'Spending', 'Average household spending on food purchased from restaurants'],
+    ['CB_SPEND_RECREATION', 'Spending', 'Average household spending on recreation and sports equipment'],
+    ['CB_SPEND_CHILDCARE', 'Spending', 'Average household spending on child care'],
+    ['CB_VEH_HYBRID', 'Spending', 'Households owning a hybrid or electric vehicle']
+  ];
+  // purchase: no code column — name / category / description auto-detected
+  var PURCHASE = [
+    ['Premium Grocery Shopper', 'Grocery', 'Frequently buys organic, imported and premium-label groceries.'],
+    ['Value Grocery Shopper', 'Grocery', 'Primarily shops discount grocers and store brands.'],
+    ['Bulk Club Member', 'Grocery', 'Purchases household staples in bulk at warehouse clubs.'],
+    ['Baby Products Buyer', 'Family', 'Recent purchases of diapers, formula and nursery items — new parents.'],
+    ['Kids Apparel Buyer', 'Family', 'Buys children\'s clothing and back-to-school supplies.'],
+    ['Toy & Game Buyer', 'Family', 'Purchases toys, board games and kids entertainment.'],
+    ['Luxury Fashion Buyer', 'Apparel', 'Purchases designer apparel, handbags and premium accessories.'],
+    ['Athleisure Buyer', 'Apparel', 'Buys activewear and performance footwear.'],
+    ['Gaming Hardware Buyer', 'Electronics', 'Purchased a gaming console, gaming PC or accessories in the last 12 months.'],
+    ['Smart Home Device Buyer', 'Electronics', 'Owns or recently bought smart speakers, thermostats or security cameras.'],
+    ['Premium Smartphone Buyer', 'Electronics', 'Purchased a flagship smartphone in the last 18 months.'],
+    ['Home Furnishings Buyer', 'Home', 'Recent furniture, mattress or decor purchases.'],
+    ['Garden & Outdoor Buyer', 'Home', 'Buys plants, garden tools and patio furniture.'],
+    ['Hardware & DIY Buyer', 'Home', 'Frequent purchases at hardware and home improvement retailers.'],
+    ['Pet Supplies Buyer', 'Pets', 'Regular purchases of pet food, treats and supplies.'],
+    ['Eco-Friendly Products Buyer', 'Lifestyle', 'Chooses reusable, recycled and sustainable household products.'],
+    ['Natural Beauty Buyer', 'Beauty', 'Buys clean, cruelty-free cosmetics and skincare.'],
+    ['Prestige Beauty Buyer', 'Beauty', 'Purchases high-end fragrance and cosmetics.'],
+    ['Wine Enthusiast', 'Beverage', 'Frequent buyer of wine, including premium and imported bottles.'],
+    ['Craft Beer Buyer', 'Beverage', 'Buys craft and microbrewery beer.'],
+    ['Sparkling Water Buyer', 'Beverage', 'Regular purchases of flavoured and sparkling water.'],
+    ['Frequent Traveller', 'Travel', 'Books three or more trips per year including flights and hotels.'],
+    ['Cruise Buyer', 'Travel', 'Has booked a cruise vacation in the last three years.'],
+    ['Sporting Goods Buyer', 'Sports', 'Purchases fitness equipment, bikes and team sports gear.'],
+    ['Golf Equipment Buyer', 'Sports', 'Buys golf clubs, balls and green fees.'],
+    ['New Vehicle Buyer', 'Auto', 'Purchased or leased a new vehicle in the last 24 months.'],
+    ['Auto Parts & Service', 'Auto', 'Regular spend on vehicle maintenance, tires and parts.'],
+    ['Online Marketplace Shopper', 'Retail', 'Heavy online shopper across marketplaces and e-commerce sites.']
+  ];
+
+  var SOURCES = {
+    panel:  { top_k: 700, rows: PANEL.map(function (r) { return { code: r[0], name: r[0], category: r[1], description: r[2] }; }) },
+    census:   { top_k: 400, rows: CENSUS.map(function (r) { return { code: r[0], name: r[0], category: r[1], description: r[2] }; }) },
+    purchase: { top_k: 100, rows: PURCHASE.map(function (r) { return { code: 'N/A', name: r[0], category: r[1], description: r[2] }; }) }
+  };
+  var SRC_KEYS = Object.keys(SOURCES);
+
+  // ── "Model" status: pretend to load for a few seconds so the keyword → semantic
+  //    handover in the UI can be seen. ────────────────────────────────────────
+  var started = Date.now();
+  var LOAD_MS = 5000;
+  var warmed = {};
+  function modelStatus() { return (Date.now() - started) >= LOAD_MS ? 'ready' : 'loading'; }
+
+  // ── Text helpers ─────────────────────────────────────────────────────────
+  var STOPWORDS = {};
+  ('a an the in on at to of for and or but is are was were with by from that this it not no have has do does will about which who')
+    .split(' ').forEach(function (w) { STOPWORDS[w] = 1; });
+
+  function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+  function wholeTermRe(term) {
+    // (?<!…) lookbehind is supported by all current browsers
+    return new RegExp('(?<![a-z0-9])' + escRe(String(term).trim().toLowerCase()) + '(?![a-z0-9])');
+  }
+  function queryTokens(q) { return (String(q || '').toLowerCase().match(/[a-z0-9]+/g)) || []; }
+  function stem(w) {
+    if (w.length > 5 && /ies$/.test(w)) return w.slice(0, -3) + 'y';
+    if (w.length > 5 && /ing$/.test(w)) return w.slice(0, -3);
+    if (w.length > 5 && /ers$/.test(w)) return w.slice(0, -3);
+    if (w.length > 4 && /er$/.test(w)) return w.slice(0, -2);
+    if (w.length > 3 && /s$/.test(w) && !/ss$/.test(w)) return w.slice(0, -1);
+    return w;
+  }
+  function contentTokens(text) {
+    return (String(text || '').toLowerCase().match(/[a-z0-9]+/g) || [])
+      .filter(function (w) { return !STOPWORDS[w]; }).map(stem);
+  }
+
+  // Hand-made synonym groups — the stand-in for embedding similarity.
+  var SYN_GROUPS = [
+    ['parent', 'family', 'kid', 'child', 'children', 'baby', 'toddler', 'mom', 'dad', 'nursery', 'school'],
+    ['luxury', 'affluent', 'premium', 'high', 'wealthy', 'rich', 'prestige', 'designer', 'upscale', 'end'],
+    ['income', 'salary', 'earn', 'wealth', 'affluent'],
+    ['high', 'affluent', 'wealthy', '150', '150k', '150p', 'premium'],
+    ['low', 'budget', 'value', 'discount', 'u40', '40k', 'under'],
+    ['eco', 'green', 'sustainable', 'environment', 'environmentally', 'recycled', 'reusable', 'organic', 'natural', 'electric', 'hybrid'],
+    ['gam', 'game', 'gamer', 'gaming', 'console', 'esport', 'video', 'streamer'],
+    ['travel', 'trip', 'vacation', 'holiday', 'flight', 'hotel', 'cruise', 'resort'],
+    ['home', 'house', 'dwelling', 'residence', 'condo', 'detached'],
+    ['own', 'owner', 'homeowner', 'mortgage'],
+    ['rent', 'renter', 'apartment', 'tenant'],
+    ['grocery', 'food', 'supermarket', 'shopper', 'staple'],
+    ['fitness', 'gym', 'workout', 'exercise', 'active', 'activewear', 'athleisure', 'sport', 'sporting'],
+    ['health', 'healthy', 'nutrition', 'wellness', 'organic'],
+    ['car', 'auto', 'vehicle', 'suv', 'automotive', 'drive', 'tire'],
+    ['pet', 'dog', 'cat', 'animal'],
+    ['beauty', 'cosmetic', 'skincare', 'makeup', 'fragrance'],
+    ['drink', 'beverage', 'water', 'juice', 'beer', 'wine', 'sparkling'],
+    ['senior', 'older', 'retire', 'retiree', '65'],
+    ['young', 'youth', 'student', 'millennial', '18', '24', '25', '34'],
+    ['tech', 'technology', 'electronic', 'smartphone', 'phone', 'mobile', 'smart', 'device', 'it'],
+    ['diy', 'renovat', 'hardware', 'improvement', 'tool', 'furnishing', 'decor', 'furniture'],
+    ['outdoor', 'hiking', 'camping', 'adventure', 'garden', 'patio'],
+    ['tv', 'streaming', 'show', 'viewer', 'video'],
+    ['business', 'b2b', 'professional', 'decision', 'manager', 'management', 'owner'],
+    ['educat', 'university', 'degree', 'college', 'graduate'],
+    ['commute', 'transit', 'bike', 'bicycle', 'work'],
+    ['shop', 'shopper', 'buyer', 'purchase', 'buy', 'retail', 'online', 'ecommerce']
+  ];
+  var SYN = {};
+  SYN_GROUPS.forEach(function (g) {
+    var stems = g.map(stem);
+    stems.forEach(function (s) {
+      SYN[s] = SYN[s] || {};
+      stems.forEach(function (o) { if (o !== s) SYN[s][o] = 1; });
+    });
+  });
+
+  function prefixLen(a, b) { var n = 0; while (n < a.length && n < b.length && a[n] === b[n]) n++; return n; }
+
+  // Best match strength of one query stem against a set of row stems.
+  function tokenMatch(q, set) {
+    if (set[q]) return 1;
+    var syn = SYN[q] || {}, best = 0;
+    for (var w in set) {
+      if (syn[w]) best = Math.max(best, 0.72);
+      var p = prefixLen(q, w);
+      if (p >= 4 && p >= 0.6 * Math.min(q.length, w.length)) best = Math.max(best, 0.55);
+    }
+    return best;
+  }
+  function toSet(arr) { var o = {}; arr.forEach(function (w) { o[w] = 1; }); return o; }
+
+  // Pre-compute token sets per row
+  SRC_KEYS.forEach(function (k) {
+    SOURCES[k].rows.forEach(function (r) {
+      r._n = toSet(contentTokens(r.name));
+      r._c = toSet(contentTokens(r.category));
+      r._d = toSet(contentTokens(r.description));
+    });
+  });
+
+  // "Cosine similarity" stand-in, roughly the 0.05–0.80 range MiniLM produces.
+  function semanticScore(query, row) {
+    var qs = contentTokens(query);
+    if (!qs.length) return 0.05;
+    var total = 0;
+    qs.forEach(function (q) {
+      total += Math.max(tokenMatch(q, row._n) * 1.0, tokenMatch(q, row._d) * 0.85, tokenMatch(q, row._c) * 0.6);
+    });
+    var avg = total / qs.length;
+    var jitter = (Mock.hash(query.toLowerCase() + '|' + row.name) % 1000) / 1000; // deterministic
+    return Math.max(0, Math.min(0.95, 0.06 + 0.66 * avg + 0.08 * jitter));
+  }
+
+  function keywordScore(query, entry) {
+    var q = (String(query).toLowerCase().match(/[a-z]+/g) || [])
+      .filter(function (w) { return !STOPWORDS[w] && w.length >= 2; });
+    var hay = [entry.name, entry.category, entry.description].join(' ').toLowerCase();
+    if (!q.length) return 0;
+    var s = 0;
+    q.forEach(function (t) { if (new RegExp('\\b' + escRe(t) + '\\b').test(hay)) s += 1; });
+    return Mock.round(s / Math.max(q.length, 1), 3);
+  }
+
+  function matchTier(query, tokens, tokenRes, row) {
+    var name = String(row.name || '');
+    if (name.trim().toLowerCase() === String(query || '').trim().toLowerCase()) return TIER_EXACT;
+    if (!tokens.length) return TIER_SEMANTIC;
+    var low = name.toLowerCase();
+    if (tokenRes.every(function (rx) { return rx.test(low); })) return TIER_NAME;
+    var hay = (name + ' ' + String(row.description || '')).toLowerCase();
+    if (tokenRes.every(function (rx) { return rx.test(hay); })) return TIER_DESC;
+    return TIER_SEMANTIC;
+  }
+
+  function publicRow(r) { return { code: r.code, name: r.name, category: r.category, description: r.description }; }
+
+  function rankTiered(query, rows, scores, src, limit) {
+    var tokens = queryTokens(query), tokenRes = tokens.map(wholeTermRe);
+    var tiered = rows.map(function (row, i) { return [matchTier(query, tokens, tokenRes, row), scores[i], row]; });
+    var literal = tiered.filter(function (t) { return t[0] > TIER_SEMANTIC; });
+    var semantic = tiered.filter(function (t) { return t[0] === TIER_SEMANTIC && t[1] > ABS_SCORE_FLOOR; });
+    if (semantic.length) {
+      var top = tiered.length ? Math.max.apply(null, tiered.map(function (t) { return t[1]; })) : 0;
+      semantic = semantic.filter(function (t) { return t[1] >= top * REL_SCORE_FLOOR; });
+    }
+    var combined = literal.concat(semantic);
+    if (!combined.length) return [];
+    combined.sort(function (a, b) { return (b[0] - a[0]) || (b[1] - a[1]); });
+    combined = combined.slice(0, limit);
+    return combined.map(function (t) {
+      var fused = t[0] + Math.max(0, Math.min(1, t[1]));
+      return Object.assign({ score: Mock.round(fused, 4), similarity: Mock.round(t[1], 4),
+        match_tier: t[0], match_label: TIER_LABELS[t[0]] }, publicRow(t[2]), { source: src });
+    });
+  }
+
+  function scoreSource(query, src, mode) {
+    var cfg = SOURCES[src], rows = cfg.rows;
+    var scores = rows.map(function (r) { return mode === 'semantic' ? semanticScore(query, r) : keywordScore(query, r); });
+    return rankTiered(query, rows, scores, src, cfg.top_k);
+  }
+
+  // ── Routes ───────────────────────────────────────────────────────────────
+  Mock.route('GET', '/taxonomy/api/status', function () {
+    var st = modelStatus(), srcs = {};
+    SRC_KEYS.forEach(function (s) { srcs[s] = { rows: SOURCES[s].rows.length, embeds: st === 'ready' && !!warmed[s] }; });
+    return { model_status: st, model_error: '', sources: srcs };
+  }, { latency: [60, 160] });
+
+  Mock.route('GET', '/taxonomy/api/columns', function () {
+    return {
+      panel:  { raw_columns: ['Data Source', 'Attribute', 'Description'],
+                  mapped: { col_code: 'Attribute', col_name: 'Attribute', col_cat: 'Data Source', col_desc: 'Description' } },
+      census:   { raw_columns: ['VARIABLE', 'CATEGORY', 'DESCRIPTION'],
+                  mapped: { col_code: 'VARIABLE', col_name: 'VARIABLE', col_cat: 'CATEGORY', col_desc: 'DESCRIPTION' } },
+      purchase: { raw_columns: ['Name', 'Category', 'Description'],
+                  mapped: { col_code: null, col_name: 'Name', col_cat: 'Category', col_desc: 'Description' } }
+    };
+  });
+
+  Mock.route('POST', '/taxonomy/api/warmup', function (req) {
+    var sources = (req.json && req.json.sources) || SRC_KEYS, st = modelStatus(), out = {};
+    sources.forEach(function (s) {
+      if (!SOURCES[s]) return;
+      if (st === 'ready') warmed[s] = true;
+      out[s] = st === 'ready' ? 'ready' : st;
+    });
+    return { status: out };
+  }, { latency: [300, 700] });
+
+  Mock.route('POST', '/taxonomy/api/search', function (req) {
+    var data = req.json || {};
+    var query = String(data.query || '').trim();
+    var sources = data.sources || SRC_KEYS;
+    if (!query) return Mock.json({ error: 'No query provided' }, 400);
+    var mode = modelStatus() === 'ready' ? 'semantic' : 'keyword';
+    var results = {};
+    sources.forEach(function (src) {
+      if (!SOURCES[src]) return;
+      var scored = scoreSource(query, src, mode);
+      if (scored.length) {
+        var top = scored[0].score;
+        scored.forEach(function (r) { r.relevance_pct = Mock.round((r.score / top) * 100, 1); });
+      }
+      results[src] = scored;
+    });
+    return { results: results, query: query, mode: mode };
+  }, { latency: [250, 600] });
+
+  Mock.route('POST', '/taxonomy/api/export', async function (req) {
+    var data = req.json || {};
+    var query = String(data.query || '').trim();
+    var sources = data.sources || SRC_KEYS;
+    var mode = modelStatus() === 'ready' ? 'semantic' : 'keyword';
+    var sheets = {};
+    sources.forEach(function (src) {
+      if (!SOURCES[src]) return;
+      var scored = scoreSource(query, src, mode);
+      if (!scored.length) return;
+      var top = scored[0].score;
+      sheets[src.charAt(0).toUpperCase() + src.slice(1)] = scored.map(function (r) {
+        return { 'Attribute': r.name, 'Category': r.category, 'Description': r.description,
+                 'Relevance %': Mock.round((r.score / top) * 100, 1) };
+      });
+    });
+    if (!Object.keys(sheets).length) sheets['Sheet1'] = [];
+    var safe = query.replace(/[^\w]/g, '_').slice(0, 40);
+    return Mock.file(await Mock.xlsxBlob(sheets), 'taxonomy_search_' + safe + '.xlsx');
+  }, { latency: [300, 600] });
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Taxonomy Search – Audience Analytics Engine</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0d0d2b;--deep:#131447;--violet:#7c5ce8;--purple:#5b4fcf;
+  --lavender:#a78bfa;--teal:#2dd4bf;--sky:#60a5fa;--amber:#fbbf24;
+  --card-bg:rgba(255,255,255,0.05);--card-border:rgba(180,160,255,0.28);
+  --text:#f0eeff;--text-sec:#c8c0e8;--muted:#8880b8;
+  --input-bg:rgba(255,255,255,0.07);--input-border:rgba(180,160,255,0.30);
+  --grn:#2dd4bf;--grn-bg:rgba(45,212,191,0.10);--grn-border:rgba(45,212,191,0.22);
+  --panel:#f472b6;--census:#2dd4bf;--purchase:#fb923c;
+}
+html,body{min-height:100vh;position:relative;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:var(--text);background:var(--navy);overflow-x:hidden}
+body::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 70% 55% at 8% 15%,rgba(91,79,207,0.28) 0%,transparent 60%),radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12) 0%,transparent 55%),radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%);pointer-events:none;z-index:0}
+body::after{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(162,140,250,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(162,140,250,0.03) 1px,transparent 1px);background-size:52px 52px;pointer-events:none;z-index:0}
+.shell{position:relative;z-index:1}
+.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:0 44px;height:84px;background:rgba(13,13,43,0.70);backdrop-filter:blur(18px);border-bottom:1px solid rgba(180,160,255,0.12)}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.brand-dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7);animation:pdot 2.6s ease-in-out infinite;flex-shrink:0}
+@keyframes pdot{0%,100%{box-shadow:0 0 8px rgba(124,92,232,0.7)}50%{box-shadow:0 0 18px rgba(45,212,191,0.9)}}
+.brand-name{font-size:1.2rem;font-weight:700;color:#e8e0ff;letter-spacing:0.01em}
+.brand-sep{width:1px;height:24px;background:var(--card-border)}
+.brand-sub{font-size:0.8rem;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase}
+.back-link{display:flex;align-items:center;gap:6px;font-size:0.75rem;color:var(--muted);text-decoration:none;padding:5px 12px;border-radius:8px;border:1px solid var(--card-border);background:rgba(255,255,255,0.03);transition:all 0.2s}
+.back-link:hover{color:var(--lavender);border-color:rgba(167,139,250,0.45)}
+.back-link svg{width:12px;height:12px;stroke:currentColor}
+.container{max-width:1100px;margin:0 auto;padding:32px 24px 72px}
+
+/* MODEL STATUS BAR */
+.model-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-radius:10px;border:1px solid;margin-bottom:18px;font-size:12px;transition:all 0.3s}
+.model-bar.loading{background:rgba(251,191,36,0.07);border-color:rgba(251,191,36,0.22);color:var(--amber)}
+.model-bar.ready{background:rgba(45,212,191,0.07);border-color:rgba(45,212,191,0.22);color:var(--teal)}
+.model-bar.error{background:rgba(248,113,113,0.07);border-color:rgba(248,113,113,0.22);color:#f87171}
+.model-bar.keyword{background:rgba(96,165,250,0.07);border-color:rgba(96,165,250,0.22);color:var(--sky)}
+.model-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.model-bar.loading .model-dot{background:var(--amber);animation:blink 1s ease-in-out infinite}
+.model-bar.ready .model-dot{background:var(--teal)}
+.model-bar.error .model-dot{background:#f87171}
+.model-bar.keyword .model-dot{background:var(--sky)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
+
+/* SEARCH */
+.search-bar{display:flex;gap:10px;align-items:stretch;margin-bottom:12px}
+.search-input-wrap{flex:1;position:relative}
+.search-input-wrap svg{position:absolute;left:14px;top:50%;transform:translateY(-50%);width:16px;height:16px;stroke:var(--muted);pointer-events:none}
+.search-input{width:100%;padding:13px 16px 13px 42px;border:1.5px solid var(--input-border);border-radius:10px;font-size:14px;font-family:Helvetica,Arial,sans-serif;background:var(--input-bg);color:var(--text);transition:border-color 0.15s,box-shadow 0.15s}
+.search-input:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+.search-input::placeholder{color:var(--muted)}
+.btn-search{padding:13px 28px;background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;border:none;border-radius:10px;font-size:13px;font-weight:700;font-family:Helvetica,Arial,sans-serif;cursor:pointer;white-space:nowrap;transition:all 0.18s;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+.btn-search:hover:not(:disabled){box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+.btn-search:disabled{opacity:0.5;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-export{padding:13px 20px;background:rgba(45,212,191,0.12);color:var(--teal);border:1.5px solid var(--grn-border);border-radius:10px;font-size:13px;font-weight:700;font-family:Helvetica,Arial,sans-serif;cursor:pointer;white-space:nowrap;transition:all 0.18s;display:none;align-items:center;gap:7px}
+.btn-export:hover:not(:disabled){background:rgba(45,212,191,0.20)}
+.btn-export:disabled{opacity:0.5;cursor:not-allowed}
+.btn-export svg{width:13px;height:13px;stroke:currentColor}
+
+.source-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:20px}
+.source-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-right:4px}
+.src-btn{padding:6px 16px;border-radius:99px;font-size:12px;font-weight:600;font-family:Helvetica,Arial,sans-serif;cursor:pointer;border:1.5px solid;transition:all 0.15s}
+.src-btn.all{border-color:rgba(167,139,250,0.4);color:var(--lavender);background:rgba(167,139,250,0.08)}
+.src-btn.all.active{background:rgba(167,139,250,0.22);border-color:var(--lavender)}
+.src-btn.panel{border-color:rgba(244,114,182,0.4);color:var(--panel);background:rgba(244,114,182,0.07)}
+.src-btn.panel.active{background:rgba(244,114,182,0.20);border-color:var(--panel)}
+.src-btn.census{border-color:rgba(45,212,191,0.4);color:var(--census);background:rgba(45,212,191,0.07)}
+.src-btn.census.active{background:rgba(45,212,191,0.20);border-color:var(--census)}
+.src-btn.purchase{border-color:rgba(251,146,60,0.4);color:var(--purchase);background:rgba(251,146,60,0.07)}
+.src-btn.purchase.active{background:rgba(251,146,60,0.20);border-color:var(--purchase)}
+
+/* RESULTS */
+.results-meta{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding:10px 16px;background:rgba(255,255,255,0.03);border:1px solid var(--card-border);border-radius:10px;font-size:12px;color:var(--muted)}
+.results-meta strong{color:var(--text)}
+.meta-right{display:flex;align-items:center;gap:16px}
+.mode-badge{font-size:10px;font-weight:700;padding:3px 9px;border-radius:99px;border:1px solid}
+.mode-semantic{background:rgba(167,139,250,0.12);color:var(--lavender);border-color:rgba(167,139,250,0.28)}
+.mode-keyword{background:rgba(96,165,250,0.10);color:var(--sky);border-color:rgba(96,165,250,0.25)}
+
+.tab-bar{display:flex;gap:0;margin-bottom:16px;border-radius:10px;overflow:hidden;border:1px solid var(--card-border);background:rgba(255,255,255,0.02)}
+.res-tab{flex:1;padding:10px 16px;font-size:12px;font-weight:600;font-family:Helvetica,Arial,sans-serif;color:var(--muted);background:none;border:none;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;justify-content:center;gap:7px}
+.res-tab+.res-tab{border-left:1px solid var(--card-border)}
+.res-tab.active{background:rgba(124,92,232,0.15);color:var(--lavender)}
+.res-tab .tab-count{font-size:10px;background:rgba(255,255,255,0.08);padding:2px 7px;border-radius:99px}
+.res-tab.active .tab-count{background:rgba(167,139,250,0.25)}
+
+.table-wrap{border:1px solid var(--card-border);border-radius:12px;overflow:auto;max-height:60vh}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead{position:sticky;top:0;z-index:10}
+th{background:rgba(20,15,60,0.98);backdrop-filter:blur(8px);color:var(--lavender);padding:10px 14px;text-align:left;font-weight:700;font-size:10px;letter-spacing:0.08em;text-transform:uppercase;border-bottom:1px solid var(--card-border);white-space:nowrap}
+td{padding:9px 14px;border-bottom:1px solid rgba(180,160,255,0.07);color:var(--text-sec);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,0.03)}
+
+.score-wrap{display:flex;align-items:center;gap:8px;min-width:110px}
+.score-bar-bg{flex:1;height:5px;background:rgba(255,255,255,0.08);border-radius:99px;overflow:hidden}
+.score-bar-fill{height:100%;border-radius:99px}
+.score-num{font-size:11px;font-weight:700;min-width:30px;text-align:right}
+
+.src-badge{display:inline-flex;align-items:center;font-size:10px;font-weight:700;padding:3px 9px;border-radius:99px;border:1px solid;white-space:nowrap}
+/* Why a row matched. Results are ordered by tier first, so this makes the
+   ranking auditable rather than an opaque relevance number. */
+.tier-pill{display:inline-block;margin-left:8px;font-size:9px;font-weight:700;letter-spacing:0.05em;
+  text-transform:uppercase;padding:2px 7px;border-radius:4px;vertical-align:middle;white-space:nowrap}
+.tier-3{color:var(--teal);background:rgba(45,212,191,0.13);border:1px solid rgba(45,212,191,0.35)}
+.tier-2{color:var(--sky);background:rgba(96,165,250,0.13);border:1px solid rgba(96,165,250,0.32)}
+.tier-1{color:var(--amber);background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.30)}
+.tier-0{color:var(--muted);background:rgba(255,255,255,0.04);border:1px solid rgba(180,160,255,0.18)}
+.sb-panel{background:rgba(244,114,182,0.10);color:var(--panel);border-color:rgba(244,114,182,0.25)}
+.sb-census{background:rgba(45,212,191,0.10);color:var(--census);border-color:rgba(45,212,191,0.25)}
+.sb-purchase{background:rgba(251,146,60,0.10);color:var(--purchase);border-color:rgba(251,146,60,0.25)}
+
+.empty-state{text-align:center;padding:60px 20px;color:var(--muted)}
+.empty-state svg{width:40px;height:40px;stroke:var(--muted);opacity:0.4;margin:0 auto 14px;display:block}
+.empty-state p{font-size:13px}
+.spinner-wrap{text-align:center;padding:48px;color:var(--muted);font-size:13px;display:flex;align-items:center;justify-content:center;gap:10px}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.err-box{background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);border-radius:10px;padding:14px 18px;font-size:12px;color:#f87171;line-height:1.6}
+.page-footer{text-align:center;padding:20px;font-size:0.68rem;color:var(--muted);border-top:1px solid rgba(162,140,250,0.07);letter-spacing:0.04em}
+</style>
+</head>
+<body>
+<div class="shell">
+<div class="container">
+
+  <!-- MODEL STATUS -->
+  <div class="model-bar loading" id="modelBar">
+    <div class="model-dot"></div>
+    <span id="modelMsg">Loading semantic model… keyword search available in the meantime</span>
+  </div>
+
+  <!-- SEARCH -->
+  <div class="search-bar">
+    <div class="search-input-wrap">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      <input class="search-input" id="searchInput" type="text"
+        placeholder="Search taxonomy… e.g. home owner, gaming, grocery shopper, high income"
+        autocomplete="off" onkeydown="if(event.key==='Enter')doSearch()">
+    </div>
+    <button class="btn-search" id="searchBtn" onclick="doSearch()">Search</button>
+    <button class="btn-export" id="exportBtn" onclick="doExport()">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Export Excel
+    </button>
+  </div>
+
+  <div class="source-row">
+    <span class="source-label">Source:</span>
+    <button class="src-btn all active" id="src-all"        onclick="toggleSource('all')">All Sources</button>
+    <button class="src-btn panel"    id="src-panel"    onclick="toggleSource('panel')">Panel-based</button>
+    <button class="src-btn census"     id="src-census"     onclick="toggleSource('census')">Census-based</button>
+    <button class="src-btn purchase"   id="src-purchase"   onclick="toggleSource('purchase')">Purchase-based</button>
+  </div>
+
+  <div id="resultsArea">
+    <div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      <p>Enter a search term to find matching taxonomy attributes</p>
+      <p style="font-size:11px;margin-top:8px;opacity:0.8">Try “parents”, “luxury travel”, “eco”, “gaming” or “high income”.</p>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script>
+const SRC_COLORS = {panel:'var(--panel)',census:'var(--census)',purchase:'var(--purchase)'};
+const SRC_CLASS  = {panel:'sb-panel',census:'sb-census',purchase:'sb-purchase'};
+const SRC_LABEL  = {panel:'Panel-based',census:'Census-based',purchase:'Purchase-based'};
+let activeSource = 'all';
+let lastQuery    = '';
+let lastResults  = {};
+let modelReady   = false;
+let pollTimer    = null;
+
+// ── Model status polling ──────────────────────────────────────────────────────
+async function checkStatus(){
+  try{
+    const r = await fetch('/taxonomy/api/status');
+    const d = await r.json();
+    const bar = document.getElementById('modelBar');
+    const msg = document.getElementById('modelMsg');
+
+    if(d.model_status === 'ready'){
+      modelReady = true;
+      bar.className = 'model-bar ready';
+      const counts = Object.entries(d.sources)
+        .map(([s,v])=> v.rows ? `${SRC_LABEL[s]||s}: ${v.rows} attr.` : null)
+        .filter(Boolean).join(' · ');
+      msg.textContent = `Semantic search ready — ${counts}`;
+      clearInterval(pollTimer);
+      // Warmup embeddings in background
+      fetch('/taxonomy/api/warmup',{
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({sources:['panel','census','purchase']})
+      });
+    } else if(d.model_status === 'error'){
+      bar.className = 'model-bar error';
+      msg.textContent = `Model error: ${d.model_error} — keyword search active`;
+      clearInterval(pollTimer);
+    } else {
+      bar.className = 'model-bar loading';
+      msg.textContent = 'Loading semantic model… keyword search available in the meantime';
+    }
+  }catch(e){}
+}
+
+// Poll every 3 seconds until model is ready
+pollTimer = setInterval(checkStatus, 3000);
+checkStatus();
+
+// ── Source toggle ─────────────────────────────────────────────────────────────
+function toggleSource(src){
+  activeSource = src;
+  document.querySelectorAll('.src-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('src-'+src).classList.add('active');
+  if(lastQuery) doSearch();
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+async function doSearch(){
+  const q = document.getElementById('searchInput').value.trim();
+  if(!q) return;
+  lastQuery = q;
+  const srcs = activeSource==='all' ? ['panel','census','purchase'] : [activeSource];
+  const btn  = document.getElementById('searchBtn');
+  btn.disabled = true; btn.textContent = 'Searching…';
+  document.getElementById('exportBtn').style.display = 'none';
+  document.getElementById('resultsArea').innerHTML =
+    '<div class="spinner-wrap"><span class="spinner"></span> Searching taxonomy…</div>';
+
+  try{
+    const res  = await fetch('/taxonomy/api/search',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({query:q, sources:srcs, top_k:60})
+    });
+    const data = await res.json();
+    if(data.error) throw new Error(data.error);
+    lastResults = data.results;
+    renderResults(data.results, q, srcs, data.mode);
+  }catch(e){
+    document.getElementById('resultsArea').innerHTML =
+      `<div class="err-box">Error: ${e.message}</div>`;
+  }finally{
+    btn.disabled=false; btn.textContent='Search';
+  }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderResults(results, query, srcs, mode){
+  const area  = document.getElementById('resultsArea');
+  const total = srcs.reduce((n,s)=>n+(results[s]||[]).length, 0);
+
+  if(!total){
+    area.innerHTML=`<div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      <p>No matching attributes found. Try a different search term.</p></div>`;
+    return;
+  }
+
+  const modeBadge = mode==='semantic'
+    ? '<span class="mode-badge mode-semantic">Semantic</span>'
+    : '<span class="mode-badge mode-keyword">Keyword</span>';
+
+  const srcCounts = srcs.map(s=>{
+    const n=(results[s]||[]).length;
+    return `<span style="display:flex;align-items:center;gap:5px">
+      <span style="width:7px;height:7px;border-radius:50%;background:${SRC_COLORS[s]};display:inline-block"></span>
+      ${SRC_LABEL[s]}: <strong>${n}</strong></span>`;
+  }).join('');
+
+  const meta=`<div class="results-meta">
+    <span><strong>${total}</strong> attributes matched</span>
+    <div class="meta-right">${modeBadge}<div style="display:flex;gap:14px">${srcCounts}</div></div>
+  </div>`;
+
+  function makeTable(rows, showSrc){
+    if(!rows.length) return `<div class="empty-state" style="padding:30px"><p>No matches</p></div>`;
+    return `<div class="table-wrap"><table><thead><tr>
+      <th>Attribute</th>
+      <th style="width:150px">Category</th>
+      <th>Description</th>
+      ${showSrc?'<th style="width:100px">Source</th>':''}
+      <th style="width:130px">Relevance</th>
+    </tr></thead><tbody>`+
+    rows.map(r=>{
+      const pct = r.relevance_pct ?? Math.round(r.score*100);
+      const clr = pct>=70?'var(--teal)':pct>=40?'var(--lavender)':'var(--sky)';
+      return `<tr>
+        <td style="color:var(--text);font-weight:500">${r.name||''}${r.match_label?`<span class="tier-pill tier-${r.match_tier}">${r.match_label}</span>`:''}</td>
+        <td style="font-size:11px;color:var(--muted)">${r.category||''}</td>
+        <td style="font-size:11px;color:var(--muted)">${r.description||''}</td>
+        ${showSrc?`<td><span class="src-badge ${SRC_CLASS[r.source]}">${SRC_LABEL[r.source]||r.source}</span></td>`:''}
+        <td><div class="score-wrap">
+          <div class="score-bar-bg"><div class="score-bar-fill" style="width:${pct}%;background:${clr}"></div></div>
+          <span class="score-num" style="color:${clr}">${pct}</span>
+        </div></td>
+      </tr>`;
+    }).join('')+
+    '</tbody></table></div>';
+  }
+
+  let tabs='', panes='';
+  if(activeSource==='all'){
+    // Sort across sources by match tier, then raw similarity. relevance_pct is
+    // normalised within each source, so using it here would rank a source whose
+    // best hit is merely "Related" (100% of its own top) above another source's
+    // exact match.
+    const allRows=[...srcs.flatMap(s=>(results[s]||[]))].sort((a,b)=>
+      ((b.match_tier??0)-(a.match_tier??0))
+      || ((b.similarity??b.score??0)-(a.similarity??a.score??0)));
+    tabs='<div class="tab-bar">';
+    tabs+=`<button class="res-tab active" id="rtab-all" onclick="showTab('all')">All <span class="tab-count">${total}</span></button>`;
+    for(const s of srcs){
+      const n=(results[s]||[]).length;
+      tabs+=`<button class="res-tab" id="rtab-${s}" onclick="showTab('${s}')">${SRC_LABEL[s]} <span class="tab-count">${n}</span></button>`;
+    }
+    tabs+='</div>';
+    panes+=`<div class="tab-pane" id="pane-all">${makeTable(allRows,true)}</div>`;
+    for(const s of srcs){
+      panes+=`<div class="tab-pane" id="pane-${s}" style="display:none">${makeTable(results[s]||[],false)}</div>`;
+    }
+  } else {
+    panes = makeTable(results[activeSource]||[], false);
+  }
+
+  area.innerHTML = meta + tabs + panes;
+  document.getElementById('exportBtn').style.display='inline-flex';
+}
+
+function showTab(src){
+  document.querySelectorAll('.res-tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('rtab-'+src).classList.add('active');
+  document.querySelectorAll('.tab-pane').forEach(p=>p.style.display='none');
+  document.getElementById('pane-'+src).style.display='';
+}
+
+// ── Export ────────────────────────────────────────────────────────────────────
+async function doExport(){
+  if(!lastQuery) return;
+  const srcs = activeSource==='all' ? ['panel','census','purchase'] : [activeSource];
+  const btn  = document.getElementById('exportBtn');
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Exporting…';
+  try{
+    const res = await fetch('/taxonomy/api/export',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({query:lastQuery, sources:srcs})
+    });
+    if(!res.ok) throw new Error('Export failed');
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href=url; a.download=`taxonomy_${lastQuery.replace(/\s+/g,'_').slice(0,40)}.xlsx`;
+    a.click(); URL.revokeObjectURL(url);
+  }catch(e){ alert('Export error: '+e.message); }
+  finally{
+    btn.disabled=false;
+    btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke-width="2.5" style="width:13px;height:13px;stroke:currentColor"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Export Excel';
+  }
+}
+</script>
+</body>
+</html>

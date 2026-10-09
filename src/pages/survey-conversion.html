@@ -1,0 +1,745 @@
+<script data-demo="survey_conversion">
+// Survey → CA Taxonomy — in-browser stand-in for the Flask blueprint.
+// Parses a survey audience-definition export (Client / Audience Name / Audience Id /
+// Audience Size metadata, then "Regular Group:" blocks of Survey / OR / AND rows)
+// and maps every survey attribute to CA taxonomy segments via
+//   1. whole-term fuzzy search over a (made-up) live taxonomy, and
+//   2. a (made-up) reference crosswalk, flagged when no longer in the taxonomy.
+// Logic mirrors the Python version; all names and numbers are invented.
+(function () {
+  'use strict';
+
+  // ── Made-up CA taxonomy: [Data Source, Attribute] ─────────────────────────
+  var TAXONOMY = [
+    ['CA Demographic', 'Age 18-24'], ['CA Demographic', 'Age 25-34'], ['CA Demographic', 'Age 35-44'],
+    ['CA Demographic', 'Age 45-54'], ['CA Demographic', 'Age 55-64'], ['CA Demographic', 'Age 65+'],
+    ['CA Demographic', 'Female 25-34'], ['CA Demographic', 'Female 35-44'], ['CA Demographic', 'Male 25-34'],
+    ['CA Demographic', 'Male 35-44'], ['CA Demographic', 'Female'], ['CA Demographic', 'Male'],
+    ['CA Demographic', 'Homeowner'], ['CA Demographic', 'New Homeowner'], ['CA Demographic', 'Renter'],
+    ['CA Demographic', 'Household Income $100K-$149K'], ['CA Demographic', 'Household Income $150K+'],
+    ['CA Demographic', 'Presence of Children'], ['CA Demographic', 'Presence of Children 0-5'],
+    ['CA Demographic', 'Presence of Children 6-12'], ['CA Demographic', 'Married'],
+    ['CA Demographic', 'University Graduate'], ['CA Demographic', 'Urban Professionals'],
+    ['CA Demographic', 'Suburban Families'],
+    ['CA Interest', 'Travel - Luxury'], ['CA Interest', 'Travel - Budget'], ['CA Interest', 'Frequent Travel'],
+    ['CA Interest', 'Fitness Enthusiasts'], ['CA Interest', 'Fitness - Home Workouts'],
+    ['CA Interest', 'Running'], ['CA Interest', 'Yoga'], ['CA Interest', 'Outdoor Adventure'],
+    ['CA Interest', 'Gaming - Console'], ['CA Interest', 'Mobile Gaming'], ['CA Interest', 'Esports'],
+    ['CA Interest', 'Cooking'], ['CA Interest', 'Healthy Eating'], ['CA Interest', 'Home Decor'],
+    ['CA Interest', 'Hockey'], ['CA Interest', 'Basketball'], ['CA Interest', 'Soccer'],
+    ['CA Interest', 'Music Festivals'], ['CA Interest', 'Podcasts'], ['CA Interest', 'Streaming Video'],
+    ['CA Interest', 'Personal Finance'], ['CA Interest', 'Pets - Dogs'], ['CA Interest', 'Pets - Cats'],
+    ['CA Intent', 'Vacation Packages'], ['CA Intent', 'Electric Vehicles'], ['CA Intent', 'SUV Intenders'],
+    ['CA Intent', 'Mortgage Shoppers'], ['CA Intent', 'New Smartphone'], ['CA Intent', 'Home Fitness Equipment'],
+    ['CA Intent', 'Grocery Delivery'], ['CA Intent', 'Credit Card Seekers'],
+    ['CA Lifestyle', 'Green Living'], ['CA Lifestyle', 'Early Adopters'], ['CA Lifestyle', 'Deal Seekers'],
+    ['CA Lifestyle', 'Premium Brand Loyalists'], ['CA Lifestyle', 'Busy Parents'],
+    ['CA Lifestyle', 'Health Conscious'], ['CA Lifestyle', 'Social Media Influencers'],
+    ['CA Purchase', 'Athleisure Buyers'], ['CA Purchase', 'Organic Grocery Buyers'],
+    ['CA Purchase', 'Kids Apparel Buyers'], ['CA Purchase', 'Gaming Hardware Buyers'],
+    ['CA Purchase', 'Outdoor Gear Buyers']
+  ];
+  var TAX_SEGS = TAXONOMY.map(function (t) { return { ds: t[0], attr: t[1], full: t[0] + ' - ' + t[1] }; });
+  var TAX_SET = {};
+  TAX_SEGS.forEach(function (s) { TAX_SET[s.full] = true; });
+
+  // ── Made-up reference crosswalk: [Survey Attribute, Segment Name] ─────────────
+  // Some targets were "retired" (not in the taxonomy above) so they surface as
+  // unverified reference-only matches, like a real year-on-year revision.
+  var REFERENCE = [
+    ['Adventurous', 'CA Interest - Outdoor Adventure'], ['Adventurous', 'CA Interest - Extreme Sports'],
+    ['Affluent', 'CA Demographic - Household Income $150K+'], ['Affluent', 'CA Lifestyle - Premium Brand Loyalists'],
+    ['Ambitious', 'CA Demographic - Urban Professionals'], ['Career-Focused', 'CA Demographic - Urban Professionals'],
+    ['Eco-Conscious', 'CA Lifestyle - Green Living'], ['Eco-Conscious', 'CA Lifestyle - Eco Shoppers 2024'],
+    ['Eco-Conscious', 'CA Intent - Electric Vehicles'], ['Health-Conscious', 'CA Lifestyle - Health Conscious'],
+    ['Health-Conscious', 'CA Interest - Healthy Eating'], ['Tech Savvy', 'CA Lifestyle - Early Adopters'],
+    ['Tech Savvy', 'CA Intent - New Smartphone'], ['Bargain Hunter', 'CA Lifestyle - Deal Seekers'],
+    ['Brand Loyal', 'CA Lifestyle - Premium Brand Loyalists'], ['Travel', 'CA Intent - Vacation Packages'],
+    ['Travel', 'CA Interest - Travel - Luxury'], ['Fitness', 'CA Interest - Fitness Enthusiasts'],
+    ['Fitness', 'CA Intent - Home Fitness Equipment'], ['Fitness', 'CA Purchase - Athleisure Buyers'],
+    ['Gaming', 'CA Purchase - Gaming Hardware Buyers'], ['Gaming', 'CA Interest - Esports'],
+    ['Cooking', 'CA Interest - Healthy Eating'], ['Food & Drink', 'CA Interest - Cooking'],
+    ['Sports', 'CA Interest - Hockey'], ['Sports', 'CA Interest - Basketball'], ['Sports', 'CA Interest - Soccer'],
+    ['Music', 'CA Interest - Music Festivals'], ['Music', 'CA Interest - Music Streaming 2023'],
+    ['Pets', 'CA Interest - Pets - Dogs'], ['Pets', 'CA Interest - Pets - Cats'],
+    ['Homeowner', 'CA Demographic - New Homeowner'], ['Renting', 'CA Demographic - Renter'],
+    ['Parent', 'CA Lifestyle - Busy Parents'], ['Parent', 'CA Demographic - Presence of Children'],
+    ['Married / Civil Partnership', 'CA Demographic - Married'], ['University Degree', 'CA Demographic - University Graduate'],
+    ['Streaming', 'CA Interest - Streaming Video'], ['Podcasts', 'CA Interest - Podcasts'],
+    ['Social Media', 'CA Lifestyle - Social Media Influencers'], ['Personal Finance', 'CA Intent - Credit Card Seekers'],
+    ['Electric Car', 'CA Intent - Electric Vehicles'], ['Outdoor Activities', 'CA Purchase - Outdoor Gear Buyers'],
+    ['Outdoor Activities', 'CA Interest - Camping Weekend 2022'], ['Online Grocery', 'CA Intent - Grocery Delivery'],
+    ['Organic Food', 'CA Purchase - Organic Grocery Buyers'], ['Yoga / Pilates', 'CA Interest - Yoga'],
+    ['Running', 'CA Interest - Running'], ['Kids Clothing', 'CA Purchase - Kids Apparel Buyers'],
+    ['1', 'CA Intent - Model One Compact'], ['2', 'CA Intent - Model Two Compact']
+  ];
+  var REF_MAP = {};
+  REFERENCE.forEach(function (r) {
+    var k = r[0].trim().toLowerCase(), b = REF_MAP[k] || (REF_MAP[k] = []);
+    if (b.indexOf(r[1]) < 0) b.push(r[1]);
+  });
+
+  // ── Matching helpers (ported 1:1) ─────────────────────────────────────────
+  var NOISE = [/child under/, /grandparent/, /employed mom/, /employed parent/, /single.*parent/];
+  function isNoise(low) { return NOISE.some(function (p) { return p.test(low); }); }
+  function parts(a) { return String(a).split('>>').map(function (p) { return p.trim(); }); }
+  function isAge(a) { return a.toLowerCase().indexOf('age') >= 0 && a.indexOf('>>') >= 0; }
+  function ageValue(a) { var p = parts(a); return p[p.length - 1]; }
+  function shortLabel(a) { var p = parts(a); return p[p.length - 1].replace(' (Select Markets Only)', '').trim(); }
+  function labelAttr(a) { var p = parts(a); return p.length >= 2 ? p[p.length - 2] + ' — ' + p[p.length - 1] : p[p.length - 1]; }
+  function categoryName(a) {
+    var p = parts(a);
+    if (isAge(a)) return 'Age';
+    if (p.length) {
+      var top = p[0];
+      if (top.toLowerCase().indexOf('online activit') >= 0 || a.toLowerCase().indexOf('web brand') >= 0) {
+        return p[p.length - 1].replace(' (Select Markets Only)', '').trim() + ' Usage';
+      }
+      return p.length > 1 ? p[1] : top;
+    }
+    return 'Other';
+  }
+  function tooGeneric(t) { t = String(t).trim(); return t.length < 3 || /^\d+$/.test(t); }
+  function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+  function wholeTermRe(term) { return new RegExp('(?<![a-z0-9])' + escRe(term.toLowerCase()) + '(?![a-z0-9])'); }
+
+  function fuzzySegments(attr) {
+    var seen = {}, out = [], pat, term;
+    if (isAge(attr)) {
+      term = ageValue(attr).replace(/\++$/, '').trim().toLowerCase();
+      if (!term) return out;
+      pat = wholeTermRe(term);
+      TAX_SEGS.forEach(function (s) {
+        var low = s.attr.toLowerCase();
+        if (pat.test(low) && !isNoise(low) && !seen[s.full]) { seen[s.full] = 1; out.push(s.full); }
+      });
+    } else {
+      term = shortLabel(attr);
+      if (tooGeneric(term)) return out;
+      pat = wholeTermRe(term);
+      TAX_SEGS.forEach(function (s) {
+        if (pat.test(s.attr.toLowerCase()) && !seen[s.full]) { seen[s.full] = 1; out.push(s.full); }
+      });
+    }
+    return out;
+  }
+
+  function mapAttribute(attr) {
+    var label = shortLabel(attr), key = label.toLowerCase(), out = [], seen = {};
+    fuzzySegments(attr).forEach(function (seg) {
+      out.push({ segment: seg, source: 'taxonomy', in_current_taxonomy: true }); seen[seg] = 1;
+    });
+    if (!isAge(attr) && tooGeneric(label)) return out;
+    (REF_MAP[key] || []).forEach(function (seg) {
+      if (seen[seg]) return;
+      out.push({ segment: seg, source: 'reference', in_current_taxonomy: !!TAX_SET[seg] }); seen[seg] = 1;
+    });
+    return out;
+  }
+
+  // ── Audience definition parser ───────────────────────────────────────────
+  function cell(row, i) { var v = row[i]; return (v === null || v === undefined || v === '' || v === false) ? '' : String(v).trim(); }
+  function parseAudience(rows) {
+    rows = rows.filter(function (r) { return r && r.some(function (c) { return c !== null && c !== undefined && c !== ''; }); });
+    var meta = {}, groups = [], current = null, pending = 'OR';
+    rows.forEach(function (row) {
+      var c0 = cell(row, 0), c1 = cell(row, 1), c2 = cell(row, 2);
+      if (c0 === 'Client') meta.client = c1;
+      else if (c0 === 'Audience Name') meta.audience_name = c1;
+      else if (c0 === 'Audience Id') meta.audience_id = row[1] != null && row[1] !== '' ? String(row[1]).split('.')[0] : '';
+      else if (c0 === 'Audience Size') meta.audience_size = c1;
+      else if (c0.indexOf('Regular Group:') === 0) {
+        current = { name: c0.replace('Regular Group:', '').trim(), conditions: [] };
+        groups.push(current); pending = null;
+      } else if (c0 === 'SURVEY' && current) {
+        current.conditions.push({ operator: pending, survey_attr: c1, reach: c2 }); pending = null;
+      } else if ((c0 === 'OR' || c0 === 'AND') && current) pending = c0;
+    });
+    meta.groups = groups;
+    return meta;
+  }
+
+  function buildOutputGroups(aud) {
+    return aud.groups.map(function (group) {
+      var blocks = [], cur = null;
+      group.conditions.forEach(function (cond) {
+        var a = cond.survey_attr;
+        var entry = { label: labelAttr(a), survey_attr: a, reach: cond.reach, segments: mapAttribute(a),
+                      too_generic: !isAge(a) && tooGeneric(shortLabel(a)) };
+        var cat = categoryName(a);
+        if (cond.operator === 'AND') {
+          if (cur) blocks.push(cur);
+          blocks.push({ type: 'AND_SEPARATOR' });
+          cur = { type: 'OR_BLOCK', category: cat, conditions: [entry] };
+        } else if (!cur) cur = { type: 'OR_BLOCK', category: cat, conditions: [entry] };
+        else cur.conditions.push(entry);
+      });
+      if (cur) blocks.push(cur);
+      return { name: group.name, blocks: blocks };
+    });
+  }
+
+  function coverageSummary(groups) {
+    var total = 0, matched = 0, unmatched = 0, tax = 0, ref = 0, unver = 0, uniq = {};
+    groups.forEach(function (g) {
+      g.blocks.forEach(function (b) {
+        if (b.type !== 'OR_BLOCK') return;
+        b.conditions.forEach(function (c) {
+          total++;
+          if (c.segments.length) matched++; else unmatched++;
+          c.segments.forEach(function (s) {
+            uniq[s.segment] = 1;
+            if (s.source === 'taxonomy') tax++;
+            else { ref++; if (!s.in_current_taxonomy) unver++; }
+          });
+        });
+      });
+    });
+    return { total_conditions: total, matched: matched, unmatched: unmatched,
+             unique_segments: Object.keys(uniq).length, taxonomy_hits: tax,
+             reference_hits: ref, unverified_reference: unver };
+  }
+
+  // ── Jobs (same 12-entry cap as the server) ───────────────────────────────
+  var jobs = {}, jobOrder = [], JOB_CAP = 12;
+  function newJobId() {
+    var s = ''; for (var i = 0; i < 32; i++) s += '0123456789abcdef'[Math.floor(Math.random() * 16)]; return s;
+  }
+
+  async function readRows(file) {
+    var X = await Mock.loadXLSX();
+    var wb;
+    if (/\.csv$/i.test(file.name || '')) wb = X.read(await Mock.readFile(file), { type: 'string', raw: true });
+    else wb = X.read(await file.arrayBuffer(), { type: 'array' });
+    var ws = wb.Sheets[wb.SheetNames[0]];
+    return X.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
+  }
+
+  Mock.route('POST', '/survey-conversion/api/analyze', async function (req) {
+    var f = req.form && req.form.get('audience');
+    if (!f || typeof f === 'string' || !f.name) {
+      return Mock.json({ error: 'Upload a survey audience definition (.xlsx) file.' }, 400);
+    }
+    var aud;
+    try { aud = parseAudience(await readRows(f)); }
+    catch (e) { return Mock.json({ error: 'Could not read the audience file: ' + (e && e.message || e) }, 400); }
+    if (!aud.groups || !aud.groups.length) {
+      return Mock.json({ error: 'No "Regular Group:" blocks found — is this a survey audience definition export?' }, 400);
+    }
+    var groups = buildOutputGroups(aud), coverage = coverageSummary(groups);
+    var meta = { client: aud.client || '', audience_name: aud.audience_name || '',
+                 audience_id: aud.audience_id || '', audience_size: aud.audience_size || '' };
+    var job = newJobId();
+    if (jobOrder.length >= JOB_CAP) delete jobs[jobOrder.shift()];
+    jobs[job] = { meta: meta, groups: groups, coverage: coverage }; jobOrder.push(job);
+    return { job: job, meta: meta, groups: groups, coverage: coverage };
+  }, { latency: [500, 900] });
+
+  Mock.route('GET', '/survey-conversion/api/download', async function (req) {
+    var e = jobs[req.query.job || ''];
+    if (!e) return Mock.json({ error: 'Job expired — re-run the mapping.' }, 404);
+    var m = e.meta, c = e.coverage;
+    var summary = [
+      ['Client', m.client], ['Audience Name', m.audience_name], ['Audience ID', m.audience_id],
+      ['Audience Size', m.audience_size], ['', ''], ['Total Conditions', c.total_conditions],
+      ['Matched', c.matched], ['Unmatched', c.unmatched], ['Unique CA Segments', c.unique_segments],
+      ['Live Taxonomy Matches', c.taxonomy_hits], ['Reference-Only Matches', c.reference_hits],
+      ['  ...not found in current taxonomy', c.unverified_reference]
+    ].map(function (r) { return { Field: r[0], Value: r[1] }; });
+    var detail = [];
+    e.groups.forEach(function (g) {
+      g.blocks.forEach(function (b) {
+        if (b.type !== 'OR_BLOCK') return;
+        b.conditions.forEach(function (cd) {
+          var base = { 'Group': g.name, 'Category': b.category, 'Survey Attribute': cd.label, 'Reach': cd.reach };
+          if (cd.segments.length) cd.segments.forEach(function (s) {
+            detail.push(Object.assign({}, base, { 'Mapped CA Segment': s.segment, 'Source': s.source,
+              'In Current Taxonomy': s.in_current_taxonomy ? 'Yes' : 'No' }));
+          });
+          else detail.push(Object.assign({}, base, { 'Mapped CA Segment': '(no mapping found)', 'Source': '', 'In Current Taxonomy': '' }));
+        });
+      });
+    });
+    var name = (m.audience_name || 'Survey_Mapping').replace(/ /g, '_').slice(0, 60);
+    return Mock.file(await Mock.xlsxBlob({ 'Summary': summary, 'Mapped Segments': detail }), name + '_CA_Mapping.xlsx');
+  });
+
+  // ── Sample Survey audience-definition export (generated numbers) ─────────────
+  async function sampleBlob() {
+    var r = Mock.rng('survey-sample-' + Math.floor(Date.now() / 60000)); // fresh-ish numbers each minute
+    function reach() { return Mock.round(Mock.randFloat(4, 38, r), 1) + '%'; }
+    var size = Mock.randInt(900, 4200, r) * 1000 + Mock.randInt(0, 999, r);
+    var aoa = [
+      ['Client', 'Northwind Outfitters (sample)'],
+      ['Audience Name', 'Active Urban Families'],
+      ['Audience Id', Mock.randInt(400000, 999999, r)],
+      ['Audience Size', size.toLocaleString('en-CA')],
+      [],
+      ['Regular Group: Core Demographics'],
+      ['SURVEY', 'Demographics >> Age >> 25-34', reach()],
+      ['OR'], ['SURVEY', 'Demographics >> Age >> 35-44', reach()],
+      ['AND'], ['SURVEY', 'Demographics >> Gender >> Female', reach()],
+      ['AND'], ['SURVEY', 'Demographics >> Household >> Homeowner', reach()],
+      ['OR'], ['SURVEY', 'Demographics >> Household >> Renting', reach()],
+      [],
+      ['Regular Group: Interests & Attitudes'],
+      ['SURVEY', 'Interests & Hobbies >> Interests >> Travel', reach()],
+      ['OR'], ['SURVEY', 'Interests & Hobbies >> Interests >> Fitness', reach()],
+      ['OR'], ['SURVEY', 'Interests & Hobbies >> Interests >> Gaming', reach()],
+      ['AND'], ['SURVEY', 'Attitudes & Lifestyle >> Personality >> Adventurous', reach()],
+      ['OR'], ['SURVEY', 'Attitudes & Lifestyle >> Personality >> Eco-Conscious', reach()],
+      ['OR'], ['SURVEY', 'Attitudes & Lifestyle >> Personality >> Tech Savvy', reach()],
+      [],
+      ['Regular Group: Household & Brands'],
+      ['SURVEY', 'Household >> Number Of Children >> 2', reach()],
+      ['OR'], ['SURVEY', 'Household >> Parental Status >> Parent', reach()],
+      ['AND'], ['SURVEY', 'Online Activities >> Web Brands >> Podcasts (Select Markets Only)', reach()],
+      ['AND'], ['SURVEY', 'Brands >> Snack Brands >> Crunchtown Chips', reach()]
+    ];
+    var X = await Mock.loadXLSX();
+    var wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, X.utils.aoa_to_sheet(aoa), 'Audience');
+    var out = X.write(wb, { bookType: 'xlsx', type: 'array' });
+    return new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+  Mock.route('GET', '/survey-conversion/api/demo-sample', async function () {
+    return Mock.file(await sampleBlob(), 'Sample_Survey_Audience_Definition.xlsx');
+  }, { latency: [100, 250] });
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Survey → CA Taxonomy – Audience Analytics Engine</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0d0d2b;--deep:#131447;--violet:#7c5ce8;--purple:#5b4fcf;
+  --lavender:#a78bfa;--teal:#2dd4bf;--sky:#60a5fa;--amber:#fbbf24;--pink:#f472b6;--red:#f87171;
+  --card-bg:rgba(255,255,255,0.05);--card-border:rgba(180,160,255,0.28);
+  --text:#f0eeff;--text-sec:#cdc6ec;--muted:#9d95c9;
+  --input-bg:rgba(255,255,255,0.07);--input-border:rgba(180,160,255,0.30);
+}
+html,body{min-height:100vh;position:relative;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:var(--text);background:var(--navy);overflow-x:hidden}
+body::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 70% 55% at 8% 15%,rgba(91,79,207,0.28)0%,transparent 60%),radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12)0%,transparent 55%),radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%);pointer-events:none;z-index:0}
+body::after{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(162,140,250,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(162,140,250,0.03) 1px,transparent 1px);background-size:52px 52px;pointer-events:none;z-index:0}
+.shell{position:relative;z-index:1}
+@keyframes pageIn{from{opacity:0}to{opacity:1}}
+body{animation:pageIn .35s ease both}
+body.leaving{opacity:0;transform:scale(.99);transition:opacity .2s ease,transform .2s ease}
+@keyframes riseIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:0 44px;height:84px;background:rgba(13,13,43,0.70);backdrop-filter:blur(18px);border-bottom:1px solid rgba(180,160,255,0.12)}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.brand-dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7);animation:pdot 2.6s ease-in-out infinite;flex-shrink:0}
+@keyframes pdot{0%,100%{box-shadow:0 0 8px rgba(124,92,232,0.7)}50%{box-shadow:0 0 18px rgba(45,212,191,0.9)}}
+.brand-name{font-size:1.2rem;font-weight:700;color:#e8e0ff;letter-spacing:0.01em}
+.brand-sep{width:1px;height:24px;background:var(--card-border)}
+.brand-sub{font-size:0.8rem;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase}
+.back-link{display:flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--muted);text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--card-border);background:rgba(255,255,255,0.03);transition:all .2s}
+.back-link:hover{color:var(--lavender);border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.08)}
+.back-link svg{width:13px;height:13px;stroke:currentColor}
+
+.container{max-width:1180px;margin:0 auto;padding:28px 28px 72px}
+.sec-head{font-size:0.65rem;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:var(--lavender);margin:26px 0 14px;display:flex;align-items:center;gap:10px}
+.sec-head::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--card-border),transparent)}
+.sec-head:first-child{margin-top:0}
+
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:14px;padding:22px 24px;margin-bottom:14px;backdrop-filter:blur(12px);position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,0.35),transparent)}
+
+.btn{display:inline-flex;align-items:center;gap:7px;padding:11px 20px;font-size:13px;font-weight:600;border-radius:9px;cursor:pointer;border:none;font-family:inherit;transition:all .18s;min-height:44px;text-decoration:none}
+.btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+.btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:0.4;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-secondary{background:rgba(255,255,255,0.05);color:var(--text-sec);border:1px solid var(--card-border)}
+.btn-secondary:hover{border-color:rgba(167,139,250,0.45);color:var(--text)}
+.btn-sm{padding:7px 13px;font-size:12px;min-height:auto}
+.btn-toggle.active{background:rgba(251,191,36,0.14);border-color:rgba(251,191,36,0.45);color:var(--amber)}
+
+/* ── Upload zone ── */
+.drop-zone{border:1.5px dashed var(--input-border);border-radius:14px;padding:44px 24px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s,transform .15s;position:relative;background:var(--card-bg)}
+.drop-zone:hover{border-color:rgba(167,139,250,0.55);background:rgba(124,92,232,0.06)}
+.drop-zone.drag-over{border-color:var(--teal);background:rgba(45,212,191,0.08);transform:scale(1.01)}
+.drop-zone.filled{border-style:solid;border-color:rgba(45,212,191,0.5);background:rgba(45,212,191,0.06)}
+.drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+.drop-icon{font-size:2.4rem;margin-bottom:10px;display:block;filter:drop-shadow(0 4px 14px rgba(124,92,232,0.4))}
+.drop-title{font-size:1.05rem;font-weight:700;margin-bottom:6px}
+.drop-hint{font-size:12px;color:var(--muted)}
+.file-name{font-family:'DM Mono',monospace;font-size:12px;color:var(--teal);margin-top:12px;word-break:break-all}
+
+.info-note{font-size:11.5px;color:var(--muted);background:rgba(255,255,255,0.03);border:1px solid rgba(180,160,255,0.12);border-radius:8px;padding:12px 14px;line-height:1.6;margin-top:14px}
+.info-note b{color:var(--text-sec)}
+
+/* ── Loading ── */
+.loader{display:none;text-align:center;padding:36px;color:var(--muted);font-size:13px}
+.loader.visible{display:block}
+.spinner{width:32px;height:32px;border:3px solid var(--card-border);border-top-color:var(--violet);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.error-box{display:none;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.3);border-radius:10px;padding:14px 18px;font-size:13px;color:var(--red);margin-top:14px}
+.error-box.visible{display:block}
+
+/* ── Results ── */
+#results{display:none}
+#results.visible{display:block;animation:riseIn .4s ease both}
+
+.meta-card{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px}
+.meta-item .meta-label{font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}
+.meta-item .meta-value{font-size:1.05rem;font-weight:700}
+.meta-item .meta-value.accent{color:var(--teal)}
+
+.summary-grid{display:grid;grid-template-columns:0.85fr 1.15fr;gap:14px;align-items:start}
+@media(max-width:820px){.summary-grid{grid-template-columns:1fr}}
+.viz-card{border-radius:14px;border:1px solid var(--card-border);background:var(--card-bg);padding:20px 22px;backdrop-filter:blur(12px)}
+.donut-wrap{position:relative;width:100%;max-width:190px;margin:6px auto 4px}
+.donut-center{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:none}
+.donut-center .dc-lbl{font-size:9px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted)}
+.donut-center .dc-val{font-size:1.5rem;font-weight:700;background:linear-gradient(90deg,var(--lavender),var(--sky));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.stat-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid rgba(180,160,255,0.08);font-size:12.5px}
+.stat-row:last-child{border-bottom:none}
+.stat-row .sr-val{font-weight:700;font-variant-numeric:tabular-nums;flex-shrink:0;padding-left:12px}
+/* Space the dot with flex gap rather than a margin on an inline-block: the same
+   pattern the status pills on the other tools use, and it can't collapse onto
+   the label under unusual font metrics or display scaling. min-width:0 lets a
+   long label wrap instead of squeezing the dot. */
+.stat-row>span:first-child{display:flex;align-items:center;gap:8px;min-width:0}
+.dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
+
+/* ── Action bar ── */
+.action-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.action-bar .search-inp{flex:1;min-width:200px;font-family:inherit;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border);border-radius:9px;padding:11px 14px;font-size:13px}
+.action-bar .search-inp:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+
+/* ── Groups ── */
+.group-card{border-left:3px solid var(--violet)}
+.group-title{font-size:0.72rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--lavender);margin-bottom:16px}
+
+.or-block{background:rgba(255,255,255,0.03);border:1px solid var(--card-border);border-radius:11px;padding:16px 18px;margin-bottom:10px}
+.block-category{font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--sky);margin-bottom:12px}
+.condition{margin-bottom:14px}
+.condition:last-child{margin-bottom:0}
+.condition-head{display:flex;align-items:baseline;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+.condition-label{font-size:13px;font-weight:700;color:var(--text)}
+.condition-reach{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.segment-list{list-style:none;display:flex;flex-direction:column;gap:6px}
+.segment-list li{font-size:12.5px;color:var(--text);padding:8px 12px;background:rgba(0,0,0,0.18);border-radius:7px;border-left:3px solid var(--teal);line-height:1.4;display:flex;align-items:center;gap:8px;justify-content:space-between}
+.segment-list li.ref{border-left-color:var(--lavender)}
+.segment-list li.unverified{border-left-color:var(--amber);background:rgba(251,191,36,0.06)}
+.segment-list li.empty{border-left-color:var(--amber);color:var(--amber);background:rgba(251,191,36,0.06)}
+.seg-badge{font-size:9px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:var(--muted);flex-shrink:0;white-space:nowrap}
+.seg-badge.live{color:var(--teal)}
+.seg-badge.reference{color:var(--lavender)}
+.seg-badge.unverified{color:var(--amber)}
+
+.and-separator{display:flex;align-items:center;gap:12px;margin:12px 0}
+.and-separator::before,.and-separator::after{content:'';flex:1;height:1px;background:var(--card-border)}
+.and-badge{font-size:10px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:var(--violet);background:rgba(124,92,232,0.14);border:1px solid rgba(124,92,232,0.35);border-radius:5px;padding:4px 10px}
+
+.flags{margin-top:14px;border-top:1px solid rgba(180,160,255,0.12);padding-top:14px}
+.flags-title{font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--amber);margin-bottom:8px}
+.flag-item{font-size:12px;color:var(--amber);background:rgba(251,191,36,0.07);border:1px solid rgba(251,191,36,0.2);border-radius:7px;padding:8px 12px;margin-bottom:6px}
+.flag-item::before{content:'⚠ '}
+
+.page-footer{text-align:center;padding:20px;font-size:0.68rem;color:var(--muted);border-top:1px solid rgba(162,140,250,0.07);letter-spacing:0.04em;position:relative;z-index:1}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<div class="container">
+
+  <div id="upload-step">
+    <div class="sec-head">Upload Survey Audience Definition</div>
+    <div class="drop-zone" id="dropZone">
+      <input type="file" id="fileInput" accept=".xlsx,.csv">
+      <span class="drop-icon">📤</span>
+      <div class="drop-title">Drop the audience definition file here</div>
+      <div class="drop-hint">or click to browse — .xlsx (or .csv) exported from your survey platform</div>
+      <div class="file-name" id="fileName"></div>
+    </div>
+    <div class="info-note">
+      Taxonomy and crosswalk are built in. Upload the audience definition only.<div style="margin-top:10px">No file handy?</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <a class="btn btn-secondary btn-sm" href="/survey-conversion/api/demo-sample">⬇ Download sample survey export</a>
+        <button class="btn btn-secondary btn-sm" type="button" onclick="useSample(this)">✨ Use sample data</button>
+      </div>
+    </div>
+    <button class="btn btn-primary" id="runBtn" style="margin-top:16px;width:100%" disabled onclick="runMapping()">🚀 Run Mapping</button>
+    <div class="error-box" id="errorBox"></div>
+    <div class="loader" id="loader"><div class="spinner"></div>Mapping survey attributes against the CA taxonomy…</div>
+  </div>
+
+  <div id="results">
+
+    <div class="sec-head">Audience</div>
+    <div class="card meta-card">
+      <div class="meta-item"><div class="meta-label">Client</div><div class="meta-value" id="mClient">—</div></div>
+      <div class="meta-item"><div class="meta-label">Audience Name</div><div class="meta-value" id="mName">—</div></div>
+      <div class="meta-item"><div class="meta-label">Audience ID</div><div class="meta-value" id="mId">—</div></div>
+      <div class="meta-item"><div class="meta-label">Audience Size</div><div class="meta-value accent" id="mSize">—</div></div>
+    </div>
+
+    <div class="sec-head">Mapping Coverage</div>
+    <div class="summary-grid">
+      <div class="viz-card">
+        <div class="donut-wrap">
+          <canvas id="covDonut" width="190" height="190"></canvas>
+          <div class="donut-center"><span class="dc-lbl">Matched</span><span class="dc-val" id="dcPct">0%</span></div>
+        </div>
+      </div>
+      <div class="viz-card">
+        <div class="stat-row"><span><span class="dot" style="background:var(--teal)"></span>Conditions matched</span><span class="sr-val" id="statMatched">0</span></div>
+        <div class="stat-row"><span><span class="dot" style="background:var(--amber)"></span>Conditions unmatched</span><span class="sr-val" id="statUnmatched">0</span></div>
+        <div class="stat-row"><span><span class="dot" style="background:var(--sky)"></span>Unique CA segments</span><span class="sr-val" id="statUnique">0</span></div>
+        <div class="stat-row"><span><span class="dot" style="background:var(--teal)"></span>Live taxonomy matches</span><span class="sr-val" id="statTax">0</span></div>
+        <div class="stat-row"><span><span class="dot" style="background:var(--lavender)"></span>Reference-crosswalk matches</span><span class="sr-val" id="statRef">0</span></div>
+        <div class="stat-row"><span><span class="dot" style="background:var(--amber)"></span>...not in current taxonomy</span><span class="sr-val" id="statUnverified">0</span></div>
+      </div>
+    </div>
+
+    <div class="sec-head">Mapped Segments</div>
+    <div class="info-note" id="genericNote" style="display:none;margin-bottom:14px"><b>Too generic to auto-match</b> marks very short values (such as "2" from "Number Of Children") that are skipped rather than fuzzy-matched. Map them manually.</div>
+    <div class="action-bar">
+      <input class="search-inp" id="searchBox" placeholder="Search attributes or segments…" oninput="renderGroups()">
+      <button class="btn btn-secondary btn-sm btn-toggle" id="refToggle" onclick="toggleRefOnly()">👁 Hide unverified reference-only</button>
+      <button class="btn btn-secondary btn-sm" onclick="copySegments()">📋 Copy all matched segments</button>
+      <button class="btn btn-secondary btn-sm" onclick="exportExcel()">📄 Export to Excel</button>
+      <button class="btn btn-secondary btn-sm" onclick="resetTool()">↺ Map another audience</button>
+    </div>
+    <div id="groupsArea"></div>
+
+  </div>
+
+</div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+let currentJob=null, currentData=null, hideUnverified=false;
+
+/* ── Upload zone ── */
+const dropZone=$('dropZone'), fileInput=$('fileInput');
+['dragenter','dragover'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();dropZone.classList.add('drag-over');}));
+['dragleave','drop'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();dropZone.classList.remove('drag-over');}));
+dropZone.addEventListener('drop',e=>{
+  if(e.dataTransfer.files[0]){ fileInput.files=e.dataTransfer.files; onFileChosen(); }
+});
+fileInput.addEventListener('change', onFileChosen);
+async function useSample(btn){
+  const orig=btn.textContent; btn.disabled=true; btn.textContent='Generating…';
+  try{
+    const r=await fetch('/survey-conversion/api/demo-sample');
+    if(!r.ok) throw new Error('Could not generate the sample file');
+    const f=new File([await r.blob()],'Sample_Survey_Audience_Definition.xlsx',
+      {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const dt=new DataTransfer(); dt.items.add(f); fileInput.files=dt.files;
+    onFileChosen();
+    runMapping();
+  }catch(e){
+    $('errorBox').textContent=e.message; $('errorBox').classList.add('visible');
+  }finally{ btn.disabled=false; btn.textContent=orig; }
+}
+function onFileChosen(){
+  const f=fileInput.files[0];
+  if(!f) return;
+  $('fileName').textContent=f.name;
+  dropZone.classList.add('filled');
+  $('runBtn').disabled=false;
+}
+
+/* ── Run mapping ── */
+async function runMapping(){
+  const f=fileInput.files[0];
+  if(!f) return;
+  $('errorBox').classList.remove('visible');
+  $('loader').classList.add('visible');
+  $('runBtn').disabled=true;
+
+  const fd=new FormData();
+  fd.append('audience', f);
+
+  try{
+    const r=await fetch('/survey-conversion/api/analyze', {method:'POST', body:fd});
+    const data=await r.json();
+    if(!r.ok || data.error){
+      $('errorBox').textContent=data.error||'Mapping failed.';
+      $('errorBox').classList.add('visible');
+      return;
+    }
+    currentJob=data.job;
+    currentData=data;
+    renderResults(data);
+    $('upload-step').style.display='none';
+    $('results').classList.add('visible');
+  }catch(e){
+    $('errorBox').textContent='Unexpected error: '+e.message;
+    $('errorBox').classList.add('visible');
+  }finally{
+    $('loader').classList.remove('visible');
+    $('runBtn').disabled=false;
+  }
+}
+
+function resetTool(){
+  currentJob=null; currentData=null; hideUnverified=false;
+  fileInput.value=''; $('fileName').textContent=''; dropZone.classList.remove('filled');
+  $('runBtn').disabled=true;
+  $('results').classList.remove('visible');
+  $('upload-step').style.display='';
+  $('searchBox').value='';
+  $('refToggle').classList.remove('active');
+}
+
+/* ── Coverage donut ── */
+let covChart=null;
+function renderCoverage(cov){
+  $('statMatched').textContent=cov.matched;
+  $('statUnmatched').textContent=cov.unmatched;
+  $('statUnique').textContent=cov.unique_segments;
+  $('statTax').textContent=cov.taxonomy_hits;
+  $('statRef').textContent=cov.reference_hits;
+  $('statUnverified').textContent=cov.unverified_reference;
+
+  const pct=cov.total_conditions>0?Math.round(cov.matched/cov.total_conditions*100):0;
+  $('dcPct').textContent=pct+'%';
+
+  if(typeof Chart==='undefined') return;
+  const data=[cov.matched, cov.unmatched];
+  if(covChart){ covChart.data.datasets[0].data=data; covChart.update(); return; }
+  covChart=new Chart($('covDonut'), {
+    type:'doughnut',
+    data:{labels:['Matched','Unmatched'],datasets:[{data:data.every(v=>!v)?[1,0]:data,
+      backgroundColor:['#2dd4bfdd','#fbbf24dd'],borderColor:'rgba(13,13,43,0.9)',borderWidth:2,hoverOffset:6}]},
+    options:{cutout:'70%',responsive:true,maintainAspectRatio:true,animation:{duration:450},
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' '+c.label+': '+c.parsed}}}}
+  });
+}
+
+/* ── Results rendering ── */
+function renderResults(data){
+  const m=data.meta;
+  $('mClient').textContent=m.client||'—';
+  $('mName').textContent=m.audience_name||'—';
+  $('mId').textContent=m.audience_id||'—';
+  $('mSize').textContent=m.audience_size||'—';
+  renderCoverage(data.coverage);
+
+  const hasGeneric=data.groups.some(g=>g.blocks.some(b=>
+    b.type==='OR_BLOCK' && b.conditions.some(c=>c.too_generic)));
+  $('genericNote').style.display=hasGeneric?'':'none';
+
+  renderGroups();
+}
+
+function toggleRefOnly(){
+  hideUnverified=!hideUnverified;
+  $('refToggle').classList.toggle('active', hideUnverified);
+  renderGroups();
+}
+
+function segClass(s){
+  if(!s.in_current_taxonomy && s.source==='reference') return 'unverified';
+  if(s.source==='reference') return 'ref';
+  return '';
+}
+function segBadge(s){
+  if(!s.in_current_taxonomy && s.source==='reference') return '<span class="seg-badge unverified">⚠ Reference only</span>';
+  if(s.source==='reference') return '<span class="seg-badge reference">Reference match</span>';
+  return '<span class="seg-badge live">Live match</span>';
+}
+
+function renderGroups(){
+  if(!currentData) return;
+  const q=($('searchBox').value||'').toLowerCase().trim();
+  const groups=currentData.groups;
+  let html='';
+
+  for(const group of groups){
+    const allFlags=[];
+    let blockHtml='';
+    let groupHasVisibleContent=false;
+
+    for(const block of group.blocks){
+      if(block.type==='AND_SEPARATOR'){
+        blockHtml+=`<div class="and-separator"><span class="and-badge">AND</span></div>`;
+        continue;
+      }
+      let condHtml='';
+      for(const c of block.conditions){
+        let segs=c.segments;
+        if(hideUnverified) segs=segs.filter(s=>!(s.source==='reference' && !s.in_current_taxonomy));
+        const matchesSearch=!q || c.label.toLowerCase().includes(q) || segs.some(s=>s.segment.toLowerCase().includes(q));
+        if(!matchesSearch) continue;
+        groupHasVisibleContent=true;
+
+        if(!c.segments.length) allFlags.push(
+          c.too_generic
+            ? `Too generic to safely auto-match, map manually: ${c.label}`
+            : `No mapping found for: ${c.label}`
+        );
+
+        condHtml+=`<div class="condition">
+          <div class="condition-head">
+            <span class="condition-label">${esc(c.label)}</span>
+            ${c.reach?`<span class="condition-reach">Reach: ${esc(c.reach)}</span>`:''}
+          </div>
+          <ul class="segment-list">
+            ${segs.length ? segs.map(s=>`<li class="${segClass(s)}"><span>${esc(s.segment)}</span>${segBadge(s)}</li>`).join('')
+              : c.segments.length ? '<li class="empty">All matches hidden by the reference-only filter</li>'
+              : c.too_generic ? '<li class="empty">Value too generic to auto-match safely — map this one manually</li>'
+              : '<li class="empty">No segments found</li>'}
+          </ul>
+        </div>`;
+      }
+      if(condHtml){
+        blockHtml+=`<div class="or-block"><div class="block-category">${esc(block.category)}</div>${condHtml}</div>`;
+      }
+    }
+
+    if(!groupHasVisibleContent && q) continue;
+
+    html+=`<div class="card group-card"><div class="group-title">${esc(group.name)}</div>${blockHtml}`;
+    if(allFlags.length){
+      html+=`<div class="flags"><div class="flags-title">Flags</div>${allFlags.map(f=>`<div class="flag-item">${esc(f)}</div>`).join('')}</div>`;
+    }
+    html+=`</div>`;
+  }
+
+  $('groupsArea').innerHTML=html || '<div class="card" style="text-align:center;color:var(--muted)">No conditions match your search.</div>';
+}
+
+/* ── Actions ── */
+function copySegments(){
+  if(!currentData) return;
+  const segs=new Set();
+  for(const g of currentData.groups){
+    for(const b of g.blocks){
+      if(b.type!=='OR_BLOCK') continue;
+      for(const c of b.conditions){
+        for(const s of c.segments) segs.add(s.segment);
+      }
+    }
+  }
+  const text=Array.from(segs).join('\n');
+  navigator.clipboard.writeText(text).then(()=>{
+    const btn=event.target;
+    const orig=btn.textContent;
+    btn.textContent='✓ Copied '+segs.size+' segments';
+    setTimeout(()=>{btn.textContent=orig;},2000);
+  });
+}
+
+function exportExcel(){
+  if(!currentJob) return;
+  Mock.downloadFrom('/survey-conversion/api/download?job='+encodeURIComponent(currentJob));
+}
+
+</script>
+</body>
+</html>

@@ -1,0 +1,1159 @@
+<script data-demo="audience_tracker">
+// Audience & Campaign Tracker — agency -> client -> audience -> campaign.
+// Mirrors tools/audience_tracker.py (pricing, 12-month creation rule, "old rates"
+// flagging, validation messages, optimistic-version conflicts) on a nested
+// document tree persisted with Mock.store('tracker').
+(function () {
+  'use strict';
+  var S = Mock.store('tracker');
+  var RATE_KEYS = ['creation', 'syndication', 'data_3p', 'data_1p'];
+  var DATA_TYPES = ['3P', '1P'];
+  var CREATION_WINDOW_DAYS = 365;
+  var DAY = 86400000;
+
+  // ── tiny helpers ──────────────────────────────────────────────────────────
+  function BadInput(msg) { this.message = msg; this.code = 400; }
+  function NotFound(msg) { this.message = msg; this.code = 404; }
+  function Conflict(cur) { this.message = 'This record was changed by someone else since you loaded it.'; this.current = cur; this.code = 409; }
+  function newId(prefix, r) {
+    var f = r || Math.random, h = '';
+    for (var i = 0; i < 10; i++) h += Math.floor(f() * 16).toString(16);
+    return prefix + '_' + h;
+  }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function now() {
+    var d = new Date();
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' +
+      pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+  function r2(v) { return Math.round((v + (v >= 0 ? 1 : -1) * 1e-9) * 100) / 100; }
+  function r4(v) { return Math.round(v * 10000) / 10000; }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  // ISO date -> UTC ms, or null when not a real YYYY-MM-DD date.
+  function parseDate(v) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v == null ? '' : v).trim());
+    if (!m) return null;
+    var t = Date.UTC(+m[1], +m[2] - 1, +m[3]), d = new Date(t);
+    if (d.getUTCFullYear() !== +m[1] || d.getUTCMonth() !== +m[2] - 1 || d.getUTCDate() !== +m[3]) return null;
+    return t;
+  }
+  function iso(t) { return new Date(t).toISOString().slice(0, 10); }
+  function lower(s) { return String(s || '').toLowerCase(); }
+
+  // ── document tree (same shape as admin_store.LocalDocs) ────────────────────
+  var root = null;
+  function load() { if (!root) root = S.get('root', {}); return root; }
+  function save() { S.set('root', root); }
+  function split(path) {
+    var parts = path.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
+    if (parts.some(function (p) { return p.charAt(0) === '_'; })) throw new NotFound('Invalid path.');
+    return parts;
+  }
+  function coll(node, parts, create) {
+    for (var i = 0; i < parts.length - 1; i += 2) {
+      var c = parts[i], d = parts[i + 1];
+      if (!node[c]) { if (!create) return {}; node[c] = {}; }
+      node = node[c];
+      if (!node[d]) { if (!create) return {}; throw new NotFound('Parent record not found.'); }
+      node = node[d]._sub = node[d]._sub || {};
+    }
+    var last = parts[parts.length - 1];
+    if (!node[last]) { if (!create) return {}; node[last] = {}; }
+    return node[last];
+  }
+  function strip(d, id) {
+    var o = {};
+    Object.keys(d).forEach(function (k) { if (k !== '_sub') o[k] = clone(d[k]); });
+    o.id = id; return o;
+  }
+  var docs = {
+    list: function (p) {
+      var c = coll(load(), split(p));
+      return Object.keys(c).map(function (id) { return strip(c[id], id); });
+    },
+    get: function (p) {
+      var parts = split(p), d = coll(load(), parts.slice(0, -1))[parts[parts.length - 1]];
+      return d ? strip(d, parts[parts.length - 1]) : null;
+    },
+    create: function (p, prefix, fields, opts) {
+      var c = coll(load(), split(p), true), id = newId(prefix, opts && opts.rng);
+      var doc = clone(fields);
+      doc.created_at = (opts && opts.created_at) || now(); doc._version = 1;
+      c[id] = doc; if (!(opts && opts.nosave)) save();
+      return id;
+    },
+    update: function (p, fields, expected) {
+      var parts = split(p), c = coll(load(), parts.slice(0, -1)), id = parts[parts.length - 1], cur = c[id];
+      if (!cur) throw new NotFound('Record not found.');
+      if (expected != null && (cur._version || 1) !== expected) throw new Conflict(strip(cur, id));
+      Object.keys(fields).forEach(function (k) { cur[k] = clone(fields[k]); });
+      cur._version = (cur._version || 1) + 1; cur.updated_at = now();
+      save();
+    },
+    remove: function (p) {
+      var parts = split(p);
+      delete coll(load(), parts.slice(0, -1))[parts[parts.length - 1]];
+      save();
+    }
+  };
+
+  // ── validation (messages match the Flask blueprint) ────────────────────────
+  function text(data, key, required, label) {
+    var v = String((data || {})[key] || '').trim();
+    if (required && !v) throw new BadInput((label || key) + ' is required.');
+    return v;
+  }
+  function number(v, label, required, integer, positive) {
+    if (required === undefined) required = true;
+    if (v == null || (typeof v === 'string' && !v.trim())) {
+      if (required) throw new BadInput(label + ' is required.');
+      return null;
+    }
+    var s = String(v).replace(/,/g, '').replace(/\$/g, '').trim();
+    if (!/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(s)) throw new BadInput(label + ' must be a number.');
+    var n = parseFloat(s);
+    if (!isFinite(n)) throw new BadInput(label + ' must be a number.');
+    if (n < 0 || (positive && n === 0)) throw new BadInput(label + ' must be ' + (positive ? 'greater than' : 'at least') + ' 0.');
+    if (integer) {
+      if (n !== Math.trunc(n)) throw new BadInput(label + ' must be a whole number.');
+      return Math.trunc(n);
+    }
+    return n;
+  }
+  function date(v, label) {
+    v = String(v == null ? '' : v).trim();
+    if (parseDate(v) == null) throw new BadInput(label + ' must be a date (YYYY-MM-DD).');
+    return v;
+  }
+  function rates(data, partial) {
+    var labels = { creation: 'Creation fee', syndication: 'Syndication rate',
+      data_3p: '3P data usage rate', data_1p: '1P data usage rate' };
+    var out = {};
+    RATE_KEYS.forEach(function (k) {
+      var n = number((data || {})[k], labels[k], !partial);
+      if (n != null) out[k] = r4(n);
+    });
+    return out;
+  }
+  function unique(items, name, ownId, what) {
+    var low = name.toLowerCase();
+    if (items.some(function (d) { return lower(d.name) === low && d.id !== ownId; }))
+      throw new BadInput('A ' + (what || 'record') + ' named "' + name + '" already exists.');
+  }
+  var P = {
+    ag: function (ag) { return 'agencies/' + ag; },
+    cl: function (ag, cl) { return 'agencies/' + ag + '/clients/' + cl; },
+    au: function (ag, cl, au) { return 'agencies/' + ag + '/clients/' + cl + '/audiences/' + au; }
+  };
+  function must(path, what) {
+    var d = docs.get(path);
+    if (!d) throw new NotFound(what + ' not found.');
+    return d;
+  }
+
+  // ── pricing ────────────────────────────────────────────────────────────────
+  function effectiveRates(agency, client) {
+    var base = agency.rates || {}, ov = client.rate_overrides || {}, rt = {}, src = {};
+    RATE_KEYS.forEach(function (k) {
+      if (ov[k] != null) { rt[k] = parseFloat(ov[k]); src[k] = 'client'; }
+      else { rt[k] = parseFloat(base[k] || 0); src[k] = 'agency'; }
+    });
+    return { rates: rt, source: src };
+  }
+  function price(rt, audience, campaign) {
+    var records = parseInt(audience.record_count || 0, 10) || 0;
+    var platforms = campaign.platforms || [];
+    var nPlat = platforms.length;
+    var impressions = platforms.reduce(function (s, p) { return s + (parseInt(p.impressions || 0, 10) || 0); }, 0);
+    var months = parseFloat(campaign.months || 0) || 0;
+    var dataType = DATA_TYPES.indexOf(audience.data_type) >= 0 ? audience.data_type : '3P';
+    var dataRate = dataType === '1P' ? rt.data_1p : rt.data_3p;
+    var fees = {
+      creation: r2(campaign.charge_creation ? rt.creation : 0),
+      syndication: r2(records * nPlat * months * rt.syndication / 1000),
+      data_usage: r2(impressions * dataRate / 1000)
+    };
+    fees.total = r2(fees.creation + fees.syndication + fees.data_usage);
+    return {
+      fees: fees,
+      basis: { records: records, platforms: nPlat, months: months, impressions: impressions,
+        data_type: dataType, data_rate: dataRate },
+      rates_applied: clone(rt)
+    };
+  }
+  function creationSuggestion(campaigns, startDate, excludeId) {
+    var start = parseDate(startDate);
+    if (start == null) return [true, 'Enter a start date to check the 12-month rule.'];
+    var paid = [];
+    campaigns.forEach(function (c) {
+      if (c.id === excludeId || !c.charge_creation) return;
+      var d = parseDate(c.start_date || '');
+      if (d == null) return;
+      if (d <= start && Math.round((start - d) / DAY) < CREATION_WINDOW_DAYS) paid.push([d, c]);
+    });
+    if (paid.length) {
+      var best = paid.reduce(function (a, b) { return b[0] > a[0] ? b : a; });
+      var until = best[0] + CREATION_WINDOW_DAYS * DAY;
+      return [false, 'Waived — already paid on "' + best[1].name + '" (' + iso(best[0]) + '); next due from ' + iso(until) + '.'];
+    }
+    var others = campaigns.filter(function (c) { return c.id !== excludeId; });
+    return [true, !others.length ? 'First activation of this audience.'
+      : 'No creation fee paid in the 12 months before this start date.'];
+  }
+  function parseCampaign(data) {
+    var platforms = [], seen = {};
+    (data.platforms || []).forEach(function (p, i) {
+      var name = String((p || {}).name || '').trim();
+      if (!name) throw new BadInput('Platform ' + (i + 1) + ' needs a name.');
+      if (seen[name.toLowerCase()]) throw new BadInput('"' + name + '" is listed twice.');
+      seen[name.toLowerCase()] = 1;
+      platforms.push({ name: name, impressions: number(p.impressions, 'Impressions for ' + name, true, true) });
+    });
+    if (!platforms.length) throw new BadInput('Add at least one platform.');
+    return {
+      name: text(data, 'name', true, 'Campaign name'),
+      start_date: date(data.start_date, 'Start date'),
+      months: number(data.months, 'Campaign length (months)', true, false, true),
+      platforms: platforms,
+      charge_creation: !!data.charge_creation,
+      notes: text(data, 'notes')
+    };
+  }
+  function endDate(start, months) {
+    var t = parseDate(start);
+    if (t == null) return '';
+    var d = new Date(t), whole = Math.trunc(months);
+    var mi = d.getUTCMonth() + whole, y = d.getUTCFullYear() + Math.floor(mi / 12), m = ((mi % 12) + 12) % 12;
+    var dim = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+    var end = Date.UTC(y, m, Math.min(d.getUTCDate(), dim)) + Math.round((months - whole) * 30) * DAY;
+    return iso(end - DAY);
+  }
+  function parseAudience(data, partial) {
+    var out = {};
+    var has = function (k) { return Object.prototype.hasOwnProperty.call(data, k); };
+    if (!partial || has('name')) out.name = text(data, 'name', true, 'Audience name');
+    if (!partial || has('record_count')) out.record_count = number(data.record_count, 'Record count', true, true);
+    if (!partial || has('data_type')) {
+      var dt = String(data.data_type || '').toUpperCase();
+      if (DATA_TYPES.indexOf(dt) < 0) throw new BadInput('Data type must be 3P or 1P.');
+      out.data_type = dt;
+    }
+    if (!partial || has('created_date')) out.created_date = date(data.created_date, 'Created date');
+    if (!partial || has('notes')) out.notes = String(data.notes || '').trim();
+    return out;
+  }
+  function context(ag, cl, au) {
+    var agency = must(P.ag(ag), 'Agency'), client = must(P.cl(ag, cl), 'Client');
+    var audience = must(P.au(ag, cl, au), 'Audience');
+    return [effectiveRates(agency, client), audience];
+  }
+
+  // ── seed: fictional agencies, clients, audiences, campaigns ────────────────
+  function seed() {
+    root = {};
+    var r = Mock.rng('tracker-seed-v1');
+    var PLATS = ['DV360', 'The Trade Desk', 'Amazon DSP', 'Meta', 'Google Ads', 'StackAdapt', 'TikTok', 'Pinterest'];
+    var AGENCIES = [
+      { name: 'Northwind Media Group', notes: 'Full-service media agency — Toronto hub.',
+        rates: { creation: 1500, syndication: 0.35, data_3p: 0.75, data_1p: 0.4 },
+        old: { syndication: 0.3 },
+        clients: [
+          { name: 'Maple Motors', notes: 'Auto OEM — national + dealer groups.', ov: {},
+            auds: ['Near-Luxury Auto Intenders', 'EV Curious Commuters', 'Lease Renewal Window'] },
+          { name: 'Juniper Grocers', notes: 'Regional grocery chain.', ov: { data_3p: 0.6 },
+            auds: ['Weekly Big-Basket Shoppers', 'Plant-Based Explorers'] }
+        ] },
+      { name: 'Bluefin Collective', notes: 'Performance & programmatic specialists.',
+        rates: { creation: 1250, syndication: 0.4, data_3p: 0.85, data_1p: 0.45 },
+        clients: [
+          { name: 'Aurora Telecom', notes: 'Mobile + home internet.', ov: { creation: 1000 },
+            auds: ['Contract-End Switchers', 'Household Bundle Upgraders', 'Student Movers'] },
+          { name: 'Pinecrest Insurance', notes: '', ov: {},
+            auds: ['New Homeowners', 'Young Families Protection'] }
+        ] },
+      { name: 'Harbourline Partners', notes: 'Boutique agency — retail & travel.',
+        rates: { creation: 1800, syndication: 0.3, data_3p: 0.7, data_1p: 0.35 },
+        clients: [
+          { name: 'Lakeshore Outfitters', notes: 'Outdoor & apparel retailer.', ov: {},
+            auds: ['Weekend Trail Enthusiasts', 'Winter Sports Gear Buyers'] }
+        ] }
+    ];
+    var CAMP_NAMES = ['Q1 Conquest', 'Spring Launch', 'Summer Always-On', 'Back to School', 'Fall Promo',
+      'Holiday Push', 'Loyalty Retarget', 'Brand Awareness', 'Year-End Clearance', 'Product Launch'];
+    var staleDone = false;
+    AGENCIES.forEach(function (A) {
+      var ag = docs.create('agencies', 'ag', { name: A.name, rates: A.rates, notes: A.notes },
+        { rng: r, nosave: true, created_at: '2024-01-15 09:00:00' });
+      A.clients.forEach(function (C) {
+        var cl = docs.create(P.ag(ag) + '/clients', 'cl', { name: C.name, notes: C.notes, rate_overrides: C.ov },
+          { rng: r, nosave: true, created_at: '2024-02-01 10:00:00' });
+        var eff = effectiveRates({ rates: A.rates }, { rate_overrides: C.ov });
+        C.auds.forEach(function (aname, ai) {
+          var created = Date.UTC(2024 + Mock.randInt(0, 2, r), Mock.randInt(0, 11, r), Mock.randInt(1, 28, r));
+          if (created > Date.UTC(2026, 6, 1)) created = Date.UTC(2026, Mock.randInt(0, 5, r), Mock.randInt(1, 28, r));
+          var aud = { name: aname, record_count: Mock.randInt(8, 240, r) * 5000,
+            data_type: r() < 0.3 ? '1P' : '3P', created_date: iso(created),
+            notes: r() < 0.4 ? 'Built from the CA taxonomy; refresh quarterly.' : '' };
+          var au = docs.create(P.cl(ag, cl) + '/audiences', 'au', aud,
+            { rng: r, nosave: true, created_at: iso(created) + ' 12:00:00' });
+          var nC = ai === C.auds.length - 1 && r() < 0.5 ? 0 : Mock.randInt(1, 3, r);
+          var t = created + Mock.randInt(10, 60, r) * DAY, camps = [];
+          for (var k = 0; k < nC && t < Date.UTC(2026, 9, 1); k++) {
+            var plats = Mock.shuffle(PLATS, r).slice(0, Mock.randInt(1, 3, r)).map(function (n) {
+              return { name: n, impressions: Mock.randInt(20, 900, r) * 5000 };
+            });
+            var camp = { name: CAMP_NAMES[Mock.randInt(0, CAMP_NAMES.length - 1, r)] + ' ' + iso(t).slice(0, 4),
+              start_date: iso(t), months: [1, 2, 3, 3, 6, 1.5][Mock.randInt(0, 5, r)],
+              platforms: plats, notes: '' };
+            camp.charge_creation = creationSuggestion(camps, camp.start_date)[0];
+            var rt = eff.rates;
+            if (A.old && !staleDone && k === 0) {          // priced before the last rate change
+              rt = clone(eff.rates); Object.keys(A.old).forEach(function (x) { rt[x] = A.old[x]; });
+              staleDone = true;
+            }
+            var p = price(rt, aud, camp);
+            camp.fees = p.fees; camp.rates_applied = p.rates_applied; camp.basis = p.basis;
+            var cid = docs.create(P.au(ag, cl, au) + '/campaigns', 'cm', camp,
+              { rng: r, nosave: true, created_at: camp.start_date + ' 09:30:00' });
+            camps.push(Object.assign({ id: cid }, camp));
+            t += Mock.randInt(60, 330, r) * DAY;
+          }
+        });
+      });
+    });
+    save(); S.set('seeded', 1);
+  }
+  if (!S.get('seeded')) seed();
+
+  // ── route wrapper: maps thrown errors to the blueprint's error handlers ────
+  function h(fn) {
+    return function (req) {
+      try { return fn(req, req.params, req.json || {}); }
+      catch (e) {
+        if (e instanceof Conflict) return Mock.json({ error: e.message, conflict: true, current: e.current }, 409);
+        if (e instanceof BadInput || e instanceof NotFound) return Mock.json({ error: e.message }, e.code);
+        throw e;
+      }
+    };
+  }
+  var has = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); };
+  var LAT = { latency: [60, 220] };
+  var API = '/tracker/api';
+
+  Mock.route('GET', API + '/meta', function () {
+    return { storage: { backend: 'Demo · this browser', shared: false, blocked: false, location: 'Browser storage',
+      note: 'Agencies, clients, audiences and campaigns are made-up sample data; your edits persist in this browser only.' } };
+  }, { latency: [40, 90] });
+  Mock.route('GET', API + '/storage/check', function () {
+    return { ok: true, summary: 'Demo storage OK — read/write round trip succeeded in browser storage.' };
+  });
+
+  // agencies
+  Mock.route('GET', API + '/agencies', h(function () {
+    var items = docs.list('agencies');
+    items.forEach(function (a) { a.n_clients = docs.list('agencies/' + a.id + '/clients').length; });
+    items.sort(function (a, b) { return lower(a.name) < lower(b.name) ? -1 : lower(a.name) > lower(b.name) ? 1 : 0; });
+    return { agencies: items };
+  }), LAT);
+  Mock.route('POST', API + '/agencies', h(function (req, p, data) {
+    var name = text(data, 'name', true, 'Agency name');
+    unique(docs.list('agencies'), name, null, 'agency');
+    return { id: docs.create('agencies', 'ag', { name: name, rates: rates(data.rates), notes: text(data, 'notes') }) };
+  }), LAT);
+  Mock.route('PATCH', API + '/agencies/:ag', h(function (req, p, data) {
+    var fields = {};
+    if (has(data, 'name')) { fields.name = text(data, 'name', true, 'Agency name'); unique(docs.list('agencies'), fields.name, p.ag, 'agency'); }
+    if (has(data, 'rates')) fields.rates = rates(data.rates);
+    if (has(data, 'notes')) fields.notes = text(data, 'notes');
+    docs.update(P.ag(p.ag), fields, data._version);
+    return { ok: true };
+  }), LAT);
+  Mock.route('DELETE', API + '/agencies/:ag', h(function (req, p) {
+    must(P.ag(p.ag), 'Agency'); docs.remove(P.ag(p.ag)); return { ok: true };
+  }), LAT);
+
+  // clients
+  Mock.route('GET', API + '/agencies/:ag/clients', h(function (req, p) {
+    var agency = must(P.ag(p.ag), 'Agency');
+    var items = docs.list(P.ag(p.ag) + '/clients');
+    items.forEach(function (c) { c.n_audiences = docs.list(P.cl(p.ag, c.id) + '/audiences').length; });
+    items.sort(function (a, b) { return lower(a.name) < lower(b.name) ? -1 : lower(a.name) > lower(b.name) ? 1 : 0; });
+    return { agency: agency, clients: items };
+  }), LAT);
+  Mock.route('POST', API + '/agencies/:ag/clients', h(function (req, p, data) {
+    must(P.ag(p.ag), 'Agency');
+    var name = text(data, 'name', true, 'Client name');
+    unique(docs.list(P.ag(p.ag) + '/clients'), name, null, 'client at this agency');
+    return { id: docs.create(P.ag(p.ag) + '/clients', 'cl', { name: name, notes: text(data, 'notes'),
+      rate_overrides: rates(data.rate_overrides, true) }) };
+  }), LAT);
+  Mock.route('GET', API + '/agencies/:ag/clients/:cl', h(function (req, p) {
+    var agency = must(P.ag(p.ag), 'Agency'), client = must(P.cl(p.ag, p.cl), 'Client');
+    var eff = effectiveRates(agency, client);
+    var audiences = docs.list(P.cl(p.ag, p.cl) + '/audiences');
+    audiences.forEach(function (a) {
+      var camps = docs.list(P.au(p.ag, p.cl, a.id) + '/campaigns');
+      camps.forEach(function (c) {
+        var cur = price(eff.rates, a, c);
+        c.end_date = endDate(c.start_date, parseFloat(c.months || 0) || 0);
+        c.current_fees = cur.fees;
+        c.stale = ((c.fees || {}).total) !== cur.fees.total;
+      });
+      camps.sort(function (x, y) { return (x.start_date || '') < (y.start_date || '') ? -1 : (x.start_date || '') > (y.start_date || '') ? 1 : 0; });
+      a.campaigns = camps;
+      var starts = camps.map(function (c) { return c.start_date; }).filter(Boolean).sort();
+      a.activated_year = starts.length ? starts[0].slice(0, 4) : null;
+      a.created_year = (a.created_date || a.created_at || '').slice(0, 4) || null;
+      a.total_fees = r2(camps.reduce(function (s, c) { return s + ((c.fees || {}).total || 0); }, 0));
+    });
+    audiences.sort(function (x, y) {
+      var kx = (x.created_date || '') + '\u0000' + lower(x.name), ky = (y.created_date || '') + '\u0000' + lower(y.name);
+      return kx < ky ? -1 : kx > ky ? 1 : 0;
+    });
+    return { agency: agency, client: client, effective: eff, audiences: audiences };
+  }), LAT);
+  Mock.route('PATCH', API + '/agencies/:ag/clients/:cl', h(function (req, p, data) {
+    var fields = {};
+    if (has(data, 'name')) {
+      fields.name = text(data, 'name', true, 'Client name');
+      unique(docs.list(P.ag(p.ag) + '/clients'), fields.name, p.cl, 'client at this agency');
+    }
+    if (has(data, 'notes')) fields.notes = text(data, 'notes');
+    if (has(data, 'rate_overrides')) fields.rate_overrides = rates(data.rate_overrides, true);
+    docs.update(P.cl(p.ag, p.cl), fields, data._version);
+    return { ok: true };
+  }), LAT);
+  Mock.route('DELETE', API + '/agencies/:ag/clients/:cl', h(function (req, p) {
+    must(P.cl(p.ag, p.cl), 'Client'); docs.remove(P.cl(p.ag, p.cl)); return { ok: true };
+  }), LAT);
+
+  // audiences
+  Mock.route('POST', API + '/agencies/:ag/clients/:cl/audiences', h(function (req, p, data) {
+    must(P.cl(p.ag, p.cl), 'Client');
+    var fields = parseAudience(data);
+    unique(docs.list(P.cl(p.ag, p.cl) + '/audiences'), fields.name, null, 'audience for this client');
+    return { id: docs.create(P.cl(p.ag, p.cl) + '/audiences', 'au', fields) };
+  }), LAT);
+  Mock.route('PATCH', API + '/agencies/:ag/clients/:cl/audiences/:au', h(function (req, p, data) {
+    var fields = parseAudience(data, true);
+    if (has(fields, 'name')) unique(docs.list(P.cl(p.ag, p.cl) + '/audiences'), fields.name, p.au, 'audience for this client');
+    docs.update(P.au(p.ag, p.cl, p.au), fields, data._version);
+    return { ok: true };
+  }), LAT);
+  Mock.route('DELETE', API + '/agencies/:ag/clients/:cl/audiences/:au', h(function (req, p) {
+    var path = P.au(p.ag, p.cl, p.au);
+    must(path, 'Audience'); docs.remove(path); return { ok: true };
+  }), LAT);
+
+  // campaigns
+  Mock.route('POST', API + '/agencies/:ag/clients/:cl/audiences/:au/price', h(function (req, p, data) {
+    var ctx = context(p.ag, p.cl, p.au), eff = ctx[0], audience = ctx[1];
+    var camps = docs.list(P.au(p.ag, p.cl, p.au) + '/campaigns');
+    var sug = creationSuggestion(camps, data.start_date, data.id);
+    if (data.charge_creation == null) data.charge_creation = sug[0];
+    var num = function (v) { var n = parseFloat(String(v == null ? '' : v).replace(/,/g, '')); return isNaN(n) ? 0 : Math.max(0, n); };
+    var camp = { months: num(data.months), charge_creation: !!data.charge_creation,
+      platforms: (data.platforms || []).filter(function (x) { return (x || {}).name; })
+        .map(function (x) { return { impressions: Math.trunc(num(x.impressions)) }; }) };
+    var out = price(eff.rates, audience, camp);
+    out.source = eff.source; out.suggest_creation = sug[0]; out.creation_reason = sug[1];
+    out.end_date = endDate(data.start_date, camp.months);
+    return out;
+  }), { latency: [40, 120] });
+  Mock.route('POST', API + '/agencies/:ag/clients/:cl/audiences/:au/campaigns', h(function (req, p, data) {
+    var ctx = context(p.ag, p.cl, p.au);
+    var fields = parseCampaign(data), pr = price(ctx[0].rates, ctx[1], fields);
+    fields.fees = pr.fees; fields.rates_applied = pr.rates_applied; fields.basis = pr.basis;
+    return { id: docs.create(P.au(p.ag, p.cl, p.au) + '/campaigns', 'cm', fields), fees: pr.fees };
+  }), LAT);
+  Mock.route('PATCH', API + '/agencies/:ag/clients/:cl/audiences/:au/campaigns/:cm', h(function (req, p, data) {
+    var path = P.au(p.ag, p.cl, p.au) + '/campaigns/' + p.cm;
+    var ctx = context(p.ag, p.cl, p.au);
+    var fields = parseCampaign(data), pr = price(ctx[0].rates, ctx[1], fields);
+    fields.fees = pr.fees; fields.rates_applied = pr.rates_applied; fields.basis = pr.basis;
+    docs.update(path, fields, data._version);
+    return { ok: true, fees: pr.fees };
+  }), LAT);
+  Mock.route('DELETE', API + '/agencies/:ag/clients/:cl/audiences/:au/campaigns/:cm', h(function (req, p) {
+    var path = P.au(p.ag, p.cl, p.au) + '/campaigns/' + p.cm;
+    must(path, 'Campaign'); docs.remove(path); return { ok: true };
+  }), LAT);
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audience &amp; Campaign Tracker – Audience Analytics Engine</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0d0d2b;--violet:#7c5ce8;--purple:#5b4fcf;--lavender:#a78bfa;--teal:#2dd4bf;
+  --sky:#60a5fa;--amber:#fbbf24;--red:#f87171;--green:#3fb950;
+  --card-bg:rgba(255,255,255,0.05);--card-border:rgba(180,160,255,0.28);
+  --text:#f0eeff;--text-sec:#cdc6ec;--muted:#9d95c9;
+  --input-bg:rgba(255,255,255,0.07);--input-border:rgba(180,160,255,0.30);
+}
+html,body{min-height:100vh;position:relative;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:var(--text);background:var(--navy);overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse 70% 55% at 8% 15%,rgba(91,79,207,0.28)0%,transparent 60%),radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12)0%,transparent 55%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%);pointer-events:none;z-index:0}
+.shell{position:relative;z-index:1}
+@keyframes riseIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 44px;height:76px;background:rgba(13,13,43,0.72);backdrop-filter:blur(18px);border-bottom:1px solid rgba(180,160,255,0.12)}
+.topbar-left{display:flex;align-items:center;gap:12px;min-width:0}
+.brand-dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7);flex-shrink:0}
+.brand-name{font-size:1.15rem;font-weight:700;color:#e8e0ff;white-space:nowrap}
+.brand-sep{width:1px;height:24px;background:var(--card-border)}
+.brand-sub{font-size:0.78rem;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase;white-space:nowrap}
+.topbar-right{display:flex;align-items:center;gap:10px}
+.back-link{display:flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--muted);text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--card-border);background:rgba(255,255,255,0.03)}
+.back-link:hover{color:var(--lavender);border-color:rgba(167,139,250,0.45)}
+.pill{font-size:11px;color:var(--muted);border:1px solid var(--card-border);border-radius:14px;padding:5px 12px;background:rgba(255,255,255,0.03);cursor:help;white-space:nowrap}
+.pill b{color:var(--teal)}
+.pill.is-local{color:var(--amber);border-color:rgba(251,191,36,0.45);background:rgba(251,191,36,0.10)}
+.pill.is-local b{color:var(--amber)}
+
+.container{max-width:1280px;margin:0 auto;padding:24px 28px 80px}
+.crumbs{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin-bottom:18px}
+.crumbs a{color:var(--lavender);text-decoration:none}
+.crumbs a:hover{text-decoration:underline}
+.crumbs .sep{opacity:.5}
+.crumbs .here{color:var(--text);font-weight:600}
+
+.view-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+.view-title{font-size:1.5rem;font-weight:700}
+.view-sub{font-size:12.5px;color:var(--muted);margin-top:4px;max-width:720px;line-height:1.5}
+.sec-label{font-size:10.5px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:var(--lavender);margin:26px 0 12px;display:flex;align-items:center;gap:10px}
+.sec-label::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--card-border),transparent)}
+
+.btn{display:inline-flex;align-items:center;gap:7px;padding:10px 18px;font-size:13px;font-weight:600;border-radius:9px;cursor:pointer;border:none;font-family:inherit;transition:all .18s;text-decoration:none;white-space:nowrap}
+.btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+.btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+.btn-secondary{background:rgba(255,255,255,0.05);color:var(--text-sec);border:1px solid var(--card-border)}
+.btn-secondary:hover{border-color:rgba(167,139,250,0.45);color:var(--text)}
+.btn-teal{background:rgba(45,212,191,0.12);color:var(--teal);border:1px solid rgba(45,212,191,0.4)}
+.btn-teal:hover{background:rgba(45,212,191,0.2)}
+.btn-danger{background:rgba(248,113,113,0.12);color:var(--red);border:1px solid rgba(248,113,113,0.3)}
+.btn-danger:hover{background:rgba(248,113,113,0.2)}
+.btn-sm{padding:6px 12px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:14px;padding:18px 20px;animation:riseIn .35s ease both}
+.card.link{cursor:pointer;transition:border-color .15s,background .15s,transform .15s}
+.card.link:hover{border-color:rgba(167,139,250,0.6);background:rgba(124,92,232,0.08);transform:translateY(-2px)}
+.card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.card-name{font-size:1.08rem;font-weight:700}
+.card-meta{font-size:12px;color:var(--muted);margin-top:3px}
+.rates{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin-top:14px}
+.rate .l{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:0.07em}
+.rate .v{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}
+.rate .u{font-size:10.5px;color:var(--muted);font-weight:400}
+.rate.ov .v{color:var(--amber)}
+.tag{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;padding:2px 8px;border-radius:10px;border:1px solid;vertical-align:middle}
+.tag-ov{color:var(--amber);border-color:rgba(251,191,36,0.45);background:rgba(251,191,36,0.10)}
+.tag-3p{color:var(--sky);border-color:rgba(96,165,250,0.45);background:rgba(96,165,250,0.10)}
+.tag-1p{color:var(--teal);border-color:rgba(45,212,191,0.45);background:rgba(45,212,191,0.10)}
+.tag-idle{color:var(--muted);border-color:rgba(157,149,201,0.35);background:rgba(157,149,201,0.08)}
+.tag-warn{color:var(--amber);border-color:rgba(251,191,36,0.45);background:rgba(251,191,36,0.10)}
+
+.head-card{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap}
+.head-card .rates{grid-template-columns:repeat(4,minmax(120px,1fr));margin-top:0;flex:1}
+.stats{display:flex;gap:26px;flex-wrap:wrap}
+.stat .v{font-size:1.35rem;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .l{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:0.07em}
+
+.toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:22px 0 4px}
+.seg{display:inline-flex;border:1px solid var(--card-border);border-radius:9px;overflow:hidden}
+.seg button{background:transparent;border:none;color:var(--text-sec);font:inherit;font-size:12.5px;padding:8px 14px;cursor:pointer}
+.seg button.on{background:rgba(124,92,232,0.28);color:#fff;font-weight:600}
+.toolbar .spacer{flex:1}
+
+.year{margin-top:22px}
+.year-head{display:flex;align-items:baseline;gap:12px;margin-bottom:10px}
+.year-head .y{font-size:1.25rem;font-weight:700}
+.year-head .n{font-size:12px;color:var(--muted)}
+
+.aud{background:var(--card-bg);border:1px solid var(--card-border);border-radius:13px;margin-bottom:12px;overflow:hidden;animation:riseIn .35s ease both}
+.aud-head{display:flex;gap:18px;align-items:flex-start;padding:16px 20px;flex-wrap:wrap}
+.aud-main{flex:1;min-width:240px}
+.aud-name{font-size:15.5px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.aud-meta{font-size:12px;color:var(--muted);margin-top:5px}
+.aud-fig{text-align:right;min-width:110px}
+.aud-fig .v{font-size:1.1rem;font-weight:700;font-variant-numeric:tabular-nums}
+.aud-fig .l{font-size:9.5px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em}
+.aud-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.aud-body{display:grid;grid-template-columns:minmax(220px,1fr) 2.4fr;border-top:1px solid rgba(180,160,255,0.12)}
+@media(max-width:900px){.aud-body{grid-template-columns:1fr}}
+.notes{padding:14px 20px;border-right:1px solid rgba(180,160,255,0.12);background:rgba(0,0,0,0.10)}
+.notes label{display:block;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--lavender);margin-bottom:8px}
+.notes textarea{width:100%;min-height:92px}
+.notes .saved{font-size:10.5px;color:var(--muted);margin-top:5px;min-height:14px}
+.camps{padding:14px 20px;overflow-x:auto}
+.camps-title{font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--lavender);margin-bottom:8px}
+table.ct{width:100%;border-collapse:collapse;font-size:12.5px}
+.ct th{color:var(--muted);font-weight:600;text-align:left;padding:7px 10px;border-bottom:1px solid var(--card-border);font-size:10px;text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap}
+.ct td{padding:9px 10px;border-bottom:1px solid rgba(180,160,255,0.08);vertical-align:top;font-variant-numeric:tabular-nums}
+.ct tbody tr{cursor:pointer}
+.ct tbody tr:hover td{background:rgba(124,92,232,0.07)}
+.ct .num{text-align:right;white-space:nowrap}
+.ct .tot{font-weight:700;color:var(--teal)}
+.ct tfoot td{font-weight:700;border-bottom:none;padding-top:10px}
+.plat{font-size:11.5px;color:var(--text-sec);line-height:1.55;white-space:nowrap}
+.empty{padding:36px;text-align:center;color:var(--muted);border:1.5px dashed var(--input-border);border-radius:13px;line-height:1.6}
+.empty-sm{padding:16px;text-align:center;color:var(--muted);font-size:12.5px;border:1.5px dashed var(--input-border);border-radius:10px}
+.banner{padding:12px 16px;border-radius:10px;font-size:12.5px;line-height:1.5;margin-bottom:16px;border:1px solid}
+.banner.warn{color:#fde68a;border-color:rgba(251,191,36,0.45);background:rgba(251,191,36,0.08)}
+.banner.err{color:#fecaca;border-color:rgba(248,113,113,0.45);background:rgba(248,113,113,0.08)}
+
+select,input[type=text],input[type=number],input[type=date],textarea{font-family:inherit;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border);border-radius:9px;padding:10px 12px;font-size:13.5px}
+select:focus,input:focus,textarea:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+select option{background:#fff;color:#1a1a2e}
+textarea{resize:vertical}
+input[type=number]{font-variant-numeric:tabular-nums}
+
+.modal-back{position:fixed;inset:0;background:rgba(6,6,20,0.72);backdrop-filter:blur(4px);z-index:200;display:none;align-items:center;justify-content:center;padding:20px}
+.modal-back.open{display:flex}
+.modal{background:linear-gradient(160deg,#161638,#111130);border:1px solid var(--card-border);border-radius:16px;padding:24px 26px;width:100%;max-width:560px;box-shadow:0 20px 60px rgba(0,0,0,0.5);max-height:92vh;overflow-y:auto}
+.modal.wide{max-width:860px}
+.modal h2{font-size:1.1rem;margin-bottom:4px}
+.modal .lead{font-size:12px;color:var(--muted);margin-bottom:16px;line-height:1.5}
+.mrow{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.mrow.three{grid-template-columns:2fr 1fr 1fr}
+@media(max-width:620px){.mrow,.mrow.three{grid-template-columns:1fr}}
+.mfield{margin-bottom:13px}
+.mfield label{display:block;font-size:10.5px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.mfield input,.mfield textarea,.mfield select{width:100%}
+.hint{font-size:10.5px;color:var(--muted);margin-top:5px;line-height:1.45}
+.prefix{position:relative}
+.prefix span{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:13px;pointer-events:none}
+.prefix input{padding-left:24px}
+.modal-actions{display:flex;gap:10px;margin-top:18px;align-items:center}
+.modal-actions .spacer{flex:1}
+.merr{color:var(--red);font-size:12.5px;margin-top:10px;min-height:16px}
+
+.camp-grid{display:grid;grid-template-columns:1.25fr 1fr;gap:22px}
+@media(max-width:800px){.camp-grid{grid-template-columns:1fr}}
+.prow{display:grid;grid-template-columns:1.4fr 1fr 34px;gap:8px;margin-bottom:8px}
+.prow input{width:100%;min-width:0}
+.xbtn{background:transparent;border:1px solid var(--card-border);color:var(--muted);border-radius:8px;cursor:pointer;font-size:15px}
+.xbtn:hover{color:var(--red);border-color:rgba(248,113,113,0.5)}
+.checkrow{display:flex;align-items:flex-start;gap:9px;font-size:13px;color:var(--text-sec);cursor:pointer;user-select:none}
+.checkrow input{accent-color:var(--violet);width:16px;height:16px;margin-top:1px;flex-shrink:0}
+.quote{background:rgba(0,0,0,0.22);border:1px solid var(--card-border);border-radius:12px;padding:16px 18px;position:sticky;top:0}
+.quote h3{font-size:10.5px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:var(--lavender);margin-bottom:12px}
+.qline{display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid rgba(180,160,255,0.10)}
+.qline .l{font-size:13px}
+.qline .f{font-size:10.5px;color:var(--muted);margin-top:3px;line-height:1.4}
+.qline .v{font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.qtotal{display:flex;justify-content:space-between;padding-top:12px;font-size:15px;font-weight:700}
+.qtotal .v{color:var(--teal);font-variant-numeric:tabular-nums}
+.qsrc{font-size:10.5px;color:var(--muted);margin-top:12px;line-height:1.5}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1d1d45;border:1px solid var(--card-border);color:var(--text);padding:10px 18px;border-radius:10px;font-size:13px;z-index:300;opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:1}
+@media(max-width:700px){.topbar{padding:0 16px}.brand-sep,.brand-sub{display:none}.container{padding:18px 16px 60px}.head-card .rates{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<div class="shell">
+<main class="container">
+  <div id="storeBanner"></div>
+  <nav class="crumbs" id="crumbs"></nav>
+  <div id="view"></div>
+</main>
+</div>
+
+<datalist id="platformList">
+  <option value="DV360"><option value="The Trade Desk"><option value="Amazon DSP">
+  <option value="Meta"><option value="Google Ads"><option value="StackAdapt">
+  <option value="Yahoo DSP"><option value="LinkedIn"><option value="TikTok">
+  <option value="Snapchat"><option value="Pinterest"><option value="LiveRamp">
+</datalist>
+
+<!-- Agency modal -->
+<div class="modal-back" id="mAgency"><div class="modal">
+  <h2 id="agTitle">New agency</h2>
+  <div class="mfield"><label>Agency name</label><input type="text" id="agName" placeholder="e.g. Northwind Media"></div>
+  <div class="mrow">
+    <div class="mfield"><label>Creation fee</label><div class="prefix"><span>$</span><input type="number" id="agCreation" min="0" step="0.01"></div><div class="hint">Flat, per audience activation</div></div>
+    <div class="mfield"><label>Syndication rate</label><div class="prefix"><span>$</span><input type="number" id="agSyndication" min="0" step="0.01"></div><div class="hint">Per 1,000 records, per platform, per month</div></div>
+  </div>
+  <div class="mrow">
+    <div class="mfield"><label>3P data usage rate</label><div class="prefix"><span>$</span><input type="number" id="agData3p" min="0" step="0.01"></div><div class="hint">CPM — per 1,000 impressions</div></div>
+    <div class="mfield"><label>1P data usage rate</label><div class="prefix"><span>$</span><input type="number" id="agData1p" min="0" step="0.01"></div><div class="hint">CPM — per 1,000 impressions</div></div>
+  </div>
+  <div class="mfield"><label>Notes</label><textarea id="agNotes" rows="2"></textarea></div>
+  <div class="merr" id="agErr"></div>
+  <div class="modal-actions">
+    <button class="btn btn-danger btn-sm" id="agDel" onclick="deleteAgency()">Delete agency</button>
+    <span class="spacer"></span>
+    <button class="btn btn-secondary" onclick="closeModal('mAgency')">Cancel</button>
+    <button class="btn btn-primary" onclick="saveAgency()">Save</button>
+  </div>
+</div></div>
+
+<!-- Client modal -->
+<div class="modal-back" id="mClient"><div class="modal">
+  <h2 id="clTitle">New client</h2>
+  <p class="lead">Leave blank to use the agency rate.</p>
+  <div class="mfield"><label>Client name</label><input type="text" id="clName" placeholder="e.g. Maple Motors"></div>
+  <div class="sec-label" style="margin-top:6px">Rate overrides</div>
+  <div class="mrow">
+    <div class="mfield"><label>Creation fee</label><div class="prefix"><span>$</span><input type="number" id="clCreation" min="0" step="0.01"></div><div class="hint" id="clCreationH"></div></div>
+    <div class="mfield"><label>Syndication rate</label><div class="prefix"><span>$</span><input type="number" id="clSyndication" min="0" step="0.01"></div><div class="hint" id="clSyndicationH"></div></div>
+  </div>
+  <div class="mrow">
+    <div class="mfield"><label>3P data usage rate</label><div class="prefix"><span>$</span><input type="number" id="clData3p" min="0" step="0.01"></div><div class="hint" id="clData3pH"></div></div>
+    <div class="mfield"><label>1P data usage rate</label><div class="prefix"><span>$</span><input type="number" id="clData1p" min="0" step="0.01"></div><div class="hint" id="clData1pH"></div></div>
+  </div>
+  <div class="mfield"><label>Notes</label><textarea id="clNotes" rows="2"></textarea></div>
+  <div class="merr" id="clErr"></div>
+  <div class="modal-actions">
+    <button class="btn btn-danger btn-sm" id="clDel" onclick="deleteClient()">Delete client</button>
+    <span class="spacer"></span>
+    <button class="btn btn-secondary" onclick="closeModal('mClient')">Cancel</button>
+    <button class="btn btn-primary" onclick="saveClient()">Save</button>
+  </div>
+</div></div>
+
+<!-- Audience modal -->
+<div class="modal-back" id="mAudience"><div class="modal">
+  <h2 id="auTitle">New audience</h2>
+  <div class="mfield"><label>Audience name</label><input type="text" id="auName" placeholder="e.g. Near-Luxury Auto Intenders"></div>
+  <div class="mrow three">
+    <div class="mfield"><label>Record count</label><input type="number" id="auRecords" min="0" step="1"></div>
+    <div class="mfield"><label>Data type</label><select id="auType"><option value="3P">3P</option><option value="1P">1P</option></select></div>
+    <div class="mfield"><label>Created</label><input type="date" id="auCreated"></div>
+  </div>
+  <div class="mfield"><label>Notes</label><textarea id="auNotes" rows="3"></textarea></div>
+  <div class="merr" id="auErr"></div>
+  <div class="modal-actions">
+    <button class="btn btn-danger btn-sm" id="auDel" onclick="deleteAudience()">Delete audience</button>
+    <span class="spacer"></span>
+    <button class="btn btn-secondary" onclick="closeModal('mAudience')">Cancel</button>
+    <button class="btn btn-primary" onclick="saveAudience()">Save</button>
+  </div>
+</div></div>
+
+<!-- Campaign modal -->
+<div class="modal-back" id="mCampaign"><div class="modal wide">
+  <h2 id="cmTitle">Activate — new campaign</h2>
+  <p class="lead" id="cmLead"></p>
+  <div class="camp-grid">
+    <div>
+      <div class="mfield"><label>Campaign name</label><input type="text" id="cmName" placeholder="e.g. Q1 Conquest"></div>
+      <div class="mrow">
+        <div class="mfield"><label>Start date</label><input type="date" id="cmStart" oninput="queuePrice()"></div>
+        <div class="mfield"><label>Length (months)</label><input type="number" id="cmMonths" min="0" step="0.5" value="1" oninput="queuePrice()"><div class="hint" id="cmEnd"></div></div>
+      </div>
+      <div class="mfield">
+        <label>Platforms &amp; impressions</label>
+        <div id="cmPlatforms"></div>
+        <button class="btn btn-secondary btn-sm" type="button" onclick="addPlatform()">＋ Add platform</button>
+      </div>
+      <div class="mfield">
+        <label class="checkrow"><input type="checkbox" id="cmCreation" onchange="creationTouched=true;queuePrice()"><span>Charge creation fee<div class="hint" id="cmCreationWhy"></div></span></label>
+      </div>
+      <div class="mfield"><label>Notes</label><textarea id="cmNotes" rows="2"></textarea></div>
+    </div>
+    <div>
+      <div class="quote">
+        <h3>Fees</h3>
+        <div class="qline"><div><div class="l">Creation</div><div class="f" id="qCreationF"></div></div><div class="v" id="qCreation">–</div></div>
+        <div class="qline"><div><div class="l">Syndication</div><div class="f" id="qSyndF"></div></div><div class="v" id="qSynd">–</div></div>
+        <div class="qline"><div><div class="l">Data usage</div><div class="f" id="qDataF"></div></div><div class="v" id="qData">–</div></div>
+        <div class="qtotal"><span>Total</span><span class="v" id="qTotal">–</span></div>
+        <div class="qsrc" id="qSrc"></div>
+      </div>
+    </div>
+  </div>
+  <div class="merr" id="cmErr"></div>
+  <div class="modal-actions">
+    <button class="btn btn-danger btn-sm" id="cmDel" onclick="deleteCampaign()">Delete campaign</button>
+    <span class="spacer"></span>
+    <button class="btn btn-secondary" onclick="closeModal('mCampaign')">Cancel</button>
+    <button class="btn btn-primary" id="cmSave" onclick="saveCampaign()">Save campaign</button>
+  </div>
+</div></div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = v => (v == null || v === '') ? '–' : '$' + Number(v).toLocaleString('en-CA', {minimumFractionDigits:2, maximumFractionDigits:2});
+const rate = v => (v == null || v === '') ? '–' : '$' + Number(v).toLocaleString('en-CA', {minimumFractionDigits:2, maximumFractionDigits:4});
+const int = v => (v == null || v === '') ? '–' : Number(v).toLocaleString('en-CA');
+const API = '/tracker/api';
+const RATE_META = [
+  ['creation', 'Creation fee', 'flat'],
+  ['syndication', 'Syndication', '/ 1k records / platform / mo'],
+  ['data_3p', '3P data usage', 'CPM'],
+  ['data_1p', '1P data usage', 'CPM'],
+];
+
+let state = {agency:null, client:null, clientView:null, groupBy:'created'};
+try { state.groupBy = localStorage.getItem('tracker.groupBy') || 'created'; } catch(e) {}
+
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2200); }
+function openModal(id){ $(id).classList.add('open'); }
+function closeModal(id){ $(id).classList.remove('open'); }
+document.addEventListener('keydown', e => { if(e.key==='Escape') document.querySelectorAll('.modal-back.open').forEach(m=>m.classList.remove('open')); });
+
+async function api(path, opts={}){
+  const r = await fetch(API + path, {headers:{'Content-Type':'application/json'}, ...opts,
+                                     body: opts.body ? JSON.stringify(opts.body) : undefined});
+  let j = {};
+  try { j = await r.json(); } catch(e) {}
+  if(r.status === 409 && j.conflict){
+    alert('Someone else changed this record since you opened it. Reloading the latest version — re-apply your change if it still applies.');
+    Object.keys(modalIds).forEach(closeModal); route();
+    throw new Error('conflict');
+  }
+  if(!r.ok) throw new Error(j.error || `Request failed (${r.status})`);
+  return j;
+}
+const modalIds = {mAgency:1, mClient:1, mAudience:1, mCampaign:1};
+
+// ── routing: #/a/<agency>/c/<client> ─────────────────────────────────────────
+function go(hash){ location.hash = hash; }
+// Demo: pages run in a srcdoc iframe, where href="#..." resolves against the parent URL; keep in-page hash links in-page.
+document.addEventListener('click', e => { const a = e.target.closest && e.target.closest('a[href^="#"]'); if(!a) return; e.preventDefault(); go(a.getAttribute('href')); });
+window.addEventListener('hashchange', route);
+async function route(){
+  const m = location.hash.match(/^#\/a\/([^/]+)(?:\/c\/([^/]+))?/);
+  try{
+    if(!m) return await showAgencies();
+    if(!m[2]) return await showAgency(m[1]);
+    return await showClient(m[1], m[2]);
+  }catch(e){
+    if(e.message === 'conflict') return;
+    $('view').innerHTML = `<div class="empty">${esc(e.message)}<br><br><a class="btn btn-secondary btn-sm" href="#/">Back to agencies</a></div>`;
+  }
+}
+function crumbs(parts){
+  $('crumbs').innerHTML = parts.map((p,i) => i === parts.length-1
+    ? `<span class="here">${esc(p[0])}</span>`
+    : `<a href="${p[1]}">${esc(p[0])}</a><span class="sep">›</span>`).join('');
+}
+function rateBlock(rates, overridden={}){
+  return `<div class="rates">${RATE_META.map(([k,l,u]) => `
+    <div class="rate${overridden[k]?' ov':''}"><div class="l">${l}${overridden[k]?' · client':''}</div>
+    <div class="v">${rate(rates?.[k])} <span class="u">${u}</span></div></div>`).join('')}</div>`;
+}
+
+// ── view 1: agencies ─────────────────────────────────────────────────────────
+async function showAgencies(){
+  state.agency = state.client = null;
+  crumbs([['Agencies']]);
+  const {agencies} = await api('/agencies');
+  $('view').innerHTML = `
+    <div class="view-head">
+      <div><div class="view-title">Agencies</div></div>
+      <button class="btn btn-primary" onclick="editAgency()">＋ New agency</button>
+    </div>
+    ${agencies.length ? `<div class="grid">${agencies.map(a => `
+      <div class="card link" onclick="go('#/a/${a.id}')">
+        <div class="card-top"><div><div class="card-name">${esc(a.name)}</div>
+        <div class="card-meta">${a.n_clients} client${a.n_clients===1?'':'s'}</div></div>
+        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();editAgency('${a.id}')">Edit</button></div>
+        ${rateBlock(a.rates)}
+      </div>`).join('')}</div>`
+    : `<div class="empty">No agencies yet.<br>Add your first one with its rate card to get started.</div>`}`;
+  state.agencies = agencies;
+}
+
+// ── view 2: one agency, its clients ──────────────────────────────────────────
+async function showAgency(ag){
+  const {agency, clients} = await api(`/agencies/${ag}/clients`);
+  state.agency = agency; state.client = null; state.clients = clients;
+  crumbs([['Agencies','#/'],[agency.name]]);
+  $('view').innerHTML = `
+    <div class="view-head">
+      <div><div class="view-title">${esc(agency.name)}</div>
+      <div class="view-sub">${esc(agency.notes || '')}</div></div>
+      <div style="display:flex;gap:8px"><button class="btn btn-secondary" onclick="editAgency('${agency.id}')">Edit agency &amp; rates</button>
+      <button class="btn btn-primary" onclick="editClient()">＋ New client</button></div>
+    </div>
+    <div class="card">${rateBlock(agency.rates)}</div>
+    <div class="sec-label">Clients</div>
+    ${clients.length ? `<div class="grid">${clients.map(c => {
+      const ov = Object.keys(c.rate_overrides || {});
+      return `<div class="card link" onclick="go('#/a/${agency.id}/c/${c.id}')">
+        <div class="card-top"><div><div class="card-name">${esc(c.name)}</div>
+        <div class="card-meta">${c.n_audiences} audience${c.n_audiences===1?'':'s'}</div></div>
+        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();editClient('${c.id}')">Edit</button></div>
+        <div style="margin-top:12px">${ov.length
+          ? `<span class="tag tag-ov">${ov.length} rate override${ov.length===1?'':'s'}</span>`
+          : `<span class="tag tag-idle">Agency rates</span>`}</div>
+      </div>`;}).join('')}</div>`
+    : `<div class="empty">No clients at ${esc(agency.name)} yet.</div>`}`;
+}
+
+// ── view 3: one client ───────────────────────────────────────────────────────
+async function showClient(ag, cl){
+  const v = await api(`/agencies/${ag}/clients/${cl}`);
+  state.agency = v.agency; state.client = v.client; state.clientView = v;
+  crumbs([['Agencies','#/'],[v.agency.name,`#/a/${ag}`],[v.client.name]]);
+  renderClient();
+}
+function setGroup(g){ state.groupBy = g; try{ localStorage.setItem('tracker.groupBy', g); }catch(e){} renderClient(); }
+function renderClient(){
+  const v = state.clientView, auds = v.audiences;
+  const over = Object.fromEntries(Object.entries(v.effective.source).map(([k,s]) => [k, s==='client']));
+  const nCamps = auds.reduce((n,a) => n + a.campaigns.length, 0);
+  const total = auds.reduce((n,a) => n + a.total_fees, 0);
+  const nStale = auds.reduce((n,a) => n + a.campaigns.filter(c => c.stale).length, 0);
+
+  const key = state.groupBy === 'activated' ? 'activated_year' : 'created_year';
+  const groups = {};
+  auds.forEach(a => (groups[a[key] || '—'] ||= []).push(a));
+  const order = Object.keys(groups).sort((x,y) => x==='—' ? 1 : y==='—' ? -1 : y.localeCompare(x));
+  const label = y => y !== '—' ? y : (state.groupBy === 'activated' ? 'Not activated yet' : 'No created date');
+
+  $('view').innerHTML = `
+    <div class="view-head">
+      <div><div class="view-title">${esc(v.client.name)}</div>
+      <div class="view-sub">${esc(v.client.notes || '')}</div></div>
+      <div style="display:flex;gap:8px"><button class="btn btn-secondary" onclick="editClient('${v.client.id}')">Edit client &amp; overrides</button>
+      <button class="btn btn-primary" onclick="editAudience()">＋ New audience</button></div>
+    </div>
+    <div class="card head-card">
+      <div class="stats">
+        <div class="stat"><div class="v">${auds.length}</div><div class="l">Audiences</div></div>
+        <div class="stat"><div class="v">${nCamps}</div><div class="l">Campaigns</div></div>
+        <div class="stat"><div class="v" style="color:var(--teal)">${money(total)}</div><div class="l">Total fees</div></div>
+      </div>
+      ${rateBlock(v.effective.rates, over)}
+    </div>
+    ${nStale ? `<div class="banner warn" style="margin-top:14px"><b>${nStale} campaign${nStale===1?' was':'s were'} priced before a rate or record-count change.</b> The stored fee is what was quoted and has not been changed. Open the campaign and save it to reprice at today's figures.</div>` : ''}
+    <div class="toolbar">
+      <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:600">Group by</span>
+      <div class="seg"><button class="${state.groupBy==='created'?'on':''}" onclick="setGroup('created')">Year created</button><button class="${state.groupBy==='activated'?'on':''}" onclick="setGroup('activated')">Year activated</button></div>
+    </div>
+    ${auds.length ? order.map(y => `
+      <section class="year">
+        <div class="year-head"><span class="y">${esc(label(y))}</span><span class="n">${groups[y].length} audience${groups[y].length===1?'':'s'}</span></div>
+        ${groups[y].map(audCard).join('')}
+      </section>`).join('')
+    : `<div class="empty" style="margin-top:16px">No audiences for ${esc(v.client.name)} yet.</div>`}`;
+}
+function audCard(a){
+  const c = a.campaigns;
+  return `<div class="aud" id="aud-${a.id}">
+    <div class="aud-head">
+      <div class="aud-main">
+        <div class="aud-name">${esc(a.name)} <span class="tag ${a.data_type==='1P'?'tag-1p':'tag-3p'}">${esc(a.data_type)}</span>
+          ${a.activated_year ? `<span class="tag tag-1p">Activated ${esc(a.activated_year)}</span>` : `<span class="tag tag-idle">Not activated</span>`}</div>
+        <div class="aud-meta">Created ${esc(a.created_date || '–')} · ${c.length} campaign${c.length===1?'':'s'}</div>
+      </div>
+      <div class="aud-fig"><div class="v">${int(a.record_count)}</div><div class="l">Records</div></div>
+      <div class="aud-fig"><div class="v" style="color:var(--teal)">${money(a.total_fees)}</div><div class="l">Fees to date</div></div>
+      <div class="aud-actions">
+        <button class="btn btn-teal btn-sm" onclick="editCampaign('${a.id}')">▶ Activate</button>
+        <button class="btn btn-secondary btn-sm" onclick="editAudience('${a.id}')">Edit</button>
+      </div>
+    </div>
+    <div class="aud-body">
+      <div class="notes"><label>Notes</label>
+        <textarea id="note-${a.id}" placeholder="Anything worth knowing about this audience…" onblur="saveNote('${a.id}')">${esc(a.notes)}</textarea>
+        <div class="saved" id="noteMsg-${a.id}"></div></div>
+      <div class="camps"><div class="camps-title">Campaigns</div>
+        ${c.length ? `<table class="ct"><thead><tr><th>Campaign</th><th>Flight</th><th>Platforms · impressions</th>
+          <th class="num">Creation</th><th class="num">Syndication</th><th class="num">Data usage</th><th class="num">Total</th></tr></thead>
+          <tbody>${c.map(x => `<tr onclick="editCampaign('${a.id}','${x.id}')">
+            <td><b>${esc(x.name)}</b>${x.stale ? ` <span class="tag tag-warn" title="Today's rates would give ${esc(money(x.current_fees.total))}">Old rates</span>` : ''}</td>
+            <td style="white-space:nowrap">${esc(x.start_date)} → ${esc(x.end_date)}<div class="plat">${x.months} mo</div></td>
+            <td>${(x.platforms||[]).map(p => `<div class="plat">${esc(p.name)} · ${int(p.impressions)}</div>`).join('')}</td>
+            <td class="num">${money(x.fees?.creation)}</td><td class="num">${money(x.fees?.syndication)}</td>
+            <td class="num">${money(x.fees?.data_usage)}</td><td class="num tot">${money(x.fees?.total)}</td></tr>`).join('')}</tbody>
+          ${c.length > 1 ? `<tfoot><tr><td colspan="6" style="text-align:right;color:var(--muted)">Total</td><td class="num tot">${money(a.total_fees)}</td></tr></tfoot>` : ''}</table>`
+        : `<div class="empty-sm">Not activated yet. Press <b>Activate</b> to start its first campaign.</div>`}
+      </div>
+    </div>
+  </div>`;
+}
+async function saveNote(au){
+  const a = state.clientView.audiences.find(x => x.id === au);
+  const val = $('note-'+au).value.trim();
+  if(!a || val === (a.notes || '')) return;
+  const {agency, client} = state;
+  try{
+    await api(`/agencies/${agency.id}/clients/${client.id}/audiences/${au}`, {method:'PATCH', body:{notes:val, _version:a._version}});
+    a.notes = val; a._version = (a._version || 1) + 1;
+    $('noteMsg-'+au).textContent = 'Saved';
+    setTimeout(() => { const m = $('noteMsg-'+au); if(m) m.textContent=''; }, 1800);
+  }catch(e){ if(e.message !== 'conflict') $('noteMsg-'+au).textContent = e.message; }
+}
+
+// ── agency CRUD ──────────────────────────────────────────────────────────────
+let editingAgency = null;
+const AG_FIELDS = {creation:'agCreation', syndication:'agSyndication', data_3p:'agData3p', data_1p:'agData1p'};
+function editAgency(id){
+  const a = id ? ((state.agencies||[]).find(x => x.id===id) || state.agency) : null;
+  editingAgency = a;
+  $('agTitle').textContent = a ? `Edit ${a.name}` : 'New agency';
+  $('agName').value = a?.name || ''; $('agNotes').value = a?.notes || '';
+  Object.entries(AG_FIELDS).forEach(([k,f]) => $(f).value = a?.rates?.[k] ?? '');
+  $('agDel').style.display = a ? '' : 'none'; $('agErr').textContent = '';
+  openModal('mAgency'); $('agName').focus();
+}
+async function saveAgency(){
+  const body = {name:$('agName').value, notes:$('agNotes').value,
+    rates:Object.fromEntries(Object.entries(AG_FIELDS).map(([k,f]) => [k, $(f).value]))};
+  try{
+    if(editingAgency) await api(`/agencies/${editingAgency.id}`, {method:'PATCH', body:{...body, _version:editingAgency._version}});
+    else await api('/agencies', {method:'POST', body});
+    closeModal('mAgency'); toast('Agency saved'); route();
+  }catch(e){ if(e.message !== 'conflict') $('agErr').textContent = e.message; }
+}
+async function deleteAgency(){
+  const a = editingAgency;
+  const n = a.n_clients ?? (state.clients||[]).length;
+  if(!confirm(`Delete ${a.name}${n ? ` and its ${n} client(s), with every audience and campaign under them` : ''}? This cannot be undone.`)) return;
+  await api(`/agencies/${a.id}`, {method:'DELETE'});
+  closeModal('mAgency'); toast('Agency deleted'); go('#/'); route();
+}
+
+// ── client CRUD ──────────────────────────────────────────────────────────────
+let editingClient = null;
+const CL_FIELDS = {creation:'clCreation', syndication:'clSyndication', data_3p:'clData3p', data_1p:'clData1p'};
+function editClient(id){
+  const c = id ? ((state.clients||[]).find(x => x.id===id) || state.client) : null;
+  editingClient = c;
+  $('clTitle').textContent = c ? `Edit ${c.name}` : `New client at ${state.agency.name}`;
+  $('clName').value = c?.name || ''; $('clNotes').value = c?.notes || '';
+  Object.entries(CL_FIELDS).forEach(([k,f]) => {
+    $(f).value = c?.rate_overrides?.[k] ?? '';
+    $(f).placeholder = state.agency.rates?.[k] ?? '';
+    $(f+'H').textContent = `Agency rate: ${rate(state.agency.rates?.[k])}`;
+  });
+  $('clDel').style.display = c ? '' : 'none'; $('clErr').textContent = '';
+  openModal('mClient'); $('clName').focus();
+}
+async function saveClient(){
+  const ov = {};
+  Object.entries(CL_FIELDS).forEach(([k,f]) => { if($(f).value.trim() !== '') ov[k] = $(f).value; });
+  const body = {name:$('clName').value, notes:$('clNotes').value, rate_overrides:ov};
+  const ag = state.agency.id;
+  try{
+    if(editingClient) await api(`/agencies/${ag}/clients/${editingClient.id}`, {method:'PATCH', body:{...body, _version:editingClient._version}});
+    else await api(`/agencies/${ag}/clients`, {method:'POST', body});
+    closeModal('mClient'); toast('Client saved'); route();
+  }catch(e){ if(e.message !== 'conflict') $('clErr').textContent = e.message; }
+}
+async function deleteClient(){
+  const c = editingClient;
+  if(!confirm(`Delete ${c.name} with every audience and campaign under it? This cannot be undone.`)) return;
+  await api(`/agencies/${state.agency.id}/clients/${c.id}`, {method:'DELETE'});
+  closeModal('mClient'); toast('Client deleted'); go(`#/a/${state.agency.id}`); route();
+}
+
+// ── audience CRUD ────────────────────────────────────────────────────────────
+let editingAudience = null;
+const today = () => new Date().toLocaleDateString('en-CA');
+function audPath(au){ return `/agencies/${state.agency.id}/clients/${state.client.id}/audiences${au ? '/'+au : ''}`; }
+function editAudience(id){
+  const a = id ? state.clientView.audiences.find(x => x.id===id) : null;
+  editingAudience = a;
+  $('auTitle').textContent = a ? `Edit ${a.name}` : `New audience for ${state.client.name}`;
+  $('auName').value = a?.name || ''; $('auRecords').value = a?.record_count ?? '';
+  $('auType').value = a?.data_type || '3P'; $('auCreated').value = a?.created_date || today();
+  $('auNotes').value = a?.notes || '';
+  $('auDel').style.display = a ? '' : 'none'; $('auErr').textContent = '';
+  openModal('mAudience'); $('auName').focus();
+}
+async function saveAudience(){
+  const body = {name:$('auName').value, record_count:$('auRecords').value, data_type:$('auType').value,
+                created_date:$('auCreated').value, notes:$('auNotes').value};
+  try{
+    if(editingAudience) await api(audPath(editingAudience.id), {method:'PATCH', body:{...body, _version:editingAudience._version}});
+    else await api(audPath(), {method:'POST', body});
+    closeModal('mAudience'); toast('Audience saved'); route();
+  }catch(e){ if(e.message !== 'conflict') $('auErr').textContent = e.message; }
+}
+async function deleteAudience(){
+  const a = editingAudience;
+  if(!confirm(`Delete ${a.name}${a.campaigns.length ? ` and its ${a.campaigns.length} campaign(s)` : ''}? This cannot be undone.`)) return;
+  await api(audPath(a.id), {method:'DELETE'});
+  closeModal('mAudience'); toast('Audience deleted'); route();
+}
+
+// ── campaign CRUD + live pricing ─────────────────────────────────────────────
+let editingCampaign = null, campAudience = null, creationTouched = false, priceTimer = null, priceSeq = 0;
+function platformRow(p={}){
+  const d = document.createElement('div'); d.className = 'prow';
+  d.innerHTML = `<input type="text" list="platformList" placeholder="Platform" value="${esc(p.name||'')}" oninput="queuePrice()">
+    <input type="number" min="0" step="1" placeholder="Impressions" value="${p.impressions ?? ''}" oninput="queuePrice()">
+    <button class="xbtn" type="button" title="Remove" onclick="this.parentElement.remove();queuePrice()">×</button>`;
+  return d;
+}
+function addPlatform(p){ $('cmPlatforms').appendChild(platformRow(p)); if(!p) $('cmPlatforms').lastChild.querySelector('input').focus(); }
+function readPlatforms(){
+  return [...$('cmPlatforms').children].map(r => { const [n,i] = r.querySelectorAll('input'); return {name:n.value.trim(), impressions:i.value}; })
+    .filter(p => p.name || p.impressions !== '');
+}
+function editCampaign(au, cm){
+  campAudience = state.clientView.audiences.find(x => x.id===au);
+  const c = cm ? campAudience.campaigns.find(x => x.id===cm) : null;
+  editingCampaign = c;
+  $('cmTitle').textContent = c ? `Edit ${c.name}` : 'Activate — new campaign';
+  $('cmLead').innerHTML = `${esc(campAudience.name)} · <b>${int(campAudience.record_count)}</b> records · ${esc(campAudience.data_type)} data`;
+  $('cmName').value = c?.name || ''; $('cmStart').value = c?.start_date || today();
+  $('cmMonths').value = c?.months ?? 1; $('cmNotes').value = c?.notes || '';
+  $('cmPlatforms').innerHTML = '';
+  (c?.platforms?.length ? c.platforms : [{}]).forEach(p => $('cmPlatforms').appendChild(platformRow(p)));
+  creationTouched = !!c; $('cmCreation').checked = !!c?.charge_creation;
+  $('cmDel').style.display = c ? '' : 'none'; $('cmErr').textContent = '';
+  openModal('mCampaign'); $('cmName').focus(); price();
+}
+function queuePrice(){ clearTimeout(priceTimer); priceTimer = setTimeout(price, 220); }
+async function price(){
+  const seq = ++priceSeq;
+  const body = {id:editingCampaign?.id, start_date:$('cmStart').value, months:$('cmMonths').value,
+                platforms:readPlatforms(), charge_creation: creationTouched ? $('cmCreation').checked : null};
+  let q;
+  try{ q = await api(audPath(campAudience.id) + '/price', {method:'POST', body}); }
+  catch(e){ return; }
+  if(seq !== priceSeq) return;            // a newer keystroke already asked
+  if(!creationTouched) $('cmCreation').checked = q.suggest_creation;
+  const auto = $('cmCreation').checked === q.suggest_creation;
+  $('cmCreationWhy').textContent = (auto ? 'Suggested: ' : 'Overridden — the 12-month rule suggests the opposite. ') + q.creation_reason;
+  $('cmEnd').textContent = q.end_date ? `Ends ${q.end_date}` : '';
+  const b = q.basis, r = q.rates_applied, src = q.source;
+  $('qCreation').textContent = money(q.fees.creation);
+  $('qCreationF').textContent = $('cmCreation').checked ? `Flat ${rate(r.creation)}` : 'Not charged';
+  $('qSynd').textContent = money(q.fees.syndication);
+  $('qSyndF').textContent = `${int(b.records)} records × ${b.platforms} platform${b.platforms===1?'':'s'} × ${b.months} mo × ${rate(r.syndication)} ÷ 1,000`;
+  $('qData').textContent = money(q.fees.data_usage);
+  $('qDataF').textContent = `${int(b.impressions)} impressions × ${rate(b.data_rate)} (${b.data_type}) ÷ 1,000`;
+  $('qTotal').textContent = money(q.fees.total);
+  const ov = Object.entries(src).filter(([,s]) => s==='client').map(([k]) => RATE_META.find(m => m[0]===k)[1]);
+  $('qSrc').textContent = ov.length
+    ? `${state.client.name}'s override applies to: ${ov.join(', ')}. Everything else is ${state.agency.name}'s rate.`
+    : `All rates are ${state.agency.name}'s rate card.`;
+}
+async function saveCampaign(){
+  const body = {name:$('cmName').value, start_date:$('cmStart').value, months:$('cmMonths').value,
+                platforms:readPlatforms(), charge_creation:$('cmCreation').checked, notes:$('cmNotes').value};
+  $('cmSave').disabled = true;
+  try{
+    const base = audPath(campAudience.id) + '/campaigns';
+    if(editingCampaign) await api(`${base}/${editingCampaign.id}`, {method:'PATCH', body:{...body, _version:editingCampaign._version}});
+    else await api(base, {method:'POST', body});
+    closeModal('mCampaign'); toast('Campaign saved'); route();
+  }catch(e){ if(e.message !== 'conflict') $('cmErr').textContent = e.message; }
+  finally{ $('cmSave').disabled = false; }
+}
+async function deleteCampaign(){
+  const c = editingCampaign;
+  if(!confirm(`Delete campaign ${c.name}? This cannot be undone.`)) return;
+  await api(`${audPath(campAudience.id)}/campaigns/${c.id}`, {method:'DELETE'});
+  closeModal('mCampaign'); toast('Campaign deleted'); route();
+}
+
+route();
+</script>
+</body>
+</html>

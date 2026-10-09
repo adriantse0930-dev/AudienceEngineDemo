@@ -1,0 +1,983 @@
+<script data-demo="dmp_insights">
+// DMP Insights Analyzer — in-browser port of tools/dmp_insights.py.
+// Parses uploaded DMP insight exports (.xlsx), consolidates duplicate traits
+// across data sources, computes composition-weighted index stats, scales to
+// Unique Users and builds the summary workbook. Sample exports are generated.
+(function () {
+  'use strict';
+
+  var jobs = {}, jobOrder = [], JOB_CAP = 12;
+
+  // ── Small helpers (pandas stand-ins) ──────────────────────────────────────
+  function isNA(v) { return v == null || (typeof v === 'number' && isNaN(v)) || (typeof v === 'string' && v.trim() === ''); }
+  function toNum(v) {
+    if (typeof v === 'number') return v;
+    if (v == null) return NaN;
+    var s = String(v).trim();
+    if (s === '') return NaN;
+    var n = Number(s.replace(/,/g, ''));
+    return isNaN(n) ? NaN : n;
+  }
+  function median(a) {
+    var s = a.slice().sort(function (x, y) { return x - y; }), n = s.length;
+    if (!n) return NaN;
+    return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+  }
+  function mean(a) { return a.reduce(function (s, x) { return s + x; }, 0) / a.length; }
+  function mode(a) {
+    var c = {};
+    a.forEach(function (v) { c[v] = (c[v] || 0) + 1; });
+    var best = Math.max.apply(null, Object.keys(c).map(function (k) { return c[k]; }));
+    return Object.keys(c).filter(function (k) { return c[k] === best; }).sort()[0];
+  }
+  function uniqSorted(a) { return Array.from(new Set(a)).sort(); }
+  function r1(x) { return Mock.round(x, 1); }
+  function r2(x) { return Mock.round(x, 2); }
+  function hex32() { var s = ''; for (var i = 0; i < 32; i++) s += Math.floor(Math.random() * 16).toString(16); return s; }
+  function fmtInt(n) { return Number(n).toLocaleString('en-US'); }
+  function titleCase(s) {
+    return s.toLowerCase().replace(/(^|[^a-z])([a-z])/g, function (m, p, c) { return p + c.toUpperCase(); });
+  }
+
+  // ── Parsing ───────────────────────────────────────────────────────────────
+  function parseSheet(raw, fileName, sheetName) {
+    var hdrRow = null, hdrCol = null;
+    for (var r = 0; r < Math.min(raw.length, 60) && hdrRow === null; r++) {
+      var row = raw[r] || [];
+      for (var c = 0; c < Math.min(row.length, 12); c++) {
+        if (row[c] != null && String(row[c]).trim() === 'Trait Names') { hdrRow = r; hdrCol = c; break; }
+      }
+    }
+    if (hdrRow === null) return null;
+
+    var meta = { file: fileName, series: sheetName };
+    if (hdrCol >= 1) {
+      for (var i = 0; i < hdrRow; i++) {
+        var k = (raw[i] || [])[hdrCol - 1], v = (raw[i] || [])[hdrCol];
+        if (!isNA(k) && !isNA(v)) meta[String(k).trim()] = v;
+      }
+    }
+    var uu = toNum(meta['Unique Users']);
+    meta.unique_users = isNaN(uu) ? 0 : Math.trunc(uu);
+    if (String(meta['DATA DEFINITION'] || '').trim()) meta.series = String(meta['DATA DEFINITION']).trim();
+
+    var rows = [];
+    for (var j = hdrRow + 1; j < raw.length; j++) {
+      var rr = raw[j] || [];
+      var cell = function (o) { var x = rr[hdrCol + o]; return x === undefined ? null : x; };
+      var tn = cell(0), tr = cell(1);
+      var name = (!isNA(tn) && String(tn).trim() !== '') ? tn : tr;
+      if (isNA(name)) continue;
+      var idx = toNum(cell(3));
+      if (isNaN(idx)) continue;
+      var comp = toNum(cell(4));
+      if (isNaN(comp)) comp = 0;
+      rows.push({
+        trait_name: String(name), trait: tr, insight_group: cell(2), index: idx, composition: comp,
+        confidence: isNA(cell(5)) ? null : cell(5),
+        file: fileName, series: meta.series, unique_users: meta.unique_users
+      });
+    }
+    return { meta: meta, rows: rows };
+  }
+
+  function segments(name) { return String(name).split(' - ').map(function (p) { return p.trim(); }).filter(Boolean); }
+  function firstWord(s) { var w = s.split(/\s+/).filter(Boolean); return w.length ? w[0].toLowerCase() : ''; }
+
+  // Trait segments with the data-source prefix removed (vendor token repeated
+  // in leading segments is stripped too; never strips down to nothing).
+  function stripVendor(name) {
+    var segs = segments(name);
+    if (segs.length <= 1) return segs;
+    var token = firstWord(segs[0]);
+    var out = segs.slice(1);
+    while (out.length > 1 && token && firstWord(out[0]) === token) out = out.slice(1);
+    return out;
+  }
+
+  var GROUP_ALIASES = {
+    'by platform': 'Platform / Device', 'platform': 'Platform / Device', 'console': 'Platform / Device',
+    'game console': 'Platform / Device', 'device': 'Platform / Device', 'electronic': 'Platform / Device',
+    'by genre': 'Genre', 'genre': 'Genre', 'by title': 'Title', 'title': 'Title',
+    'personal tech': 'Purchase intent', 'shopping': 'Purchase intent', 'intent': 'Purchase intent'
+  };
+  var LEAF_GROUPERS = [
+    [/(playstation|\bps\s?\d|\bpsp\b|\bps\s?vita|xbox|nintendo|\bwii\b|switch|\bnds\b|\bds\b|\bpc\b|console|handheld|smart\s?tv)/i, 'Platform / Device'],
+    [/(gamer|gaming)/i, 'Gamer profile'],
+    [/(shooter|adventure|\brpg\b|role\s*playing|strateg|\brts\b|\bmmo\b|simulat|\bsim\b|horror|anime|sci-?fi|fighting|racing|driving|sport|puzzle|party|music|dance|action|first\s*person|casual|arcade|platformer|\bgames?\b)/i, 'Genre']
+  ];
+
+  function canonParent(parent) {
+    var p = String(parent).replace(/\s+/g, ' ').trim();
+    var singular = (p.length > 3 && /s$/i.test(p)) ? p.slice(0, -1) : p;
+    var alias = GROUP_ALIASES[singular.toLowerCase()] || GROUP_ALIASES[p.toLowerCase()];
+    return alias || titleCase(singular);
+  }
+  function group(name) {
+    var segs = stripVendor(name);
+    if (!segs.length) return 'General';
+    var leaf = segs[segs.length - 1];
+    for (var i = 0; i < LEAF_GROUPERS.length; i++) if (LEAF_GROUPERS[i][0].test(leaf)) return LEAF_GROUPERS[i][1];
+    if (segs.length < 2) return 'General';
+    return canonParent(segs[segs.length - 2]);
+  }
+  function normLabel(name) {
+    var label = stripVendor(name).join(' - ');
+    label = label.replace(/\s*\(canada\)\s*/gi, ' ');
+    label = label.replace(/(\d+)\s*to\s*(\d+)/g, '$1-$2');
+    return label.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+  function key(name) {
+    var segs = normLabel(name).split(' - ');
+    return segs.length ? segs[segs.length - 1].trim() : normLabel(name);
+  }
+  function source(name) { return String(name).split(' - ')[0].trim(); }
+  function category(row) {
+    var ig = isNA(row.insight_group) ? '' : String(row.insight_group);
+    if (ig.indexOf(' - ') >= 0) { var p = ig.split(' - '); return p[p.length - 1].trim(); }
+    if (ig.trim()) return ig.trim();
+    var parts = String(row.trait_name).split(' - ').map(function (x) { return x.trim(); });
+    return parts.length > 2 ? parts[1] : 'Uncategorized';
+  }
+  function wavg(idx, comp) {
+    var ws = comp.reduce(function (s, x) { return s + x; }, 0);
+    if (ws > 0) return idx.reduce(function (s, x, i) { return s + x * comp[i]; }, 0) / ws;
+    return mean(idx);
+  }
+
+  // ── Analysis ──────────────────────────────────────────────────────────────
+  function analyze(allRows) {
+    allRows.forEach(function (r) {
+      r.key = key(r.trait_name);
+      r.source = source(r.trait_name);
+      r.category = category(r);
+      r.group = group(r.trait_name);
+      var sv = stripVendor(r.trait_name);
+      r.label = sv.length ? sv[sv.length - 1] : String(r.trait_name);
+      r.path = sv.join(' - ') || String(r.trait_name);
+      r.est_users = Math.round(r.composition / 100 * r.unique_users);
+    });
+
+    var groups = {}, order = [];
+    allRows.forEach(function (r) {
+      var k = JSON.stringify([r.category, r.group, r.key]);
+      if (!groups[k]) { groups[k] = []; order.push(k); }
+      groups[k].push(r);
+    });
+
+    var consolidated = order.map(function (k) {
+      var grp = groups[k];
+      var comp = grp.map(function (r) { return r.composition; });
+      var idx = grp.map(function (r) { return r.index; });
+      var eu = grp.map(function (r) { return r.est_users; });
+      var iMin = Math.min.apply(null, idx), iMax = Math.max.apply(null, idx);
+      var spread = iMax - iMin;
+      var ratio = iMin > 0 ? iMax / iMin : null;
+      var disagree = grp.length > 1 && (spread >= 50 || (ratio !== null && ratio >= 2.0));
+      var srcs = uniqSorted(grp.map(function (r) { return r.source; }));
+      return {
+        category: grp[0].category, group: grp[0].group, key: grp[0].key,
+        label: mode(grp.map(function (r) { return r.label; })),
+        path: mode(grp.map(function (r) { return r.path; })),
+        raw_names: uniqSorted(grp.map(function (r) { return String(r.trait_name); })),
+        index_spread: r1(spread),
+        disagree: disagree,
+        sources: srcs,
+        n_sources: srcs.length,
+        n_rows: grp.length,
+        files: uniqSorted(grp.map(function (r) { return r.file; })),
+        index_wavg: r1(wavg(idx, comp)),
+        index_median: r1(median(idx)),
+        index_min: r1(iMin),
+        index_max: r1(iMax),
+        comp_avg: r2(mean(comp)),
+        comp_median: r2(median(comp)),
+        comp_min: r2(Math.min.apply(null, comp)),
+        comp_max: r2(Math.max.apply(null, comp)),
+        users_avg: Math.trunc(mean(eu)),
+        users_max: Math.trunc(Math.max.apply(null, eu))
+      };
+    });
+    consolidated.sort(function (a, b) { return b.index_wavg - a.index_wavg; });
+
+    var categories = {}, grps = {};
+    consolidated.forEach(function (r) {
+      var c = categories[r.category] || (categories[r.category] = { traits: 0, merged: 0, raw_rows: 0, disagree: 0 });
+      c.traits++; c.raw_rows += r.n_rows;
+      if (r.n_rows > 1) c.merged++;
+      if (r.disagree) c.disagree++;
+      var g = grps[r.group] || (grps[r.group] = { traits: 0, merged: 0 });
+      g.traits++;
+      if (r.n_rows > 1) g.merged++;
+    });
+    return { consolidated: consolidated, categories: categories, groups: grps };
+  }
+
+  function looksLikeExcel(buf) {
+    var b = new Uint8Array(buf.slice(0, 4));
+    var zip = b[0] === 0x50 && b[1] === 0x4B;                           // xlsx / xlsb
+    var ole = b[0] === 0xD0 && b[1] === 0xCF && b[2] === 0x11 && b[3] === 0xE0; // legacy xls
+    return zip || ole;
+  }
+
+  Mock.route('POST', '/dmp-insights/api/analyze', async function (req) {
+    var files = req.form ? req.form.getAll('files').filter(function (f) { return f && f.name; }) : [];
+    if (!files.length) return Mock.json({ error: 'Upload at least one DMP .xlsx export.' }, 400);
+    var XLSX = await Mock.loadXLSX();
+
+    var allRows = [], metas = [], skipped = [];
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i], wb = null;
+      try {
+        var buf = await f.arrayBuffer();
+        if (!looksLikeExcel(buf)) throw new Error('not excel');
+        wb = XLSX.read(buf, { type: 'array' });
+      } catch (e) {
+        skipped.push(f.name + ': not a readable Excel file');
+        continue;
+      }
+      var found = false;
+      wb.SheetNames.forEach(function (sn) {
+        var raw = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: null, blankrows: true, raw: true });
+        var parsed = parseSheet(raw, f.name, sn);
+        if (parsed && parsed.rows.length) {
+          metas.push(parsed.meta);
+          allRows = allRows.concat(parsed.rows);
+          found = true;
+        }
+      });
+      if (!found) skipped.push(f.name + ": no 'Trait Names' table found");
+    }
+    if (!allRows.length) return Mock.json({ error: 'No trait tables found. ' + skipped.join('; ') }, 400);
+
+    var res = analyze(allRows);
+    var job = hex32();
+    if (jobOrder.length >= JOB_CAP) delete jobs[jobOrder.shift()];
+    jobs[job] = { rows: allRows, consolidated: res.consolidated, categories: res.categories,
+                  groups: res.groups, metas: metas };
+    jobOrder.push(job);
+
+    return {
+      job: job,
+      files: metas.map(function (m) {
+        return { file: m.file, series: m.series || '', unique_users: m.unique_users,
+                 date_range: m['Date Range'] == null ? '' : String(m['Date Range']) };
+      }),
+      skipped: skipped,
+      raw_traits: allRows.length,
+      consolidated_traits: res.consolidated.length,
+      merged_traits: res.consolidated.filter(function (r) { return r.n_rows > 1; }).length,
+      disagreeing_traits: res.consolidated.filter(function (r) { return r.disagree; }).length,
+      categories: res.categories,
+      groups: res.groups,
+      traits: res.consolidated
+    };
+  }, { latency: [500, 900] });
+
+  // ── Excel export ──────────────────────────────────────────────────────────
+  function consFrame(consolidated, totalUU) {
+    return consolidated.map(function (r) {
+      return {
+        'Category': r.category, 'Group': r.group, 'Trait': r.label, 'Full path': r.path,
+        'Sources (n)': r.n_sources, 'Sources': r.sources.join(', '), 'Rows merged': r.n_rows,
+        'Index (weighted avg)': r.index_wavg, 'Index (median)': r.index_median,
+        'Index (min)': r.index_min, 'Index (max)': r.index_max, 'Index spread': r.index_spread,
+        'Sources disagree': r.disagree ? 'YES — check before using' : '',
+        'Composition avg %': r.comp_avg, 'Composition median %': r.comp_median,
+        'Composition min %': r.comp_min, 'Composition max %': r.comp_max,
+        'Est. users (avg comp)': r.users_avg, 'Est. users (max comp)': r.users_max,
+        'Share of unique users': fmtInt(r.users_avg) + ' of ' + fmtInt(totalUU) + ' (' + r.comp_avg.toFixed(1) + '%)',
+        'Merged from': (r.raw_names || []).join(' | ')
+      };
+    });
+  }
+
+  function addSheet(X, wb, name, rows, used) {
+    var base = name.replace(/[\\\/*?:\[\]]/g, '').slice(0, 31) || 'Category', n = base, i = 2;
+    while (used[n.toLowerCase()]) n = base.slice(0, 28) + ' ' + (i++);
+    used[n.toLowerCase()] = 1;
+    var ws = X.utils.json_to_sheet(rows);
+    var cols = rows.length ? Object.keys(rows[0]) : [];
+    ws['!cols'] = cols.map(function (c) {
+      var w = Math.max.apply(null, [String(c).length].concat(rows.slice(0, 200).map(function (r) {
+        return String(r[c] == null ? '' : r[c]).length; }))) + 2;
+      return { wch: Math.min(w, 58) };
+    });
+    X.utils.book_append_sheet(wb, ws, n);
+  }
+
+  Mock.route('GET', '/dmp-insights/api/download', async function (req) {
+    var entry = jobs[req.query.job || ''];
+    if (!entry) return Mock.json({ error: 'Job expired — re-run the analysis.' }, 404);
+    var metas = entry.metas, consolidated = entry.consolidated, allRows = entry.rows;
+    var totalUU = metas.reduce(function (m, x) { return Math.max(m, x.unique_users); }, 0);
+
+    var summary = [{ Item: 'Files analyzed', Value: new Set(metas.map(function (m) { return m.file; })).size }];
+    metas.forEach(function (m) {
+      summary.push({ Item: 'Unique Users — ' + m.file + ' (' + (m.series || '') + ')', Value: fmtInt(m.unique_users) });
+      if (m['Date Range']) summary.push({ Item: 'Date Range — ' + m.file, Value: String(m['Date Range']) });
+    });
+    summary.push({ Item: 'Raw trait rows', Value: allRows.length });
+    summary.push({ Item: 'Consolidated traits', Value: consolidated.length });
+    summary.push({ Item: 'Traits merged from multiple rows', Value: consolidated.filter(function (r) { return r.n_rows > 1; }).length });
+    Object.keys(entry.categories).forEach(function (cat) {
+      var c = entry.categories[cat];
+      summary.push({ Item: 'Category — ' + cat, Value: c.traits + ' traits (' + c.merged + ' merged)' });
+    });
+
+    var detail = allRows.map(function (r) {
+      return { 'Category': r.category, 'Consolidation key': r.key, 'Raw trait name': r.trait_name,
+               'Source': r.source, 'Index': r.index, 'Composition %': r.composition, 'Est. users': r.est_users,
+               'Confidence': r.confidence == null ? '' : r.confidence, 'File': r.file, 'Series': r.series,
+               'Unique Users': r.unique_users };
+    }).sort(function (a, b) {
+      var ks = ['Category', 'Consolidation key', 'Source'];
+      for (var i = 0; i < ks.length; i++) {
+        var x = String(a[ks[i]]), y = String(b[ks[i]]);
+        if (x < y) return -1; if (x > y) return 1;
+      }
+      return 0;
+    });
+
+    var X = await Mock.loadXLSX(), wb = X.utils.book_new(), used = {};
+    addSheet(X, wb, 'Summary', summary, used);
+    addSheet(X, wb, 'Consolidated', consFrame(consolidated, totalUU), used);
+    Object.keys(entry.categories).forEach(function (cat) {
+      addSheet(X, wb, cat, consFrame(consolidated.filter(function (r) { return r.category === cat; }), totalUU), used);
+    });
+    addSheet(X, wb, 'Detail', detail, used);
+    var out = X.write(wb, { bookType: 'xlsx', type: 'array' });
+    return Mock.file(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+                     'dmp_insights_summary.xlsx');
+  });
+
+  // ── Demo sample exports (generated) ───────────────────────────────────────
+  // Fictional data vendors. The first word of each is its "vendor token", which
+  // the consolidation logic strips from trait paths.
+  var VENDORS = [
+    { seg: 'Brightwave Mobile & App', brand: 'Brightwave Brand' },
+    { seg: 'Quillstone Audiences', brand: 'Quillstone Interest' },
+    { seg: 'Northmere Data', brand: null },
+    { seg: 'Pelican Insight Co', brand: 'Pelican Behaviour' }
+  ];
+  // [insight group, parent options (per vendor wording), leaf variants, base index, base composition %]
+  var CONCEPTS = [
+    ['Interests', ['Consoles', 'By Platform'], ['Handheld Console', 'Handheld Console (Canada)'], 168, 6.2],
+    ['Interests', ['Consoles', 'By Platform'], ['Home Console Owner'], 142, 11.5],
+    ['Interests', ['Electronics', 'Devices'], ['PC Gaming Rig'], 155, 7.8],
+    ['Interests', ['Electronics', 'Devices'], ['Smart TV Owner'], 104, 22.4],
+    ['Interests', ['Video Games', 'By Genre'], ['Shooter Games'], 188, 9.1],
+    ['Interests', ['Video Games', 'By Genre'], ['Racing Games'], 131, 5.4],
+    ['Interests', ['Video Games', 'By Genre'], ['Puzzle Games'], 96, 8.7],
+    ['Interests', ['Video Games', 'Genres'], ['Role Playing Games'], 173, 6.6],
+    ['Interests', ['Video Games', 'Genres'], ['Sports Games'], 119, 10.2],
+    ['Interests', ['Video Games', 'Genres'], ['Strategy Games'], 137, 4.1],
+    ['Interests', ['Profiles', 'Lifestyle'], ['Hardcore Gamer'], 214, 3.9],
+    ['Interests', ['Profiles', 'Lifestyle'], ['Casual Mobile Gaming'], 88, 18.6],
+    ['Interests', ['Profiles', 'Lifestyle'], ['Esports Viewer'], 197, 2.8],
+    ['Interests', ['Outdoors'], ['Hiking & Camping'], 72, 9.9],
+    ['Interests', ['Food & Drink'], ['Craft Coffee Fans'], 108, 12.3],
+    ['Demographics', ['Age'], ['Age 18 to 24', 'Age 18-24'], 176, 14.8],
+    ['Demographics', ['Age'], ['Age 25 to 34', 'Age 25-34'], 139, 21.7],
+    ['Demographics', ['Age'], ['Age 45 to 54'], 61, 12.1],
+    ['Demographics', ['Household Income'], ['Income $100k Plus'], 97, 19.5],
+    ['Demographics', ['Household'], ['Students'], 162, 7.3],
+    ['Demographics', ['Household'], ['Parents with Kids at Home'], 83, 16.9],
+    ['Purchase Intent', ['Shopping', 'Intent'], ['Electronics Intenders'], 149, 8.4],
+    ['Purchase Intent', ['Shopping', 'Intent'], ['Gaming Headset Shoppers'], 226, 2.2],
+    ['Purchase Intent', ['Personal Tech', 'Shopping'], ['New Phone Intenders'], 112, 9.6],
+    ['Purchase Intent', ['Shopping', 'Intent'], ['Energy Drink Buyers'], 158, 5.9],
+    ['Media', ['Streaming', 'Viewing'], ['Game Streaming Viewers'], 203, 6.1],
+    ['Media', ['Streaming', 'Viewing'], ['Anime Streaming Fans'], 181, 4.4],
+    ['Media', ['Podcasts'], ['Tech Podcast Listeners'], 127, 5.2]
+  ];
+
+  function buildSampleRows(which) {
+    var r = Mock.rng('dmp-sample-' + which);
+    var rows = [], traitId = which === 'A' ? 410200 : 520400;
+    CONCEPTS.forEach(function (c, ci) {
+      // Each concept is reported by 1–3 vendors; a few are skipped per file.
+      if (r() < (which === 'A' ? 0.08 : 0.2)) return;
+      var nv = Mock.pick([1, 1, 2, 2, 2, 3], r);
+      var vend = Mock.shuffle(VENDORS, r).slice(0, nv);
+      var wild = r() < 0.12; // occasionally vendors disagree sharply
+      vend.forEach(function (v, vi) {
+        var parent = c[1][(ci + vi + VENDORS.indexOf(v)) % c[1].length];
+        var leaf = c[2][(vi + (which === 'B' ? 1 : 0)) % c[2].length];
+        var segs = [v.seg];
+        if (v.brand) segs.push(v.brand);
+        segs.push(parent, leaf);
+        var drift = which === 'B' ? Mock.randFloat(0.85, 1.15, r) : 1;
+        var idx = c[3] * drift * Mock.randFloat(0.86, 1.14, r);
+        if (wild && vi > 0) idx = idx * Mock.randFloat(0.25, 0.45, r);
+        var comp = Math.max(0.1, c[4] * Mock.randFloat(0.7, 1.3, r));
+        rows.push([null, segs.join(' - '), String(traitId++), 'Insight Group - ' + c[0],
+                   Math.round(idx), Mock.round(comp, 2), Mock.pick(['High', 'High', 'Medium', 'Low'], r)]);
+      });
+    });
+    return rows;
+  }
+
+  Mock.route('GET', '/dmp-insights/api/demo-sample', async function (req) {
+    var which = (req.query.which || 'A').toUpperCase() === 'B' ? 'B' : 'A';
+    var meta = which === 'A'
+      ? [['Entity', 'Sample Game Studio — Core Players'], ['Group', 'Demo Audience Pack'],
+         ['DATA DEFINITION', 'Core Players (lookalike seed)'], ['Date Range', '2026-05-01 to 2026-07-31'],
+         ['Unique Users', 1864300], ['Report', 'Insights — generated demo data']]
+      : [['Entity', 'Sample Game Studio — Lapsed Players'], ['Group', 'Demo Audience Pack'],
+         ['DATA DEFINITION', 'Lapsed Players (retargeting pool)'], ['Date Range', '2026-06-01 to 2026-08-31'],
+         ['Unique Users', 742900], ['Report', 'Insights — generated demo data']];
+    var aoa = meta.concat([[null, null],
+      [null, 'Trait Names', 'Traits', 'Insight Group', 'Index Values', 'Composition', 'Confidence']])
+      .concat(buildSampleRows(which));
+    var X = await Mock.loadXLSX(), wb = X.utils.book_new();
+    var ws = X.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{ wch: 18 }, { wch: 82 }, { wch: 10 }, { wch: 28 }, { wch: 12 }, { wch: 12 }, { wch: 11 }];
+    X.utils.book_append_sheet(wb, ws, 'Insights');
+    var out = X.write(wb, { bookType: 'xlsx', type: 'array' });
+    return Mock.file(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+                     'sample_dmp_export_' + which + '.xlsx');
+  }, { latency: [80, 200] });
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DMP Insights — Audience Analytics Engine</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{
+    --navy:#0d0d2b; --deep:#131447; --surface:rgba(255,255,255,0.05);
+    --violet:#7c5ce8; --purple:#5b4fcf; --lavender:#a78bfa;
+    --teal:#2dd4bf; --sky:#60a5fa; --amber:#fbbf24; --pink:#f472b6; --green:#3fb950;
+    --border:rgba(180,160,255,0.28); --text:#f0eeff; --text-sec:#cdc6ec; --muted:#9d95c9;
+    --input-bg:rgba(255,255,255,0.06); --input-border:rgba(180,160,255,0.30);
+    --red:#f87171; --mono:'Cascadia Code',Consolas,monospace;
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html,body{position:relative;min-height:100vh;background:var(--navy);color:var(--text);font-family:Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6}
+  body::before{content:'';position:absolute;inset:0;z-index:0;pointer-events:none;
+    background:radial-gradient(ellipse 70% 55% at 8% 10%,rgba(91,79,207,0.28)0%,transparent 60%),
+      radial-gradient(ellipse 55% 45% at 92% 90%,rgba(45,212,191,0.12)0%,transparent 55%),
+      radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%)}
+  .shell{position:relative;z-index:1}
+
+  nav{position:sticky;top:0;z-index:100;background:rgba(13,13,43,0.9);backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--border);display:flex;gap:4px;padding:9px 24px;flex-wrap:wrap;align-items:center}
+  nav .logo{color:var(--lavender);font-weight:700;font-size:13px;margin-right:14px;display:flex;align-items:center;gap:7px}
+  nav .logo .dot{width:9px;height:9px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7)}
+  nav .back{margin-left:auto;color:var(--muted);text-decoration:none;font-size:12px}
+  nav .back:hover{color:var(--text)}
+
+  main{max-width:1120px;margin:0 auto;padding:30px 24px 64px}
+  h1{font-size:26px;font-weight:700;letter-spacing:-0.4px;margin-bottom:8px}
+  h2{font-size:18px;font-weight:600;margin:30px 0 12px;color:var(--lavender)}
+  p{color:var(--text-sec);margin-bottom:12px}
+
+  /* ── Motion ── */
+  @keyframes riseIn{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:none}}
+  @keyframes zoomIn{from{opacity:0;transform:scale(0.96)}to{opacity:1;transform:none}}
+  @keyframes pageIn{from{opacity:0}to{opacity:1}}
+  body{animation:pageIn .35s ease both}
+  .hero{animation:riseIn .5s ease both}
+  .card{animation:riseIn .5s ease .12s both}
+  .reveal{animation:zoomIn .45s cubic-bezier(.22,.9,.35,1.1) both}
+  .reveal-stagger>*{animation:riseIn .45s ease both}
+  .reveal-stagger>*:nth-child(2){animation-delay:.06s}
+  .reveal-stagger>*:nth-child(3){animation-delay:.12s}
+  .reveal-stagger>*:nth-child(4){animation-delay:.18s}
+  .reveal-stagger>*:nth-child(5){animation-delay:.24s}
+  body.leaving{opacity:0;transform:scale(0.985);transition:opacity .22s ease,transform .22s ease}
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+  .hero{padding:34px 0 26px;border-bottom:1px solid var(--border);margin-bottom:28px}
+  .hero .eyebrow{font-size:11px;color:var(--teal);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:10px}
+  .hero p{color:var(--muted);max-width:700px;font-size:15px}
+
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:16px;backdrop-filter:blur(10px)}
+
+  .dropzone{border:1.5px dashed var(--input-border);border-radius:11px;padding:38px 26px;text-align:center;
+    cursor:pointer;color:var(--muted);font-size:14px;transition:all .2s;background:var(--input-bg)}
+  .dropzone:hover,.dropzone.drag{border-color:rgba(167,139,250,0.7);color:var(--text-sec);
+    background:rgba(124,92,232,0.08);transform:scale(1.005)}
+  .dropzone.has-file{border-color:var(--teal);color:var(--teal)}
+  .hidden{display:none}
+
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:13px 28px;font-size:14px;font-weight:600;border-radius:9px;cursor:pointer;border:none;font-family:inherit;transition:all .18s;min-height:44px}
+  .btn:focus-visible,.chip:focus-visible,input:focus-visible{outline:2px solid var(--lavender);outline-offset:2px}
+  .btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+  .btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+  .btn-primary:disabled{opacity:0.6;cursor:default;transform:none;box-shadow:none}
+  .btn-secondary{background:rgba(255,255,255,0.05);color:var(--text-sec);border:1px solid var(--border)}
+  .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}
+
+  .status{padding:11px 15px;border-radius:8px;font-size:13px;margin-top:14px;display:none;border:1px solid transparent}
+  .status.info{background:rgba(96,165,250,0.10);color:var(--sky);border-color:rgba(96,165,250,0.25)}
+  .status.ok{background:rgba(45,212,191,0.10);color:var(--teal);border-color:rgba(45,212,191,0.25)}
+  .status.err{background:rgba(248,113,113,0.10);color:var(--red);border-color:rgba(248,113,113,0.25)}
+  .spinner{display:inline-block;width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  .stat-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin:16px 0}
+  @media(max-width:880px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px 16px;text-align:center;transition:transform .18s,border-color .18s}
+  .stat:hover{transform:translateY(-2px);border-color:rgba(167,139,250,0.5)}
+  .stat .val{font-size:24px;font-weight:700;font-family:var(--mono)}
+  .stat .lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-top:4px}
+
+  .file-chip{display:inline-flex;align-items:center;gap:8px;background:rgba(45,212,191,0.10);
+    border:1px solid rgba(45,212,191,0.3);color:var(--teal);border-radius:8px;padding:6px 12px;
+    font-size:12px;margin:4px 6px 0 0}
+  .file-chip .x{cursor:pointer;color:var(--muted);font-weight:700}
+  .file-chip .x:hover{color:var(--red)}
+
+  .chart-grid{display:grid;grid-template-columns:2fr 1fr;gap:16px}
+  @media(max-width:880px){.chart-grid{grid-template-columns:1fr}}
+  .chart-box{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin:14px 0}
+  .chart-box h3{font-size:13px;font-weight:600;margin-bottom:10px;color:var(--text-sec)}
+  .chart-box canvas{max-height:340px}
+
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+  .chip{padding:8px 17px;border-radius:19px;font-size:12.5px;font-weight:500;cursor:pointer;border:1px solid var(--border);
+    background:rgba(255,255,255,0.04);color:var(--text-sec);transition:all .18s;min-height:36px;display:inline-flex;align-items:center}
+  .chip:hover{border-color:rgba(167,139,250,0.6);transform:translateY(-1px)}
+  .chip.active{background:rgba(124,92,232,0.18);color:var(--lavender);border-color:rgba(167,139,250,0.5)}
+
+  input[type=text]{width:100%;max-width:360px;padding:12px 15px;border:1px solid var(--input-border);border-radius:9px;
+    font-size:13.5px;font-family:inherit;background:var(--input-bg);color:var(--text);min-height:44px;transition:border-color .15s}
+  input[type=text]:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+
+  .tbl-wrap{overflow-x:auto;margin:12px 0 20px;border:1px solid var(--border);border-radius:10px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{background:rgba(255,255,255,0.05);color:var(--text-sec);font-weight:600;text-align:left;padding:12px 14px;
+    border-bottom:2px solid var(--border);white-space:nowrap;font-size:11.5px;text-transform:uppercase;letter-spacing:0.4px}
+  th.sortable{cursor:pointer;user-select:none;transition:color .15s}
+  th.sortable:hover{color:var(--lavender)}
+  th .arr{font-size:9px;margin-left:3px;color:var(--teal)}
+  td{padding:12px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+  tr.main-row{cursor:pointer;transition:background .15s}
+  tr.main-row:hover td{background:rgba(124,92,232,0.09)}
+  tr.detail-row td{background:rgba(0,0,0,0.18);padding:0}
+  .detail-inner{padding:10px 18px;animation:riseIn .25s ease both}
+  .detail-inner table{font-size:12px}
+  .detail-inner th{font-size:10px}
+  .src-badge{display:inline-block;min-width:22px;text-align:center;padding:1px 8px;border-radius:11px;font-size:11px;font-weight:600;
+    background:rgba(96,165,250,0.14);color:var(--sky);border:1px solid rgba(96,165,250,0.3)}
+  .src-badge.multi{background:rgba(45,212,191,0.14);color:var(--teal);border-color:rgba(45,212,191,0.3)}
+  .idx-hi{color:var(--teal);font-weight:600}
+  .idx-lo{color:var(--muted)}
+  .num{font-family:var(--mono);white-space:nowrap}
+  .users-sub{font-size:11px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<main>
+
+<div class="card">
+  <div class="dropzone" id="dz" onclick="document.getElementById('files').click()">
+    Click or drop DMP .xlsx exports here (multiple files supported)
+  </div>
+  <input type="file" id="files" accept=".xlsx,.xlsb,.xls" multiple class="hidden">
+  <div id="fileChips"></div>
+  <div class="actions">
+    <button class="btn btn-primary" id="runBtn" onclick="runAnalysis()" disabled>Analyze</button>
+    <button class="btn btn-secondary hidden" id="dlBtn" onclick="downloadExcel()">⬇ Download summary Excel</button>
+  </div>
+  <div class="status" id="status"></div>
+  <p style="font-size:12px;color:var(--muted);margin:14px 0 0">Samples:
+     <a href="#" onclick="useSample();return false" style="color:var(--lavender)">Use sample data</a>
+     · download sample exports <a href="/dmp-insights/api/demo-sample?which=A" style="color:var(--lavender)">A</a>
+     / <a href="/dmp-insights/api/demo-sample?which=B" style="color:var(--lavender)">B</a>
+    </p>
+</div>
+
+<div id="results" class="hidden">
+
+  <h2>Run summary</h2>
+  <div class="stat-grid reveal-stagger">
+    <div class="stat"><div class="val" id="stFiles">–</div><div class="lbl">Files parsed</div></div>
+    <div class="stat"><div class="val" id="stUU">–</div><div class="lbl">Unique users</div></div>
+    <div class="stat"><div class="val" id="stRaw">–</div><div class="lbl">Raw traits</div></div>
+    <div class="stat"><div class="val" id="stCons">–</div><div class="lbl">Consolidated</div></div>
+    <div class="stat"><div class="val" id="stMerged">–</div><div class="lbl">Multi-source merges</div></div>
+  </div>
+  <div id="fileMeta"></div>
+
+  <h2>Charts</h2>
+  <div class="chart-box" style="padding:14px 18px">
+    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end">
+      <div><label style="display:block;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:5px">Chart type</label>
+        <select id="chType" onchange="renderCharts()">
+          <option value="bar">Horizontal bar — ranked</option>
+          <option value="column">Vertical column</option>
+          <option value="grouped">Grouped bar — by grouping</option>
+          <option value="radar">Radar — group profile</option>
+          <option value="bubble">Bubble — index vs reach vs users</option>
+        </select></div>
+      <div><label style="display:block;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:5px">Group by</label>
+        <select id="chDim" onchange="renderCharts()">
+          <option value="group">Grouping (platform / genre / …)</option>
+          <option value="category">Insight category</option>
+          <option value="source">Data source</option>
+        </select></div>
+      <div><label style="display:block;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:5px">Show</label>
+        <select id="chFilter" onchange="renderCharts()">
+          <option value="">All groupings</option>
+        </select></div>
+      <div><label style="display:block;font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:5px">Traits</label>
+        <select id="chTopN" onchange="renderCharts()">
+          <option value="15">Top 15</option><option value="25">Top 25</option>
+          <option value="40">Top 40</option><option value="0">All</option>
+        </select></div>
+    </div>
+  </div>
+  <div class="chart-box">
+    <h3 id="chTopTitle">Top traits by composition-weighted index <span style="color:var(--muted);font-weight:400">(hover for est. users)</span></h3>
+    <canvas id="chTop"></canvas>
+  </div>
+  <div class="chart-grid">
+    <div class="chart-box" style="margin:0">
+      <h3>Index vs composition — big AND over-indexed traits (comp ≥ 1%)</h3>
+      <canvas id="chScatter"></canvas>
+    </div>
+    <div class="chart-box" style="margin:0">
+      <h3 id="chDonutTitle">Traits by grouping</h3>
+      <canvas id="chDonut"></canvas>
+    </div>
+  </div>
+
+  <h2>Consolidated traits</h2>
+  <div class="chips" id="catChips"></div>
+  <input type="text" id="search" placeholder="Search traits…" oninput="renderTable()">
+  <div class="tbl-wrap">
+    <table id="tbl">
+      <thead><tr>
+        <th>Trait</th>
+        <th>Grouping</th>
+        <th>Category</th>
+        <th>Sources</th>
+        <th class="sortable" onclick="setSort('index_wavg')">Index (wtd)<span class="arr" id="arr_index_wavg"></span></th>
+        <th class="sortable" onclick="setSort('index_median')">Index (med)<span class="arr" id="arr_index_median"></span></th>
+        <th class="sortable" onclick="setSort('comp_avg')">Comp % (avg)<span class="arr" id="arr_comp_avg"></span></th>
+        <th class="sortable" onclick="setSort('users_avg')">Est. users<span class="arr" id="arr_users_avg"></span></th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+</main>
+</div>
+
+<script>
+let _files = [];         // File objects queued for upload
+let _data = null;        // last analysis response
+let _sortKey = 'index_wavg', _sortDir = -1;
+let _activeCat = 'All';
+let _charts = {};
+
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n).toLocaleString('en-CA');
+
+// Count-up animation for numeric stat values.
+function countUp(el, target, formatter){
+  const n = Number(target);
+  if(!isFinite(n)){ el.textContent = target; return; }
+  if(document.hidden){ el.textContent = formatter(n); return; }   // no frames while hidden: show the final value
+  const dur = 700, t0 = performance.now();
+  (function tick(t){
+    const p = Math.min(1, (t - t0) / dur);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = formatter(Math.round(n * eased));
+    if(p < 1) requestAnimationFrame(tick);
+  })(t0);
+}
+
+// Smooth exit before navigating back to the menu.
+
+function showStatus(msg, cls){
+  const s = $('status');
+  s.className = 'status ' + cls;
+  s.style.display = 'block';
+  s.innerHTML = msg;
+}
+function hideStatus(){ $('status').style.display = 'none'; }
+
+// ── File selection ───────────────────────────────────────────────────────────
+$('files').addEventListener('change', e => addFiles(e.target.files));
+const dz = $('dz');
+['dragover','dragenter'].forEach(ev => dz.addEventListener(ev, e => {e.preventDefault(); dz.classList.add('drag');}));
+['dragleave','drop'].forEach(ev => dz.addEventListener(ev, e => {e.preventDefault(); dz.classList.remove('drag');}));
+dz.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+
+function addFiles(list){
+  for(const f of list){
+    if(!_files.some(x => x.name === f.name && x.size === f.size)) _files.push(f);
+  }
+  renderChips();
+}
+function removeFile(i){ _files.splice(i,1); renderChips(); }
+function renderChips(){
+  $('fileChips').innerHTML = _files.map((f,i) =>
+    `<span class="file-chip">📄 ${f.name} <span class="x" onclick="removeFile(${i})">✕</span></span>`).join('');
+  dz.classList.toggle('has-file', _files.length > 0);
+  dz.textContent = _files.length ? `${_files.length} file(s) queued — click to add more` :
+    'Click or drop DMP .xlsx exports here (multiple files supported)';
+  $('runBtn').disabled = _files.length === 0;
+}
+
+// ── Analyze ──────────────────────────────────────────────────────────────────
+async function runAnalysis(){
+  const btn = $('runBtn');
+  btn.disabled = true;
+  showStatus('<span class="spinner"></span> Parsing &amp; consolidating traits…', 'info');
+  const fd = new FormData();
+  _files.forEach(f => fd.append('files', f));
+  try{
+    const r = await fetch('/dmp-insights/api/analyze', {method:'POST', body:fd});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error || 'Analysis failed');
+    _data = j;
+    _activeCat = 'All'; _sortKey = 'index_wavg'; _sortDir = -1;
+    renderResults();
+    let msg = `✓ ${j.raw_traits} raw traits → ${j.consolidated_traits} consolidated (${j.merged_traits} merged from multiple rows).`;
+    if(j.skipped && j.skipped.length) msg += ' Skipped: ' + j.skipped.join('; ');
+    showStatus(msg, 'ok');
+    $('dlBtn').classList.remove('hidden');
+  }catch(err){
+    showStatus('✗ ' + err.message, 'err');
+  }finally{
+    btn.disabled = _files.length === 0;
+  }
+}
+
+// Demo: queue both generated sample exports, then run.
+async function useSample(){
+  try{
+    for(const w of ['A','B']){
+      const r = await fetch('/dmp-insights/api/demo-sample?which=' + w);
+      const b = await r.blob();
+      addFiles([new File([b], 'sample_dmp_export_' + w + '.xlsx', {type:b.type})]);
+    }
+    runAnalysis();
+  }catch(err){ showStatus('✗ ' + err.message, 'err'); }
+}
+
+function downloadExcel(){
+  if(_data) Mock.downloadFrom('/dmp-insights/api/download?job=' + _data.job);
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+function renderResults(){
+  const d = _data;
+  const res = $('results');
+  res.classList.remove('hidden');
+  res.classList.remove('reveal'); void res.offsetWidth;  // restart animation on re-run
+  res.classList.add('reveal');
+  countUp($('stFiles'), d.files.length, fmt);
+  const uuSet = d.files.map(f => f.unique_users);
+  if(uuSet.length === 1) countUp($('stUU'), uuSet[0], fmt);
+  else $('stUU').textContent = uuSet.map(u => (u/1e6).toFixed(1)+'M').join(' / ');
+  countUp($('stRaw'), d.raw_traits, fmt);
+  countUp($('stCons'), d.consolidated_traits, fmt);
+  countUp($('stMerged'), d.merged_traits, fmt);
+  setTimeout(() => res.scrollIntoView({behavior:'smooth', block:'start'}), 150);
+
+  $('fileMeta').innerHTML = d.files.map(f =>
+    `<p style="font-size:12.5px;color:var(--muted)">📄 <b style="color:var(--text-sec)">${f.file}</b>
+     — ${f.series || ''} · ${fmt(f.unique_users)} unique users${f.date_range ? ' · ' + f.date_range : ''}</p>`).join('');
+
+  renderCatChips();
+  renderCharts();
+  renderTable();
+}
+
+function renderCatChips(){
+  const cats = ['All', ...Object.keys(_data.categories)];
+  $('catChips').innerHTML = cats.map(c =>
+    `<span class="chip ${c===_activeCat?'active':''}" onclick="setCat('${c.replace(/'/g,"\\'")}')">
+       ${c}${c==='All' ? '' : ' · ' + _data.categories[c].traits}</span>`).join('');
+}
+function setCat(c){ _activeCat = c; renderCatChips(); renderTable(); }
+
+function setSort(k){
+  if(_sortKey === k) _sortDir = -_sortDir; else { _sortKey = k; _sortDir = -1; }
+  renderTable();
+}
+
+function filteredTraits(){
+  const q = ($('search').value || '').toLowerCase();
+  let rows = _data.traits;
+  if(_activeCat !== 'All') rows = rows.filter(r => r.category === _activeCat);
+  if(q) rows = rows.filter(r => (r.label + ' ' + r.key + ' ' + r.sources.join(' ')).toLowerCase().includes(q));
+  return [...rows].sort((a,b) => (a[_sortKey] - b[_sortKey]) * _sortDir);
+}
+
+function renderTable(){
+  document.querySelectorAll('.arr').forEach(a => a.textContent = '');
+  const arr = $('arr_' + _sortKey);
+  if(arr) arr.textContent = _sortDir < 0 ? '▼' : '▲';
+
+  const rows = filteredTraits();
+  $('tbody').innerHTML = rows.map((r,i) => {
+    const multi = r.n_rows > 1;
+    return `
+    <tr class="main-row" onclick="toggleDetail(${i})">
+      <td><b>${r.label}</b>${r.disagree?` <span title="Merged sources disagree sharply — index ${r.index_min} to ${r.index_max}" style="color:var(--amber);font-weight:700">&#9888;</span>`:''}
+          <div style="font-size:10.5px;color:var(--muted);margin-top:2px">${r.path||''}</div></td>
+      <td style="font-size:11.5px">${r.group||''}</td>
+      <td style="color:var(--muted)">${r.category}</td>
+      <td><span class="src-badge ${multi?'multi':''}" title="${r.sources.join(', ')}">${r.n_sources}${multi?' ⇄':''}</span></td>
+      <td class="num ${r.index_wavg >= 120 ? 'idx-hi' : r.index_wavg < 80 ? 'idx-lo' : ''}">${r.index_wavg}</td>
+      <td class="num">${r.index_median}</td>
+      <td class="num">${r.comp_avg}%</td>
+      <td class="num">${fmt(r.users_avg)}<div class="users-sub">${r.comp_avg}% of unique users</div></td>
+    </tr>
+    <tr class="detail-row hidden" id="det${i}"><td colspan="7"><div class="detail-inner">
+      <p style="font-size:12px;margin:6px 0">Merged from <b>${r.n_rows}</b> row(s) · sources: ${r.sources.join(', ')}
+         · index min–max <span class="num">${r.index_min}–${r.index_max}</span>
+         · composition min–max <span class="num">${r.comp_min}%–${r.comp_max}%</span>
+         · est. users at max comp <span class="num">${fmt(r.users_max)}</span></p>
+    </div></td></tr>`;
+  }).join('');
+}
+function toggleDetail(i){ $('det'+i).classList.toggle('hidden'); }
+
+// ── Charts ───────────────────────────────────────────────────────────────────
+const PALETTE = ['#7c5ce8','#2dd4bf','#60a5fa','#fbbf24','#f472b6','#a78bfa','#3fb950','#f87171'];
+Chart.defaults.color = '#8880b8';
+Chart.defaults.borderColor = 'rgba(180,160,255,0.15)';
+Chart.defaults.font.family = 'Helvetica,Arial,sans-serif';
+
+function destroyCharts(){ Object.values(_charts).forEach(c => c.destroy()); _charts = {}; }
+
+function chartDim(){ return ($('chDim')||{}).value || 'group'; }
+function dimOf(t){ const d=chartDim();
+  return d==='category' ? t.category : d==='source' ? (t.sources[0]||'—') : (t.group||'General'); }
+
+// Populate the "Show" filter from whichever dimension is active, preserving the
+// current pick when it still exists.
+function syncChartFilter(){
+  const sel=$('chFilter'), prev=sel.value;
+  const names=[...new Set(_data.traits.map(dimOf))].sort();
+  sel.innerHTML='<option value="">All '+(chartDim()==='source'?'sources':chartDim()==='category'?'categories':'groupings')+'</option>'
+    + names.map(n=>`<option value="${n.replace(/"/g,'&quot;')}">${n}</option>`).join('');
+  if(prev && names.includes(prev)) sel.value=prev;
+}
+
+function chartTraits(){
+  let t=_data.traits.filter(x=>x.comp_avg>0);
+  const f=$('chFilter').value;
+  if(f) t=t.filter(x=>dimOf(x)===f);
+  t.sort((a,b)=>b.index_wavg-a.index_wavg);
+  const n=parseInt($('chTopN').value,10)||0;
+  return n>0 ? t.slice(0,n) : t;
+}
+
+function renderCharts(){
+  destroyCharts();
+  if(!_data || !_data.traits) return;
+  syncChartFilter();
+
+  const type=$('chType').value, traits=chartTraits();
+  const trim=s=>s.length>55?s.slice(0,53)+'…':s;
+  const tip=t=>` index ${t.index_wavg} · ${fmt(t.users_avg)} est. users (${t.comp_avg}%)`
+                + (t.n_rows>1?` · merged from ${t.n_rows} rows`:'');
+  const dimName=chartDim()==='source'?'source':chartDim()==='category'?'category':'grouping';
+  $('chTopTitle').innerHTML=
+    `${type==='radar'?'Average index by '+dimName:type==='grouped'?'Traits by '+dimName
+      :type==='bubble'?'Index vs reach (bubble = est. users)':'Top traits by composition-weighted index'}`
+    + ` <span style="color:var(--muted);font-weight:400">(hover for est. users)</span>`;
+
+  // Group the selected traits by the active dimension, strongest group first.
+  const byDim={};
+  traits.forEach(t=>{ (byDim[dimOf(t)] = byDim[dimOf(t)] || []).push(t); });
+  const dims=Object.keys(byDim).sort((a,b)=>
+    (byDim[b].reduce((s,t)=>s+t.index_wavg,0)/byDim[b].length) -
+    (byDim[a].reduce((s,t)=>s+t.index_wavg,0)/byDim[a].length));
+
+  let cfg, height=Math.max(300, traits.length*26+70);
+
+  if(type==='radar'){
+    // One axis per group, so the shape reads as an audience profile.
+    const avg=dims.map(d=>+(byDim[d].reduce((s,t)=>s+t.index_wavg,0)/byDim[d].length).toFixed(1));
+    cfg={ type:'radar',
+      data:{ labels:dims, datasets:[{ label:'Average index', data:avg,
+        backgroundColor:PALETTE[0]+'44', borderColor:PALETTE[0], pointBackgroundColor:PALETTE[0] }]},
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false}, tooltip:{callbacks:{
+          label:ctx=>` ${ctx.label}: avg index ${ctx.raw} across ${byDim[ctx.label].length} traits`}}},
+        scales:{ r:{ suggestedMin:0, ticks:{backdropColor:'transparent'} } } } };
+    height=Math.max(360, dims.length*26+220);
+
+  } else if(type==='bubble'){
+    cfg={ type:'bubble',
+      data:{ datasets: dims.map((d,i)=>({ label:d,
+        data: byDim[d].map(t=>({x:t.comp_avg, y:t.index_wavg, r:Math.max(4,Math.sqrt(t.users_avg)/260), t})),
+        backgroundColor:PALETTE[i%PALETTE.length]+'99' })) },
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{position:'bottom', labels:{boxWidth:10,font:{size:10}}},
+          tooltip:{callbacks:{label:ctx=>{const t=ctx.raw.t;
+            return ` ${t.label}: index ${t.index_wavg}, ${t.comp_avg}% (${fmt(t.users_avg)} users)`;}}}},
+        scales:{ x:{title:{display:true,text:'Composition % of unique users'}},
+                 y:{title:{display:true,text:'Weighted index'}} } } };
+    height=440;
+
+  } else if(type==='grouped'){
+    // Traits on one axis, one colour per group — comparison within and across.
+    cfg={ type:'bar',
+      data:{ labels:traits.map(t=>trim(t.label)),
+        datasets: dims.map((d,i)=>({ label:d,
+          data: traits.map(t=>dimOf(t)===d ? t.index_wavg : null),
+          backgroundColor:PALETTE[i%PALETTE.length]+'cc', borderRadius:4 })) },
+      options:{ indexAxis:'y', responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{position:'bottom', labels:{boxWidth:10,font:{size:10}}},
+          tooltip:{callbacks:{label:ctx=>tip(traits[ctx.dataIndex])}}},
+        scales:{ x:{stacked:false, title:{display:true,text:'Composition-weighted index (100 = average)'}},
+                 y:{stacked:true} } } };
+
+  } else {
+    const horiz = type==='bar';
+    cfg={ type:'bar',
+      data:{ labels:traits.map(t=>trim(t.label)),
+        datasets:[{ data:traits.map(t=>t.index_wavg),
+          backgroundColor:traits.map(t=>PALETTE[dims.indexOf(dimOf(t))%PALETTE.length]+'cc'),
+          borderRadius:5 }] },
+      options:{ indexAxis:horiz?'y':'x', responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false}, tooltip:{callbacks:{label:ctx=>tip(traits[ctx.dataIndex])}}},
+        scales:{ [horiz?'x':'y']:{title:{display:true,text:'Composition-weighted index (100 = average)'}} } } };
+    if(!horiz) height=420;
+  }
+
+  _charts.top = new Chart($('chTop'), cfg);
+  $('chTop').parentElement.style.height = height+'px';
+  $('chTop').style.maxHeight='none';
+
+  // Scatter: index vs composition, coloured by the active dimension.
+  _charts.scatter = new Chart($('chScatter'), {
+    type:'scatter',
+    data:{ datasets: dims.map((d,i)=>({ label:d,
+      data: byDim[d].filter(t=>t.comp_avg>=1).map(t=>({x:t.comp_avg,y:t.index_wavg,t})),
+      backgroundColor:PALETTE[i%PALETTE.length]+'bb', pointRadius:4, pointHoverRadius:6 })) },
+    options:{ responsive:true, plugins:{legend:{position:'bottom',labels:{boxWidth:10,font:{size:10}}},
+      tooltip:{callbacks:{label:ctx=>{const t=ctx.raw.t;
+        return ` ${t.label}: index ${t.index_wavg}, ${t.comp_avg}% (${fmt(t.users_avg)} users)`;}}}},
+      scales:{ x:{title:{display:true,text:'Composition % of unique users'}},
+               y:{title:{display:true,text:'Weighted index'}} } }
+  });
+
+  // Donut: trait counts on the active dimension.
+  _charts.donut = new Chart($('chDonut'), {
+    type:'doughnut',
+    data:{ labels:dims, datasets:[{ data:dims.map(d=>byDim[d].length),
+      backgroundColor:dims.map((d,i)=>PALETTE[i%PALETTE.length]+'cc'), borderWidth:0 }] },
+    options:{ responsive:true, plugins:{legend:{position:'bottom',labels:{boxWidth:10,font:{size:10}}}},
+      cutout:'60%' }
+  });
+}
+</script>
+</body>
+</html>
