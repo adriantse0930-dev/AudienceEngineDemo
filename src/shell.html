@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audience Analytics Engine</title>
+<meta name="description" content="Mock-up of an audience analytics toolkit for demonstration. All data is randomly generated; no company data.">
+<style>
+/*{{SHELL_CSS}}*/
+/*{{SPLASH_CSS}}*/
+</style>
+</head>
+<body>
+<!--{{SPLASH_HTML}}-->
+<header id="appbar">
+  <a class="brand" href="#/"><span class="brand-dot"></span><span class="brand-name">Audience Analytics Engine</span></a>
+  <span class="crumb" id="crumb" hidden><span class="crumb-sep">/</span><span id="crumbName"></span></span>
+  <span class="demo-pill" title="A mock-up for demonstration. Every number is randomly generated; no company data.">Mockup</span>
+</header>
+
+<main id="menu"></main>
+
+<section id="tool" hidden>
+  <div id="toolhead">
+    <a class="back-btn" href="#/" aria-label="Back to menu"><svg class="ic" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg></a>
+    <span class="th-icon" id="thIcon"></span>
+    <div class="th-text">
+      <h1 id="thTitle"></h1>
+      <p id="thDesc"></p>
+    </div>
+    <div class="th-actions">
+      <button id="sampleBtn" class="run-btn" type="button" disabled>
+        <svg class="ic" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg><span>Run sample</span>
+      </button>
+      <button id="aboutBtn" class="about-btn" type="button" aria-expanded="true" aria-controls="about">
+        <span>About</span><svg class="ic" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+    </div>
+  </div>
+  <div id="modebar" hidden>
+    <div class="seg" id="segCountry" role="group" aria-label="Country">
+      <i class="seg-pill" aria-hidden="true"></i>
+      <button type="button" data-v="us">United States <small>ZIP</small></button>
+      <button type="button" data-v="ca">Canada <small>Postal</small></button>
+    </div>
+    <div class="seg" id="segLevel" role="group" aria-label="Canadian geography level">
+      <i class="seg-pill" aria-hidden="true"></i>
+      <button type="button" data-v="fsa">FSA <small>3-character</small></button>
+      <button type="button" data-v="fsaldu">FSALDU <small>6-character</small></button>
+    </div>
+  </div>
+  <div id="about"><div class="about-clip"><div class="about-inner" id="aboutInner"></div></div></div>
+  <iframe id="view" title="Tool"></iframe>
+</section>
+
+<div id="notFound" hidden><div>This page isn't part of the demo.</div><a href="#/">Back to the menu</a></div>
+
+<script>
+var PAGES = /*{{PAGES}}*/{};
+/*{{TOOLS_JS}}*/
+</script>
+<script>
+/*{{SHELL_JS}}*/
+</script>
+<script>
+/*{{SPLASH_JS}}*/
+</script>
+</body>
+</html>

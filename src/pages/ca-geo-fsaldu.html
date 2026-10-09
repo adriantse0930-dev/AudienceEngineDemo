@@ -1,0 +1,1604 @@
+<script data-demo="ca_geo_fsaldu">
+// CA Geo Analysis — FSALDU level. Pretend warehouse session + in-browser
+// re-implementation of the blueprint: audience table joined to the company
+// demographic tables on a six-character postal code (FSALDU), aggregated into
+// national-vs-audience sums, resolved into composition % and index, and written
+// to a multi-tab workbook. Every row here is randomly generated (seeded).
+(function () {
+  'use strict';
+  var P = '/ca-geo-fsaldu/api';
+  var SRC_DB = 'DEMO_WAREHOUSE', SRC_SCHEMA = 'COMPANY_DATA', GEO_LEVEL = 'FSALDU', SRC_KEY = 'CODE';
+  var CODES_PER_QUERY = 20000;
+  var CLUSTER_TABLE = 'LIFESTYLE_CLUSTERS_FSALDU';
+  var st = Mock.store('ca_geo_fsaldu');
+  var session = { connected: !!st.get('connected', false) };
+
+  // ── errors (mirror the blueprint's error handler: 400 / 409) ──────────────
+  function BadInput(msg) { var e = new Error(msg); e.status = 400; return e; }
+  function NotConnected() { var e = new Error('Not connected to the warehouse — use Connect above.'); e.status = 409; return e; }
+  function handle(fn) {
+    return async function (req) {
+      try { return await fn(req); }
+      catch (e) {
+        if (e && e.status) return Mock.json({ error: e.message }, e.status);
+        return Mock.json({ error: (e && e.name || 'Error') + ': ' + (e && e.message) }, 500);
+      }
+    };
+  }
+  function requireConn() { if (!session.connected) throw NotConnected(); }
+  var IDENT_RE = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+  function checkIdent(pairs) {
+    pairs.forEach(function (p) {
+      if (!IDENT_RE.test(String(p[1] || ''))) throw BadInput('Invalid ' + p[0] + ": '" + (p[1] == null ? '' : p[1]) + "'");
+    });
+  }
+
+  // ── helpers ────────────────────────────────────────────────────────────────
+  function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+  function logit(p) { return Math.log(p / (1 - p)); }
+  function dot(w, l) { return w[0] * l[0] + w[1] * l[1] + w[2] * l[2] + w[3] * l[3]; }
+  function fmtCode(c) { return c.slice(0, 3) + ' ' + c.slice(3); }
+  function normKey(v) { return String(v).trim().replace(/ /g, '').replace(/-/g, '').replace(/\t/g, '').toUpperCase(); }
+  var LETTER_PROV = { A: 'NL', B: 'NS', C: 'PE', E: 'NB', G: 'QC', H: 'QC', J: 'QC', K: 'ON', L: 'ON', M: 'ON',
+                      N: 'ON', P: 'ON', R: 'MB', S: 'SK', T: 'AB', V: 'BC', X: 'Northwest T or Nunavut', Y: 'YK' };
+  function fsaProvince(f) { return LETTER_PROV[String(f).charAt(0).toUpperCase()] || ''; }
+
+  // ── lifestyle clusters (made-up) ─ [name, social group, lifestage, aff, age, urb, fam]
+  var CLUSTERS = [
+    ['Skyline Executives', 'Downtown Achievers', 'Mature Years', 1.8, 0.4, 1.6, -0.4],
+    ['Loft Professionals', 'Downtown Achievers', 'Younger Years', 1.3, -0.8, 1.7, -0.8],
+    ['Heritage Towers', 'Downtown Achievers', 'Mature Years', 1.2, 1.3, 1.4, -0.6],
+    ['Condo Starters', 'Urban Young', 'Younger Years', 0.2, -1.3, 1.6, -1.0],
+    ['Campus Corridors', 'Urban Young', 'Younger Years', -0.8, -1.6, 1.3, -0.9],
+    ['Transit Hustle', 'Urban Young', 'Younger Years', -0.3, -0.9, 1.4, -0.4],
+    ['Global Neighbours', 'Urban Diverse Mix', 'Family Life', -0.3, -0.4, 1.2, 0.7],
+    ['Mosaic Walk-ups', 'Urban Diverse Mix', 'Family Life', -0.8, -0.3, 1.3, 0.3],
+    ['Midtown Mix', 'Urban Diverse Mix', 'Mature Years', 0.0, 0.6, 1.1, -0.3],
+    ['Maple Estates', 'Suburban Affluence', 'Mature Years', 1.9, 0.9, 0.1, 0.4],
+    ['Ravine Ridge', 'Suburban Affluence', 'Family Life', 1.6, 0.0, 0.2, 1.1],
+    ['Golf Course Greens', 'Suburban Affluence', 'Mature Years', 1.4, 1.3, -0.3, 0.1],
+    ['Cul-de-sac Kids', 'Suburban Families', 'Family Life', 0.6, -0.6, -0.1, 1.6],
+    ['Minivan Meadows', 'Suburban Families', 'Family Life', 0.3, -0.5, -0.3, 1.4],
+    ['New Build Dreams', 'Suburban Families', 'Younger Years', 0.4, -1.0, 0.0, 1.0],
+    ['Split-Level Comfort', 'Suburban Middle', 'Mature Years', 0.0, 0.7, -0.2, 0.2],
+    ['Bungalow Boulevard', 'Suburban Middle', 'Mature Years', -0.3, 1.2, -0.1, -0.2],
+    ['Strip Mall Sprawl', 'Suburban Middle', 'Family Life', -0.5, -0.2, 0.2, 0.6],
+    ['Lakeside Towns', 'Town & Country', 'Mature Years', 0.3, 1.1, -1.0, 0.0],
+    ['Main Street Makers', 'Town & Country', 'Family Life', -0.2, 0.0, -0.8, 0.7],
+    ['Commuter Crossroads', 'Town & Country', 'Younger Years', 0.0, -0.6, -0.7, 0.8],
+    ['Back Roads & Barns', 'Rural Heartland', 'Family Life', -0.2, 0.2, -1.7, 0.9],
+    ['Cottage Country', 'Rural Heartland', 'Mature Years', 0.1, 1.5, -1.6, -0.3],
+    ['Northern Grit', 'Rural Heartland', 'Mature Years', -0.9, 0.6, -1.5, 0.0]
+  ];
+  var CLUSTER_LEVELS = { 'Segment': 0, 'Social Group': 1, 'Lifestage': 2 };
+
+  // ── FSALDU universe: ~1,200 postal codes under the 100 shared demo FSAs ────
+  var LDU_LETTERS = 'ABCEGHJKLMNPRSTVWXYZ';
+  var U = [], CODE_IDX = {};
+  (function buildUniverse() {
+    var r = Mock.rng('fsaldu-universe-v1');
+    var BIG = /Toronto|Mississauga|Brampton|Markham|Ottawa/, MID = /Hamilton|London|Kitchener|Windsor|Oakville/;
+    Mock.fsaList.forEach(function (f) {
+      var fu = BIG.test(f.CITY) ? Mock.gauss(0.9, 0.5, r) : MID.test(f.CITY) ? Mock.gauss(0.1, 0.6, r) : Mock.gauss(-0.9, 0.6, r);
+      var fa = Mock.gauss(0, 0.8, r);
+      var probs = CLUSTERS.map(function (c) {
+        return Math.exp(-((c[5] - fu) * (c[5] - fu) + 0.7 * (c[3] - fa) * (c[3] - fa)) / 0.6);
+      });
+      var tot = probs.reduce(function (s, x) { return s + x; }, 0);
+      var nLdu = Mock.randInt(8, 16, r);
+      for (var k = 0; k < nLdu; k++) {
+        var code;
+        do {
+          code = f.FSA + Mock.randInt(0, 9, r) + LDU_LETTERS.charAt(Mock.randInt(0, 19, r)) + Mock.randInt(0, 9, r);
+        } while (CODE_IDX[code] != null);
+        var x = r() * tot, ci = 0;
+        while (ci < probs.length - 1 && x > probs[ci]) { x -= probs[ci]; ci++; }
+        var c = CLUSTERS[ci];
+        var lat = [c[3] + Mock.gauss(0, 0.35, r), c[4] + Mock.gauss(0, 0.35, r),
+                   c[5] + Mock.gauss(0, 0.35, r), c[6] + Mock.gauss(0, 0.35, r)];
+        var pop = Mock.randInt(25, 190, r);
+        var hhd = Math.max(8, Math.round(pop / Math.max(1.3, 2.5 + 0.45 * lat[3] - 0.15 * lat[2] + Mock.gauss(0, 0.12, r))));
+        CODE_IDX[code] = U.length;
+        U.push({ code: code, fsa: f.FSA, city: f.CITY, cluster: ci, lat: lat, pop: pop, hhd: hhd,
+                 adult: Math.round(pop * Math.min(0.92, Math.max(0.6, 0.79 - 0.08 * lat[3] + 0.04 * lat[1]))) });
+      }
+    });
+  })();
+  var N = U.length;
+
+  // ── company datasets (one Excel tab each) ─────────────────────────────────
+  // spec: [VAR, description, category, kind, p, weights[aff,age,urb,fam]]
+  //   kind b = base column (p = pop|hhd|adult), c = count (p = share), m = mean (p = centre),
+  //   e = column empty at FSALDU level, u = count missing from the taxonomy (unlabelled)
+  var DATASETS = [
+    { tab: 'Demographics', base: 'BASPOP', base_hhd: 'BASHHD', unit: 'pop', tables: [
+      ['DEMOGRAPHICS_FSALDU_2026', [
+        ['BASPOP', 'Total Population', 'Population Base', 'b', 'pop'],
+        ['BASHHD', 'Total Households', 'Household Base', 'b', 'hhd'],
+        ['POP0014', 'Population aged 0 to 14', 'Age', 'c', 0.16, [0, -0.6, -0.1, 1.0]],
+        ['POP1524', 'Population aged 15 to 24', 'Age', 'c', 0.12, [-0.1, -0.5, 0.4, 0.1]],
+        ['POP2534', 'Population aged 25 to 34', 'Age', 'c', 0.14, [0, -0.8, 0.9, -0.3]],
+        ['POP3554', 'Population aged 35 to 54', 'Age', 'c', 0.26, [0.2, -0.1, 0, 0.5]],
+        ['POP5564', 'Population aged 55 to 64', 'Age', 'c', 0.13, [0.1, 0.6, -0.3, -0.2]],
+        ['POP65P', 'Population aged 65 or older', 'Age', 'c', 0.18, [0, 1.2, -0.2, -0.5]],
+        ['MEDAGE', 'Median Age of Population', 'Age', 'm', 41, [0, 0.8, -0.1, -0.3]],
+        ['HHINC40', 'Households with income under $40,000', 'Household Income', 'c', 0.22, [-1.1, 0.3, 0.3, -0.3]],
+        ['HHINC150', 'Households with income $150,000 or over', 'Household Income', 'c', 0.18, [1.2, 0.1, 0, 0.3]],
+        ['AVGHHINC', 'Average Household Income', 'Household Income', 'm', 112000, [1, 0.1, 0, 0.2]],
+        ['AVGHHSZ', 'Average Household Size', 'Households', 'm', 2.6, [0, -0.3, -0.3, 0.9]],
+        ['EDUUNI', 'Population 25+ with a university degree', 'Education', 'c', 0.28, [1, 0, 0.4, 0]],
+        ['EDUNONE', 'Population 25+ with no certificate, diploma or degree', 'Education', 'c', 0.12, [-0.9, 0.3, -0.2, 0]],
+        ['MARSEPDIV', 'Population separated or divorced', 'Marital Status', 'c', 0.08, [-0.3, 0.5, 0.1, -0.4]],
+        ['LANGNONOFF', 'Mother tongue: non-official language', 'Language', 'c', 0.22, [0, -0.2, 1, 0.2]],
+        ['DWOWN', 'Owned dwellings', 'Housing', 'c', 0.66, [0.6, 0.4, -0.8, 0.5]],
+        ['DWRENT', 'Rented dwellings', 'Housing', 'c', 0.34, [-0.6, -0.3, 0.8, -0.4]],
+        ['DWAPT5', 'Dwellings in apartment buildings of 5+ storeys', 'Housing', 'c', 0.17, [0, 0, 1.4, -0.6]],
+        ['POPCOLL', 'Population in collective dwellings', 'Housing', 'e'],
+        ['COMTRANSIT', 'Workers commuting by public transit', 'Commuting', 'c', 0.13, [0, -0.2, 1.3, -0.1]],
+        ['COMCAR', 'Workers commuting by car, truck or van', 'Commuting', 'c', 0.70, [0.2, 0.1, -1, 0.4]]
+      ]]
+    ]},
+    { tab: 'FoodSpending', base: 'FDBASHHD', base_hhd: 'FDBASHHD', unit: 'hhd', tables: [
+      ['FOOD_SPEND_FSALDU_2025', [
+        ['FDBASHHD', 'Total Households (food spending base)', 'Household Base', 'b', 'hhd'],
+        ['FDSTORE', 'Average household spend on food from stores', 'Food Purchased From Stores', 'm', 9400, [0.5, 0.1, -0.1, 0.6]],
+        ['FDFRESH', 'Average household spend on fresh vegetables', 'Food Purchased From Stores', 'm', 780, [0.6, 0.3, 0.1, 0.3]],
+        ['FDMEAT', 'Average household spend on meat', 'Food Purchased From Stores', 'm', 1350, [0.3, 0.1, -0.3, 0.6]],
+        ['FDREST', 'Average household spend on restaurant meals', 'Food Purchased From Restaurants', 'm', 3100, [0.8, -0.3, 0.6, 0]],
+        ['FDFAST', 'Average household spend on fast food', 'Food Purchased From Restaurants', 'm', 1250, [-0.2, -0.7, 0.3, 0.5]],
+        ['FDDELIV', 'Households using meal delivery apps', 'Food Purchased From Restaurants', 'c', 0.31, [0.3, -0.9, 1, 0.1]],
+        ['FDORG', 'Households buying organic food', 'Food Habits', 'c', 0.36, [0.9, 0, 0.5, 0.1]],
+        ['FDMKIT', 'Households buying meal kits', 'Food Habits', 'c', 0.09, [0.6, -0.6, 0.4, 0.4]],
+        ['FDBULK', 'Households shopping at warehouse clubs', 'Food Habits', 'c', 0.41, [0.2, 0.1, -0.6, 0.8]]
+      ]]
+    ]},
+    { tab: 'HouseholdSpending', base: 'HSBASHHD', base_hhd: 'HSBASHHD', unit: 'hhd', tables: [
+      ['HOUSEHOLD_SPEND_FSALDU_P1_2025', [
+        ['HSBASHHD', 'Total Households (household spending base)', 'Household Base', 'b', 'hhd'],
+        ['HSSHELT', 'Average household spend on shelter', 'Shelter', 'm', 24000, [0.8, -0.1, 0.6, 0.3]],
+        ['HSTRANS', 'Average household spend on transportation', 'Transportation', 'm', 13500, [0.5, 0, -0.7, 0.5]],
+        ['HSVEH', 'Households purchasing a new vehicle this year', 'Transportation', 'c', 0.08, [0.6, 0.1, -0.5, 0.4]],
+        ['HSREC', 'Average household spend on recreation', 'Recreation', 'm', 4600, [0.7, -0.1, 0, 0.4]]
+      ]],
+      ['HOUSEHOLD_SPEND_FSALDU_P2_2025', [
+        ['HSBASHHD', 'Total Households (household spending base)', 'Household Base', 'b', 'hhd'],
+        ['HSTRAV', 'Average household spend on travel tours', 'Recreation', 'm', 1900, [1, 0.6, 0.3, -0.1]],
+        ['HSPET', 'Households with pet expenses', 'Household Operation', 'c', 0.48, [0.2, 0.1, -0.7, 0.5]],
+        ['HSRENO', 'Households with home renovation spending', 'Household Operation', 'c', 0.27, [0.6, 0.4, -0.8, 0.4]],
+        ['HSCHILD', 'Average household spend on child care', 'Household Operation', 'm', 2100, [0.4, -0.8, 0.2, 1.2]],
+        ['HSRIDE', 'Households with spending on shared e-scooters', 'Transportation', 'e']
+      ]]
+    ]},
+    { tab: 'SocialMedia', base: 'SMBAS18P', base_hhd: 'SMBAS18P', unit: 'adult', tables: [
+      ['SOCIAL_MEDIA_FSALDU_P1_2025', [
+        ['SMBAS18P', 'Population 18+ (social media base)', 'Population Base', 'b', 'adult'],
+        ['SMIG', 'Uses Instagram weekly', 'Platform Usage', 'c', 0.44, [0.2, -1, 0.6, 0]],
+        ['SMTT', 'Uses TikTok weekly', 'Platform Usage', 'c', 0.31, [-0.2, -1.3, 0.4, 0.1]],
+        ['SMFB', 'Uses Facebook weekly', 'Platform Usage', 'c', 0.58, [-0.1, 0.6, -0.4, 0.3]]
+      ]],
+      ['SOCIAL_MEDIA_FSALDU_P2_2025', [
+        ['SMBAS18P', 'Population 18+ (social media base)', 'Population Base', 'b', 'adult'],
+        ['SMLI', 'Uses LinkedIn monthly', 'Platform Usage', 'c', 0.24, [1.1, -0.3, 0.7, 0]],
+        ['SMRD', 'Uses Reddit monthly', 'Platform Usage', 'c', 0.21, [0.2, -0.9, 0.6, -0.3]],
+        ['SMPIN', 'Uses Pinterest monthly', 'Platform Usage', 'c', 0.22, [0.2, -0.2, -0.2, 0.8]]
+      ]],
+      ['SOCIAL_MEDIA_FSALDU_P3_2025', [
+        ['SMBAS18P', 'Population 18+ (social media base)', 'Population Base', 'b', 'adult'],
+        ['SMBRAND', 'Follows brands on social media', 'Engagement', 'c', 0.37, [0.2, -0.8, 0.4, 0.3]],
+        ['SMREV', 'Posts product reviews online', 'Engagement', 'c', 0.16, [0.3, -0.4, 0.3, 0.2]],
+        ['SMHEAVY', 'Heavy social media users (3+ hours per day)', 'Engagement', 'c', 0.14, [-0.4, -1.1, 0.4, 0]],
+        ['SMAVGHR', 'Average hours per week on social media', 'Engagement', 'm', 9.5, [-0.2, -0.9, 0.3, 0]],
+        ['SMVR', 'Uses VR social platforms', 'Engagement', 'e']
+      ]]
+    ]},
+    { tab: 'MobileUsage', base: 'MBBAS18P', base_hhd: 'MBBAS18P', unit: 'adult', tables: [
+      ['MOBILE_USAGE_FSALDU_P1_2025', [
+        ['MBBAS18P', 'Population 18+ (mobile base)', 'Population Base', 'b', 'adult'],
+        ['MBSMART', 'Owns a smartphone', 'Devices', 'c', 0.88, [0.4, -0.9, 0.4, 0.2]],
+        ['MB5G', 'Has a 5G mobile plan', 'Devices', 'c', 0.39, [0.7, -0.6, 0.8, 0]],
+        ['MBBILL', 'Average monthly mobile bill', 'Devices', 'm', 78, [0.5, -0.2, 0.3, 0.4]]
+      ]],
+      ['MOBILE_USAGE_FSALDU_P2_2025', [
+        ['MBBAS18P', 'Population 18+ (mobile base)', 'Population Base', 'b', 'adult'],
+        ['MBBANK', 'Uses mobile banking', 'Mobile Activities', 'c', 0.63, [0.5, -0.8, 0.5, 0.1]],
+        ['MBPAY', 'Uses mobile wallet payments', 'Mobile Activities', 'c', 0.41, [0.5, -1, 0.8, 0]],
+        ['MBGAME', 'Plays mobile games weekly', 'Mobile Activities', 'c', 0.34, [-0.3, -1, 0.2, 0.4]],
+        ['MBMUSIC', 'Streams music on mobile daily', 'Mobile Activities', 'c', 0.38, [0, -1.2, 0.6, 0]]
+      ]]
+    ]},
+    { tab: 'FinancialProducts', base: 'FPBASHHD', base_hhd: 'FPBASHHD', unit: 'hhd', tables: [
+      ['FINANCIAL_PRODUCTS_FSALDU_P1_2025', [
+        ['FPBASHHD', 'Total Households (financial products base)', 'Household Base', 'b', 'hhd'],
+        ['FPMORT', 'Households with a mortgage', 'Borrowing', 'c', 0.36, [0.5, -0.2, -0.5, 0.9]],
+        ['FPLOC', 'Households with a line of credit', 'Borrowing', 'c', 0.41, [0.4, 0.1, -0.2, 0.4]],
+        ['FPCAR', 'Households with a vehicle loan or lease', 'Borrowing', 'c', 0.33, [0.1, -0.2, -0.8, 0.6]],
+        ['FPAVGCC', 'Average number of credit cards per household', 'Credit Cards', 'm', 2.4, [0.7, 0.2, 0, 0.3]]
+      ]],
+      ['FINANCIAL_PRODUCTS_FSALDU_P2_2025', [
+        ['FPBASHHD', 'Total Households (financial products base)', 'Household Base', 'b', 'hhd'],
+        ['FPRRSP', 'Households with an RRSP', 'Savings & Investments', 'c', 0.55, [0.9, 0.3, -0.1, 0.3]],
+        ['FPTFSA', 'Households with a TFSA', 'Savings & Investments', 'c', 0.62, [0.7, 0.1, 0.1, 0.1]],
+        ['FPINV', 'Households with a self-directed investing account', 'Savings & Investments', 'c', 0.19, [0.9, -0.4, 0.6, -0.1]],
+        ['FPX104', '', '', 'u', 0.12, [0.3, 0, 0, 0]],
+        ['FPX105', '', '', 'u', 0.07, [-0.4, 0.2, 0, 0]]
+      ]],
+      ['FINANCIAL_PRODUCTS_FSALDU_P3_2025', [
+        ['FPBASHHD', 'Total Households (financial products base)', 'Household Base', 'b', 'hhd'],
+        ['FPPREM', 'Households with a premium travel credit card', 'Credit Cards', 'c', 0.21, [1.2, 0, 0.6, 0]],
+        ['FPROBO', 'Households using a robo-advisor', 'Savings & Investments', 'c', 0.06, [0.6, -0.9, 0.8, -0.1]],
+        ['FPCCBAL', 'Average household credit card balance', 'Credit Cards', 'm', 4300, [0.1, -0.2, 0, 0.6]]
+      ]]
+    ]},
+    { tab: 'Wealth', base: 'WLHHDTOT', base_hhd: 'WLHHDTOT', unit: 'hhd', tables: [
+      ['WEALTH_FSALDU_2025', [
+        ['WLHHDTOT', 'Total Households (wealth base)', 'Household Base', 'b', 'hhd'],
+        ['WLNW', 'Average household net worth', 'Net Worth', 'm', 890000, [1.3, 0.8, -0.1, 0.2]],
+        ['WLMIL', 'Households with net worth of $1 million or more', 'Net Worth', 'c', 0.24, [1.4, 0.8, 0, 0.1]],
+        ['WLLIQ', 'Average household liquid assets', 'Assets', 'm', 185000, [1.2, 0.7, 0.1, -0.1]],
+        ['WLDEBT', 'Average household total debt', 'Liabilities', 'm', 168000, [0.5, -0.5, 0, 0.8]],
+        ['WLINV', 'Median household investment income', 'Annual Cash Flow', 'm', 3200, [1.2, 0.8, 0, -0.1]],
+        ['WLSAV', 'Savings rate (percentage of disposable income)', 'Annual Cash Flow', 'm', 6.5, [0.9, 0.4, 0, -0.3]]
+      ]]
+    ]}
+  ];
+  var DATASET_BY_TAB = {};
+  var SRC_TABLES = {};   // table name -> {ds, specs}
+  var LABELS = {};       // the "taxonomy": VAR -> {description, category, order}
+  DATASETS.forEach(function (ds) {
+    DATASET_BY_TAB[ds.tab] = ds;
+    ds.tables.forEach(function (t) {
+      SRC_TABLES[t[0]] = { ds: ds, specs: t[1] };
+      t[1].forEach(function (s) {
+        if (s[3] === 'u' || LABELS[s[0]]) return;
+        LABELS[s[0]] = { description: s[1], category: s[2], order: Object.keys(LABELS).length };
+      });
+    });
+  });
+
+  // Column values for one source table, generated lazily and cached.
+  var colCache = {};
+  function srcColumn(table, spec) {
+    var key = table + '.' + spec[0];
+    if (colCache[key]) return colCache[key];
+    var ds = SRC_TABLES[table].ds, kind = spec[3], out = new Array(N);
+    var r = Mock.rng('fsaldu-col-' + spec[0]);
+    for (var i = 0; i < N; i++) {
+      var u = U[i];
+      if (kind === 'b') out[i] = u[spec[4]];
+      else if (kind === 'e') out[i] = null;
+      else if (kind === 'm') {
+        var v = spec[4] * Math.exp(0.22 * dot(spec[5], u.lat) + Mock.gauss(0, 0.08, r));
+        out[i] = Mock.round(v, spec[4] < 20 ? 2 : 0);
+      } else {
+        var desc = spec[1] || '';
+        var unit = /household|dwelling/i.test(desc) ? u.hhd : /^workers/i.test(desc) ? Math.round(u.pop * 0.55)
+          : u[ds.unit];
+        var share = sigmoid(logit(spec[4]) + 0.55 * dot(spec[5], u.lat) + Mock.gauss(0, 0.15, r));
+        out[i] = Math.round(unit * share);
+      }
+    }
+    colCache[key] = out;
+    return out;
+  }
+
+  // ── warehouse catalogue (audience side) ───────────────────────────────────
+  function sampleCodes(n, skew, seed) {
+    var r = Mock.rng(seed);
+    var w = U.map(function (u) { return u.pop * Math.exp(dot(skew, u.lat)); });
+    var cum = [], s = 0;
+    w.forEach(function (x) { s += x; cum.push(s); });
+    var out = [];
+    for (var k = 0; k < n; k++) {
+      var x = r() * s, lo = 0, hi = N - 1;
+      while (lo < hi) { var mid = (lo + hi) >> 1; if (cum[mid] < x) lo = mid + 1; else hi = mid; }
+      out.push(U[lo].code);
+    }
+    return out;
+  }
+  var OUT_OF_AREA = ['H2X1Y4', 'V6B3K9', 'T2P0L5', 'R3C4T3', 'B3H1A2', 'G1R2J6', 'S4P3Y2', 'E1C4M3'];
+  var TIERS = ['Bronze', 'Silver', 'Gold', 'Platinum'];
+  var CLIENT = {};   // 'DB.SCHEMA' -> {TABLE: {cols:[[name,type]], rows: fn}}
+  function lazy(fn) { var v; return function () { return v || (v = fn()); }; }
+
+  CLIENT['DEMO_WAREHOUSE.CLIENT_DATA'] = {
+    CLIENT_CRM_CUSTOMERS: {
+      cols: [['CUSTOMER_ID', 'NUMBER'], ['FIRST_PURCHASE_DATE', 'DATE'], ['POSTAL_CODE', 'TEXT'],
+             ['LOYALTY_TIER', 'TEXT'], ['LIFETIME_VALUE', 'NUMBER']],
+      rows: lazy(function () {
+        var r = Mock.rng('crm-rows'), codes = sampleCodes(1500, [1.0, 0.3, 0.2, 0.1], 'crm-codes');
+        return codes.map(function (c, i) {
+          var x = r(), pc;
+          if (x < 0.03) pc = null;
+          else if (x < 0.06) pc = fmtCode(Mock.pick(OUT_OF_AREA, r));
+          else if (x < 0.58) pc = fmtCode(c);
+          else if (x < 0.83) pc = c;
+          else if (x < 0.94) pc = fmtCode(c).toLowerCase();
+          else pc = c.slice(0, 3) + '-' + c.slice(3);
+          var d = new Date(2019, 0, 1 + Mock.randInt(0, 2400, r));
+          return { CUSTOMER_ID: 100000 + i * 7 + Mock.randInt(0, 6, r), FIRST_PURCHASE_DATE: d.toISOString().slice(0, 10),
+                   POSTAL_CODE: pc, LOYALTY_TIER: Mock.pick(TIERS, r), LIFETIME_VALUE: Mock.round(Mock.randFloat(40, 4200, r), 2) };
+        });
+      })
+    },
+    LOYALTY_APP_USERS: {
+      cols: [['USER_ID', 'TEXT'], ['PC6', 'TEXT'], ['SIGNUP_CHANNEL', 'TEXT'], ['APP_SESSIONS_90D', 'NUMBER']],
+      rows: lazy(function () {
+        var r = Mock.rng('app-rows'), codes = sampleCodes(900, [0.2, -1.0, 0.8, -0.2], 'app-codes');
+        return codes.map(function (c, i) {
+          return { USER_ID: 'U' + (500000 + i * 13).toString(36).toUpperCase(), PC6: c,
+                   SIGNUP_CHANNEL: Mock.pick(['iOS', 'Android', 'Web', 'In-store QR'], r), APP_SESSIONS_90D: Mock.randInt(1, 140, r) };
+        });
+      })
+    },
+    EMAIL_SUBSCRIBERS_FSA: {
+      cols: [['SUBSCRIBER_ID', 'NUMBER'], ['FSA', 'TEXT'], ['OPT_IN_DATE', 'DATE']],
+      rows: lazy(function () {
+        var r = Mock.rng('email-rows'), codes = sampleCodes(600, [0.4, 0.5, -0.3, 0.6], 'email-codes');
+        return codes.map(function (c, i) {
+          return { SUBSCRIBER_ID: 700000 + i, FSA: c.slice(0, 3),
+                   OPT_IN_DATE: new Date(2021, 0, 1 + Mock.randInt(0, 1600, r)).toISOString().slice(0, 10) };
+        });
+      })
+    }
+  };
+  CLIENT['DEMO_WAREHOUSE.PUBLIC'] = {
+    CAMPAIGN_CALENDAR: {
+      cols: [['CAMPAIGN_ID', 'NUMBER'], ['CAMPAIGN_NAME', 'TEXT'], ['START_DATE', 'DATE'], ['END_DATE', 'DATE']],
+      rows: lazy(function () {
+        return ['Spring Refresh', 'Summer Kickoff', 'Back to School', 'Holiday Glow', 'New Year Reset'].map(function (nm, i) {
+          return { CAMPAIGN_ID: i + 1, CAMPAIGN_NAME: nm, START_DATE: '2026-0' + (i + 1) + '-01', END_DATE: '2026-0' + (i + 2) + '-15' };
+        });
+      })
+    }
+  };
+  CLIENT['SANDBOX.SCRATCH'] = {
+    AUDIENCE_TEST_2025: {
+      cols: [['RECORD_ID', 'NUMBER'], ['POSTAL_CODE', 'TEXT'], ['SCORE', 'NUMBER']],
+      rows: lazy(function () {
+        var r = Mock.rng('sandbox-rows'), codes = sampleCodes(320, [1.2, 0.1, -0.3, 0.6], 'sandbox-codes');
+        return codes.map(function (c, i) { return { RECORD_ID: i + 1, POSTAL_CODE: fmtCode(c), SCORE: Mock.round(r(), 3) }; });
+      })
+    }
+  };
+  // Company schema: the dataset tables plus the lifestyle-cluster assignment.
+  var company = {};
+  Object.keys(SRC_TABLES).forEach(function (t) {
+    var specs = SRC_TABLES[t].specs;
+    company[t] = {
+      cols: [['CODE', 'TEXT'], ['GEO', 'TEXT'], ['PROV', 'TEXT']].concat(specs.map(function (s) { return [s[0], 'NUMBER']; })),
+      value: function (col) {
+        if (col === 'CODE') return U.map(function (u) { return u.code; });
+        if (col === 'GEO') return U.map(function () { return GEO_LEVEL; });
+        if (col === 'PROV') return U.map(function (u) { return fsaProvince(u.fsa); });
+        var sp = specs.filter(function (s) { return s[0] === col; })[0];
+        return srcColumn(t, sp);
+      }
+    };
+  });
+  company[CLUSTER_TABLE] = {
+    cols: [['CODE', 'TEXT'], ['FSA', 'TEXT'], ['CLUSTER_NAME', 'TEXT'], ['SOCIAL_GROUP', 'TEXT'], ['LIFESTAGE', 'TEXT']],
+    value: function (col) {
+      return U.map(function (u) {
+        var c = CLUSTERS[u.cluster];
+        return { CODE: u.code, FSA: u.fsa, CLUSTER_NAME: c[0], SOCIAL_GROUP: c[1], LIFESTAGE: c[2] }[col];
+      });
+    }
+  };
+  CLIENT[SRC_DB + '.' + SRC_SCHEMA] = company;
+
+  function findTable(db, schema, table) {
+    var s = CLIENT[db + '.' + schema];
+    return s ? s[table] || null : null;
+  }
+  function columnValues(t, col) {
+    if (t.value) return t.value(col);
+    return t.rows().map(function (r) { return r[col] == null ? null : r[col]; });
+  }
+  function tableRowCount(t) { return t.value ? N : t.rows().length; }
+
+  // ── geography ─────────────────────────────────────────────────────────────
+  function resolveGeo(provinces, cities) {
+    provinces = (provinces || []).filter(function (p) { return p && String(p).trim(); }).map(function (p) { return String(p).trim().toUpperCase(); });
+    cities = (cities || []).filter(function (c) { return c && String(c).trim(); }).map(function (c) { return String(c).trim().toUpperCase(); });
+    if (!provinces.length && !cities.length) return null;
+    var keep = [];
+    Mock.fsaList.forEach(function (f) {
+      var fsa = String(f.FSA).trim().toUpperCase();
+      if (provinces.length && provinces.indexOf(fsaProvince(fsa).toUpperCase()) < 0) return;
+      if (cities.length && cities.indexOf(String(f.CITY || '').trim().toUpperCase()) < 0) return;
+      keep.push(fsa);
+    });
+    if (!keep.length) {
+      throw BadInput('That province/city combination matches no FSAs' +
+        (provinces.length ? ' (provinces: ' + provinces.join(', ') + ')' : '') +
+        (cities.length ? ' (cities: ' + cities.join(', ') + ')' : '') + '. Widen the filter or clear it.');
+    }
+    return Array.from(new Set(keep)).sort();
+  }
+
+  function resolveClusters(level, values, fsaPrefixes) {
+    var li = CLUSTER_LEVELS[level];
+    if (li == null) throw BadInput("Unknown lifestyle cluster level: '" + level + "'");
+    var wanted = (values || []).map(String).filter(function (v) { return v.trim(); });
+    if (!wanted.length) throw BadInput('Select at least one lifestyle cluster value.');
+    var fs = fsaPrefixes ? new Set(fsaPrefixes) : null;
+    return U.filter(function (u) {
+      return wanted.indexOf(CLUSTERS[u.cluster][li]) >= 0 && (!fs || fs.has(u.fsa));
+    }).map(function (u) { return u.code; });
+  }
+
+  // ── traits / classification (same rules as the blueprint) ─────────────────
+  var NONSUMMABLE_RE = /(^|[^a-z])(average|avg|median|rate|percentage|percent)(?![a-z])/i;
+  var HOUSEHOLD_UNIT_RE = /(^|[^a-z])(household|households|maintainer|dwelling|dwellings|family|families)(?![a-z])/i;
+  function classify(v, desc, base, baseHhd) {
+    if (v === base || v === baseHhd || !NONSUMMABLE_RE.test(desc || '')) return ['count', base];
+    return ['mean', HOUSEHOLD_UNIT_RE.test(desc || '') ? baseHhd : base];
+  }
+  function buildTraits(table) {
+    var info = SRC_TABLES[table], ds = info.ds;
+    var cols = info.specs.map(function (s) { return s[0]; });
+    if (cols.indexOf(ds.base) < 0) return [];
+    var baseHhd = cols.indexOf(ds.base_hhd) >= 0 ? ds.base_hhd : ds.base;
+    return info.specs.map(function (s) {
+      var meta = LABELS[s[0]];
+      var desc = (meta && meta.description) || s[0];
+      var cat = (meta && meta.category) || 'Unclassified';
+      var k = classify(s[0], desc, ds.base, baseHhd);
+      return { variable: s[0], description: desc, category: cat, kind: k[0], base: k[1],
+               unlabelled: !meta, order: meta ? meta.order : 1e9, spec: s };
+    });
+  }
+
+  // Row weights for one pass: multiplicity of each FSALDU in the join.
+  function selWeights(sel) {
+    var w = new Float64Array(N), i;
+    if (sel.audience) {
+      var a = sel.audience, t = findTable(a.db, a.schema, a.table);
+      if (!t) throw new Error("SQL compilation error: Object '" + a.db + '.' + a.schema + '.' + a.table + "' does not exist or not authorized.");
+      columnValues(t, a.column).forEach(function (v) {
+        if (v == null) return;
+        var k = a.normalize ? normKey(v) : String(v);
+        var ix = CODE_IDX[k];
+        if (ix == null) return;
+        w[ix] = a.unique ? 1 : w[ix] + 1;
+      });
+    } else for (i = 0; i < N; i++) w[i] = 1;
+    if (sel.codes) {
+      var cs = new Set(sel.codes);
+      for (i = 0; i < N; i++) if (!cs.has(U[i].code)) w[i] = 0;
+    }
+    if (sel.fsa) {
+      var fs = new Set(sel.fsa);
+      for (i = 0; i < N; i++) if (!fs.has(U[i].fsa)) w[i] = 0;
+    }
+    return w;
+  }
+
+  // One row of sums: SUM(trait) for counts, SUM(trait * base) for weighted means.
+  // SUM over no rows / all-NULL is NULL, as in SQL.
+  function aggregateTable(table, traits, sel) {
+    var w = selWeights(sel), out = {}, rows = 0, i;
+    for (i = 0; i < N; i++) rows += w[i];
+    var colsBy = {};
+    SRC_TABLES[table].specs.forEach(function (s) { colsBy[s[0]] = s; });
+    traits.forEach(function (t) {
+      var v = srcColumn(table, t.spec), b = t.kind === 'mean' ? srcColumn(table, colsBy[t.base]) : null, s = null;
+      for (i = 0; i < N; i++) {
+        if (!w[i] || v[i] == null) continue;
+        if (b && b[i] == null) continue;
+        s = (s || 0) + w[i] * (b ? v[i] * b[i] : v[i]);
+      }
+      out[t.variable] = s;
+    });
+    out._ROWS = rows;
+    return out;
+  }
+  function resolveAgg(agg, traits) {
+    var out = {};
+    traits.forEach(function (t) {
+      var raw = agg[t.variable];
+      if (t.kind === 'count') { out[t.variable] = raw; return; }
+      var bt = agg[t.base];
+      out[t.variable] = (raw != null && bt) ? raw / bt : null;
+    });
+    return out;
+  }
+
+  function audienceFrom(d) {
+    var a = { db: d.database || '', schema: d.schema || '', table: d.table || '', column: d.column || '',
+              normalize: d.normalize == null ? true : !!d.normalize, unique: !!d.unique_fsaldu };
+    checkIdent([['database', a.db], ['schema', a.schema], ['table', a.table], ['key column', a.column]]);
+    return a;
+  }
+
+  function selectionFrom(d) {
+    var mode = d.mode || 'audience', geo = d.geo || {};
+    var fsa = resolveGeo(geo.provinces, geo.cities);
+    var scoped = (geo.baseline || 'scoped') === 'scoped';
+    var audSel = { fsa: fsa }, natSel = { fsa: scoped ? fsa : null }, desc;
+    if (mode === 'cluster') {
+      var level = d.level || 'Segment', values = d.values || [];
+      var codes = resolveClusters(level, values, fsa);
+      if (!codes.length) throw BadInput('That lifestyle cluster selection resolves to no postal codes — ' +
+        'widen the province/city filter or pick another segment.');
+      audSel.codes = codes;
+      desc = { source: 'Lifestyle cluster ' + level + ': ' + values.join(', '), table: 'Clusters ' + level,
+               detail: codes.length.toLocaleString() + ' postal codes',
+               weighting: 'One row per postal code — each FSALDU is assigned to one lifestyle cluster' };
+    } else {
+      var a = audienceFrom(d);
+      audSel.audience = a;
+      desc = { source: a.db + '.' + a.schema + '.' + a.table, table: a.table,
+               detail: 'key ' + a.column + (a.normalize ? ', normalized' : ', matched as stored'),
+               weighting: !a.unique ? 'One row per audience record — profile weighted by where the audience concentrates'
+                                    : 'Distinct FSALDU — each matched postal code counted once' };
+    }
+    desc.geography = fsa == null ? 'All of Canada' : fsa.length + ' FSAs — ' + [
+      (geo.provinces || []).length ? 'provinces: ' + geo.provinces.join(', ') : '',
+      (geo.cities || []).length ? 'cities: ' + geo.cities.join(', ') : ''
+    ].filter(Boolean).join(', ');
+    desc.baseline = (fsa && scoped) ? 'Same geography as the audience' : 'All of Canada';
+    return { aud: audSel, nat: natSel, desc: desc };
+  }
+
+  // ── routes: connection ────────────────────────────────────────────────────
+  Mock.route('GET', P + '/status', function () {
+    return {
+      configured: true, account: 'demo-account.ca-central-1', default_user: 'demo.user@example.com',
+      warehouse: 'DEMO_WH', role: 'ANALYST', last_error: null,
+      connected: session.connected, geo_level: GEO_LEVEL, geo_key: SRC_KEY, source: SRC_DB + '.' + SRC_SCHEMA,
+      datasets: DATASETS.map(function (d) {
+        return { tab: d.tab, tables: d.tables.map(function (t) { return t[0]; }), parts: d.tables.length, base: d.base };
+      })
+    };
+  }, { latency: [80, 200] });
+
+  Mock.route('POST', P + '/connect', handle(async function (req) {
+    var d = req.json || {};
+    if (!String(d.user || '').trim()) throw BadInput('Enter your warehouse login email first.');
+    if (!String(d.warehouse || '').trim()) throw BadInput('Enter a warehouse name first — none is set in the config.');
+    await Mock.delay(700, 1200);
+    session.connected = true; st.set('connected', true);
+    return { ok: true };
+  }));
+  Mock.route('POST', P + '/disconnect', function () {
+    session.connected = false; st.set('connected', false);
+    return { ok: true };
+  });
+
+  // ── routes: catalogue ─────────────────────────────────────────────────────
+  Mock.route('GET', P + '/databases', handle(function () {
+    requireConn();
+    var dbs = {};
+    Object.keys(CLIENT).forEach(function (k) { dbs[k.split('.')[0]] = 1; });
+    return { databases: Object.keys(dbs).sort() };
+  }));
+  Mock.route('GET', P + '/schemas', handle(function (req) {
+    var db = req.query.database || '';
+    checkIdent([['database', db]]);
+    requireConn();
+    var out = Object.keys(CLIENT).filter(function (k) { return k.split('.')[0] === db; }).map(function (k) { return k.split('.')[1]; });
+    if (!out.length) throw new Error("SQL compilation error: Database '" + db + "' does not exist or not authorized.");
+    return { schemas: out.concat(['INFORMATION_SCHEMA']).sort() };
+  }));
+  Mock.route('GET', P + '/tables', handle(function (req) {
+    var db = req.query.database || '', schema = req.query.schema || '';
+    checkIdent([['database', db], ['schema', schema]]);
+    requireConn();
+    var s = CLIENT[db + '.' + schema] || {};
+    return { tables: Object.keys(s).sort().map(function (t) { return { name: t, rows: tableRowCount(s[t]) }; }) };
+  }));
+  Mock.route('GET', P + '/columns', handle(function (req) {
+    var db = req.query.database || '', schema = req.query.schema || '', table = req.query.table || '';
+    checkIdent([['database', db], ['schema', schema], ['table', table]]);
+    requireConn();
+    var t = findTable(db, schema, table);
+    var rows = t ? t.cols.map(function (c) { return { name: c[0], type: c[1] }; }) : [];
+    if (!rows.length) return Mock.json({ error: db + '.' + schema + '.' + table + ' has no columns visible to this role.' }, 404);
+    var likely = rows.filter(function (r) {
+      return ['CODE', 'FSALDU', 'POSTAL_CODE', 'POSTALCODE', 'PC6', 'POSTAL'].indexOf(r.name.toUpperCase()) >= 0;
+    })[0];
+    return { columns: rows, suggested_key: likely ? likely.name : null };
+  }));
+
+  Mock.route('GET', P + '/geo-filters', function () {
+    var prov = {}, city = {};
+    Mock.fsaList.forEach(function (f) {
+      var p = fsaProvince(f.FSA); if (p) prov[p] = 1;
+      if (f.CITY && String(f.CITY).trim()) city[String(f.CITY).trim()] = 1;
+    });
+    return { provinces: Object.keys(prov).sort(), cities: Object.keys(city).sort() };
+  });
+
+  // ── routes: lifestyle clusters ────────────────────────────────────────────
+  Mock.route('GET', P + '/cluster/levels', function () {
+    var values = {};
+    Object.keys(CLUSTER_LEVELS).forEach(function (level) {
+      var li = CLUSTER_LEVELS[level], counts = {};
+      U.forEach(function (u) { var v = CLUSTERS[u.cluster][li]; counts[v] = (counts[v] || 0) + 1; });
+      values[level] = Object.keys(counts).sort().map(function (v) { return { value: v, count: counts[v] }; });
+    });
+    return { levels: Object.keys(CLUSTER_LEVELS), values: values, total_fsaldu: N };
+  });
+  Mock.route('POST', P + '/cluster/resolve', handle(function (req) {
+    var d = req.json || {}, geo = d.geo || {};
+    var fsa = resolveGeo(geo.provinces, geo.cities);
+    var codes = resolveClusters(d.level || 'Segment', d.values, fsa);
+    var unfiltered = resolveClusters(d.level || 'Segment', d.values, null).length;
+    return { codes: codes.length, codes_before_geo: unfiltered, fsa_in_filter: fsa ? fsa.length : null,
+             chunks: Math.max(1, Math.ceil(codes.length / CODES_PER_QUERY)), total_fsaldu: N };
+  }));
+
+  // ── routes: join check ────────────────────────────────────────────────────
+  Mock.route('POST', P + '/precheck', handle(async function (req) {
+    var d = req.json || {};
+    var a = audienceFrom(d);
+    requireConn();
+    var t = findTable(a.db, a.schema, a.table);
+    if (!t) throw new Error("SQL compilation error: Object '" + a.db + '.' + a.schema + '.' + a.table + "' does not exist or not authorized.");
+    if (!t.cols.some(function (c) { return c[0] === a.column; })) throw new Error("SQL compilation error: invalid identifier '\"" + a.column + "\"'");
+    await Mock.delay(400, 900);
+    var probe = DATASETS[0].tables[0][0];
+    var geo = d.geo || {};
+    var fsa = resolveGeo(geo.provinces, geo.cities);
+    var fs = fsa ? new Set(fsa) : null;
+    var inSrc = {}, sRows = 0;
+    U.forEach(function (u) { if (!fs || fs.has(u.fsa)) { inSrc[u.code] = 1; sRows++; } });
+
+    var vals = columnValues(t, a.column);
+    var nonNull = vals.filter(function (v) { return v != null; });
+    var lens = nonNull.map(function (v) { return String(v).length; });
+    var match = {};
+    [['raw', false], ['normalized', true]].forEach(function (p) {
+      var rows = 0, keys = {};
+      nonNull.forEach(function (v) {
+        var k = p[1] ? normKey(v) : String(v);
+        if (inSrc[k]) { rows++; keys[k] = 1; }
+      });
+      match[p[0]] = { rows: rows, distinct_fsaldu: Object.keys(keys).length, pct: vals.length ? rows / vals.length * 100 : 0 };
+    });
+    return {
+      probe_table: probe, probe_has_geo: true, fsa_in_filter: fsa ? fsa.length : null,
+      source: { rows: sRows, distinct_keys: sRows, fanout: sRows ? 1 : null, key_len: [6, 6] },
+      audience: { rows: vals.length, non_null_keys: nonNull.length, distinct_keys: new Set(nonNull.map(String)).size,
+                  key_len: lens.length ? [Math.min.apply(null, lens), Math.max.apply(null, lens)] : [null, null],
+                  samples: nonNull.slice(0, 5).map(String) },
+      match: match
+    };
+  }));
+
+  // ── routes: dataset availability ──────────────────────────────────────────
+  Mock.route('POST', P + '/inspect', handle(async function (req) {
+    var d = req.json || {};
+    var tabs = (d.tabs && d.tabs.length) ? d.tabs : DATASETS.map(function (x) { return x.tab; });
+    tabs.forEach(function (tab) { if (!DATASET_BY_TAB[tab]) throw BadInput("Unknown dataset tab: '" + tab + "'"); });
+    requireConn();
+    await Mock.delay(300 + 150 * tabs.length, 500 + 200 * tabs.length);
+    return { datasets: tabs.map(function (tab) {
+      var ds = DATASET_BY_TAB[tab];
+      var info = { tab: tab, base: ds.base, parts: [], traits: 0, populated: 0, empty: 0, unlabelled: 0,
+                   missing_tables: [], base_present: false };
+      ds.tables.forEach(function (tt) {
+        var table = tt[0], traits = buildTraits(table);
+        if (!traits.length) { info.parts.push({ table: table, traits: 0, populated: 0, has_geo: true, note: 'base column absent' }); return; }
+        info.base_present = true;
+        var agg = aggregateTable(table, traits, {});
+        var pop = traits.filter(function (t) { return agg[t.variable] != null; }).length;
+        info.parts.push({ table: table, traits: traits.length, populated: pop, empty: traits.length - pop, rows: agg._ROWS, has_geo: true });
+        info.traits += traits.length; info.populated += pop; info.empty += traits.length - pop;
+        info.unlabelled += traits.filter(function (t) { return t.unlabelled; }).length;
+      });
+      return info;
+    }) };
+  }));
+
+  // ── report job (simulated background worker) ──────────────────────────────
+  var jobs = {}, jobOrder = [];
+  function newJobId() { return Math.random().toString(16).slice(2, 14).padEnd(12, '0'); }
+
+  Mock.route('POST', P + '/report/start', handle(function (req) {
+    var d = req.json || {};
+    var tabs = (d.tabs && d.tabs.length) ? d.tabs : ['Demographics'];
+    tabs.forEach(function (tab) { if (!DATASET_BY_TAB[tab]) throw BadInput("Unknown dataset tab: '" + tab + "'"); });
+    var s = selectionFrom(d);
+    var label = String(d.label || 'Audience').trim() || 'Audience';
+    var slim = (d.report_style || 'full') === 'index_pct';
+    requireConn();
+
+    var steps = tabs.reduce(function (acc, t) { return acc + DATASET_BY_TAB[t].tables.length * 3; }, 0) + 1;
+    // Run the whole computation now, recording progress events against a
+    // timeline so the polling UI plays back like the real worker.
+    var evs = [], t = 0, r = Mock.rng('job-' + Date.now());
+    function ev(current, done, note, ms) { t += ms || 0; evs.push({ t: t, current: current, done: done, note: note }); }
+    var results = [];
+    tabs.forEach(function (tab) {
+      var ds = DATASET_BY_TAB[tab], merged = [], nat = {}, aud = {}, parts = [], notes = [];
+      ds.tables.forEach(function (tt) {
+        var table = tt[0];
+        ev(tab + ': reading ' + table + ' columns');
+        ev(null, true, null, Mock.randInt(180, 320, r));
+        var traits = buildTraits(table);
+        if (!traits.length) {
+          notes.push(table + ': base column ' + ds.base + ' absent — skipped.');
+          ev(null, true); ev(null, true); return;
+        }
+        ev(tab + ': baseline totals from ' + table + ' (' + traits.length + ' traits)');
+        var nAgg = aggregateTable(table, traits, s.nat);
+        ev(null, true, null, Mock.randInt(350, 600, r));
+        ev(tab + ': audience totals from ' + table);
+        var aAgg = aggregateTable(table, traits, s.aud);
+        ev(null, true, null, Mock.randInt(300, 550, r));
+        var live = traits.filter(function (x) { return nAgg[x.variable] != null; });
+        var dropped = traits.length - live.length;
+        if (dropped) notes.push(table + ': ' + dropped + ' of ' + traits.length + ' traits are empty at ' + GEO_LEVEL + ' level and were excluded.');
+        merged = merged.concat(live);
+        Object.assign(nat, resolveAgg(nAgg, live));
+        Object.assign(aud, resolveAgg(aAgg, live));
+        parts.push([table, nAgg._ROWS, aAgg._ROWS]);
+        ev(null, false, tab + ' / ' + table + ': ' + live.length + ' traits, ' + aAgg._ROWS.toLocaleString() + ' matched rows');
+      });
+      merged.sort(function (x, y) { return (x.order - y.order) || (x.variable < y.variable ? -1 : 1); });
+      results.push({ tab: tab, ds: ds, traits: merged, nat: nat, aud: aud, parts: parts,
+                     notes: merged.length ? notes : (notes.length ? notes : ['No usable traits.']) });
+    });
+    ev('Building workbook', false, null, 150);
+
+    var id = newJobId();
+    jobs[id] = { status: 'running', step: 0, total: steps, current: 'Starting…', log: [], error: null,
+                 xlsx: null, filename: null, started: Date.now(), evs: evs, applied: 0, endT: t + 500,
+                 building: null, label: label, slim: slim, desc: s.desc, results: results };
+    jobOrder.push(id);
+    while (jobOrder.length > 6) delete jobs[jobOrder.shift()];
+    return { job_id: id, total: steps, codes: (s.aud.codes || []).length || null };
+  }));
+
+  async function advance(j) {
+    if (j.status !== 'running') return;
+    var el = Date.now() - j.started;
+    while (j.applied < j.evs.length && j.evs[j.applied].t <= el) {
+      var e = j.evs[j.applied++];
+      if (e.done) j.step++;
+      if (e.current != null) j.current = e.current;
+      if (e.note) j.log.push(e.note);
+    }
+    if (j.applied >= j.evs.length && el >= j.endT) {
+      if (!j.building) j.building = buildWorkbook(j);
+      try {
+        var blob = await j.building;
+        if (j.status !== 'running') return;
+        j.step++;
+        j.xlsx = blob;
+        var safe = j.label.split('').filter(function (c) { return /[A-Za-z0-9 _-]/.test(c); }).join('').trim().replace(/ /g, '_');
+        var tag = j.desc.table.split('').filter(function (c) { return /[A-Za-z0-9_-]/.test(c); }).join('');
+        j.filename = 'fsaldu_' + (safe || 'audience') + '_' + tag + '.xlsx';
+        j.preview = previewRows(j.results);
+        j.status = 'done'; j.current = 'Ready';
+      } catch (e) {
+        j.status = 'error'; j.error = (e.name || 'Error') + ': ' + e.message; j.current = 'Failed';
+      }
+    }
+  }
+
+  Mock.route('GET', P + '/report/progress', async function (req) {
+    var j = jobs[req.query.job_id || ''];
+    if (!j) return Mock.json({ error: 'That job has expired — start the report again.' }, 404);
+    await advance(j);
+    return { status: j.status, step: j.step, total: j.total, current: j.current, log: j.log.slice(-40),
+             error: j.error, elapsed: Mock.round((Date.now() - j.started) / 1000, 1), ready: j.xlsx != null, preview: j.status === 'done' ? j.preview : null };
+  }, { latency: [40, 120] });
+
+  Mock.route('POST', P + '/report/cancel', function (req) {
+    var j = jobs[(req.json || {}).job_id || ''];
+    if (!j) return Mock.json({ error: 'That job has expired.' }, 404);
+    if (j.status === 'running') j.status = 'cancelled';
+    return { ok: true };
+  });
+
+  Mock.route('GET', P + '/report/download', function (req) {
+    var j = jobs[req.query.job_id || ''];
+    if (!j) return Mock.json({ error: 'That job has expired — start the report again.' }, 404);
+    if (j.xlsx == null) return Mock.json({ error: 'Not finished yet (status: ' + j.status + ').' }, 409);
+    return Mock.file(j.xlsx, j.filename);
+  });
+
+  // On-screen preview: the ten traits that differ most from the baseline.
+  function previewRows(results) {
+    var rows = [];
+    results.forEach(function (res) {
+      res.traits.forEach(function (t) {
+        var v = t.variable, np, ap;
+        if (v === res.ds.base || v === res.ds.base_hhd) return;
+        if (t.kind === 'count') {
+          var nb = res.nat[t.base], ab = res.aud[t.base];
+          np = (res.nat[v] != null && nb) ? res.nat[v] / nb * 100 : null;
+          ap = (res.aud[v] != null && ab) ? res.aud[v] / ab * 100 : null;
+        } else { np = res.nat[v]; ap = res.aud[v]; }
+        if (np == null || ap == null || !np) return;
+        rows.push({ tab: res.tab, variable: v, description: t.description, nat: np, aud: ap, index: Mock.round(ap / np * 100, 1), kind: t.kind });
+      });
+    });
+    rows.sort(function (a, b) { return Math.abs(b.index - 100) - Math.abs(a.index - 100); });
+    return rows.slice(0, 10);
+  }
+
+  // ── workbook (same sheets / layout as the openpyxl writer) ────────────────
+  async function buildWorkbook(j) {
+    var X = await Mock.loadXLSX();
+    var wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, summarySheet(X, j.label, j.desc, j.results), 'Summary');
+    j.results.forEach(function (r) {
+      if (r.traits.length) X.utils.book_append_sheet(wb, traitSheet(X, j.label, j.slim, r), r.tab.slice(0, 31));
+    });
+    var out = X.write(wb, { bookType: 'xlsx', type: 'array' });
+    return new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+
+  function summarySheet(X, label, desc, results) {
+    var aoa = [['FSALDU Audience Analysis Report'], []];
+    [['Audience label', label], ['Audience source', desc.source], ['Selection detail', desc.detail],
+     ['Geography filter', desc.geography], ['Baseline compared against', desc.baseline],
+     ['Demographic source', SRC_DB + '.' + SRC_SCHEMA + ' (GEO = ' + GEO_LEVEL + ', key ' + SRC_KEY + ')'],
+     ['Weighting', desc.weighting],
+     ['Index reading', '100 = same composition as the baseline; >120 over-indexed, <80 under-indexed']
+    ].forEach(function (r) { aoa.push(r); });
+    aoa.push([]);
+    aoa.push(['Datasets']);
+    aoa.push(['Tab', 'Base', 'Traits reported', 'Part tables', 'Matched rows']);
+    results.forEach(function (res) {
+      var counts = res.traits.filter(function (t) { return t.kind === 'count'; }).length;
+      aoa.push([res.tab, res.ds.base, res.traits.length + ' (' + counts + ' summed, ' + (res.traits.length - counts) + ' weighted means)',
+                res.parts.map(function (p) { return p[0]; }).join(', ') || '—',
+                res.parts.reduce(function (m, p) { return Math.max(m, p[2]); }, 0)]);
+    });
+    aoa.push([]);
+    aoa.push(['Notes']);
+    var any = false;
+    results.forEach(function (res) { res.notes.forEach(function (n) { aoa.push([res.tab, n]); any = true; }); });
+    if (!any) aoa.push(['None — every part table contributed in full.']);
+    var ws = X.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{ wch: 26 }, { wch: 88 }, { wch: 40 }, { wch: 40 }, { wch: 40 }];
+    return ws;
+  }
+
+  function traitSheet(X, label, slim, res) {
+    var headers, audStart, audLabels;
+    if (slim) {
+      headers = ['Category', 'Variable', 'Description', 'Base', 'Nat. %', label + ' %', 'Index'];
+      audStart = 6; audLabels = [label + ' %', 'Index'];
+    } else {
+      headers = ['Category', 'Variable', 'Description', 'Base', 'Nat. Value', 'Nat. %', label + ' Value', label + ' %', 'Index'];
+      audStart = 7; audLabels = [label + ' Value', label + ' %', 'Index'];
+    }
+    var ncols = headers.length;
+    var r1 = headers.map(function (h, i) { return i + 1 < audStart ? h : (i + 1 === audStart ? label : ''); });
+    var r2 = headers.map(function (h, i) { return i + 1 < audStart ? '' : audLabels[i + 1 - audStart]; });
+    var aoa = [r1, r2], fmts = [];
+    var prevCat = null;
+    res.traits.forEach(function (t) {
+      var v = t.variable, isCount = t.kind === 'count';
+      var natVal = res.nat[v], audVal = res.aud[v], natPct, audPct;
+      if (isCount) {
+        var nb = res.nat[t.base], ab = res.aud[t.base];
+        natPct = (natVal != null && nb) ? natVal / nb * 100 : null;
+        audPct = (audVal != null && ab) ? audVal / ab * 100 : null;
+      } else { natPct = natVal; audPct = audVal; }
+      var index = (natPct && audPct != null) ? Mock.round(audPct / natPct * 100, 1) : null;
+      if (t.category !== prevCat) {
+        var cr = new Array(ncols).fill(''); cr[0] = t.category; aoa.push(cr); prevCat = t.category;
+      }
+      var valFmt = isCount ? '#,##0' : '#,##0.00';
+      var row = [t.category, v, t.description, isCount ? t.base : t.base + ' (weighted mean)'];
+      var rowIdx = aoa.length;
+      function num(x, fmt, blank) {
+        if (x == null || isNaN(x)) return blank || 'N/A';
+        fmts.push([rowIdx, row.length, fmt]);
+        return x;
+      }
+      if (slim) {
+        row.push(num(natPct, isCount ? '0.00' : valFmt));
+        row.push(num(audPct, isCount ? '0.00' : valFmt));
+      } else {
+        row.push(num(natVal, valFmt));
+        row.push(num(isCount ? natPct : null, '0.00', '—'));
+        row.push(num(audVal, valFmt));
+        row.push(num(isCount ? audPct : null, '0.00', '—'));
+      }
+      if (index != null && !isNaN(index)) { fmts.push([rowIdx, row.length, '0.0']); row.push(index); }
+      else row.push('N/A');
+      aoa.push(row);
+    });
+    var ws = X.utils.aoa_to_sheet(aoa);
+    fmts.forEach(function (f) {
+      var c = ws[X.utils.encode_cell({ r: f[0], c: f[1] })];
+      if (c) c.z = f[2];
+    });
+    var merges = [];
+    for (var ci = 0; ci < audStart - 1; ci++) merges.push({ s: { r: 0, c: ci }, e: { r: 1, c: ci } });
+    merges.push({ s: { r: 0, c: audStart - 1 }, e: { r: 0, c: ncols - 1 } });
+    ws['!merges'] = merges;
+    ws['!cols'] = (slim ? [40, 14, 62, 24, 12, 14, 10] : [40, 14, 62, 24, 16, 10, 16, 12, 10]).map(function (w) { return { wch: w }; });
+    return ws;
+  }
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CA Geo Analysis — FSALDU Level</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html,body{min-height:100%;font-family:Helvetica,Arial,sans-serif;background:#0d0d2b;color:#f0eeff}
+  body::before{content:'';position:fixed;inset:0;z-index:0;
+    background:radial-gradient(ellipse 70% 55% at 12% 12%,rgba(45,212,191,0.20)0%,transparent 60%),
+      radial-gradient(ellipse 55% 45% at 88% 88%,rgba(91,79,207,0.18)0%,transparent 55%),
+      linear-gradient(160deg,#0d0d2b 0%,#131447 50%,#0d0d2b 100%)}
+  .wrap{position:relative;z-index:1;max-width:1080px;margin:0 auto;padding:36px 24px 80px}
+
+  a.back{display:inline-flex;align-items:center;gap:7px;text-decoration:none;color:#a5b4c8;
+    font-size:13px;margin-bottom:20px}
+  a.back:hover{color:#fff}
+
+  h1{font-size:1.75rem;font-weight:700;margin-bottom:16px}
+
+  .src{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:26px}
+  .chip{font-size:11.5px;letter-spacing:0.03em;padding:5px 11px;border-radius:20px;
+    background:rgba(45,212,191,0.10);border:1px solid rgba(45,212,191,0.30);color:#7fe6d8;
+    font-family:Consolas,Monaco,monospace}
+  .chip.muted{background:rgba(255,255,255,0.04);border-color:rgba(180,160,255,0.20);color:#b8b0d8}
+
+  .card{background:rgba(255,255,255,0.045);border:1px solid rgba(180,160,255,0.20);
+    border-radius:14px;padding:22px 24px;margin-bottom:18px}
+  .card.dim{opacity:0.45;pointer-events:none}
+  .step{display:flex;align-items:center;gap:11px;margin-bottom:18px}
+  .step-num{flex:0 0 auto;width:25px;height:25px;border-radius:50%;background:rgba(45,212,191,0.16);
+    border:1px solid rgba(45,212,191,0.40);color:#5fe3d1;font-size:12px;font-weight:700;
+    display:flex;align-items:center;justify-content:center}
+  .step-title{font-size:15px;font-weight:600}
+
+  label.fl{display:block;font-size:11px;letter-spacing:0.09em;text-transform:uppercase;
+    color:#a78bfa;font-weight:700;margin-bottom:6px}
+  .grid{display:grid;gap:14px}
+  .grid.c2{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+  .grid.c3{grid-template-columns:repeat(auto-fit,minmax(215px,1fr))}
+  .grid.c4{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+  .mt{margin-top:14px}
+
+  select,input[type=text]{width:100%;background:rgba(13,13,43,0.75);color:#f0eeff;
+    border:1px solid rgba(180,160,255,0.28);border-radius:8px;padding:9px 11px;
+    font-size:13.5px;font-family:inherit}
+  select[multiple]{padding:6px;height:186px}
+  select[multiple] option{padding:4px 7px;border-radius:4px}
+  select:focus,input[type=text]:focus{outline:none;border-color:#2dd4bf}
+  select:disabled{opacity:0.45}
+
+  /* source-mode switch */
+  .modes{display:inline-flex;background:rgba(13,13,43,0.6);border:1px solid rgba(180,160,255,0.22);
+    border-radius:10px;padding:3px;margin-bottom:18px}
+  .modes button{background:transparent;color:#b8b0d8;font-weight:600;font-size:13px;
+    padding:8px 18px;border-radius:8px;box-shadow:none}
+  .modes button:hover:not(.on){color:#f0eeff;transform:none;box-shadow:none}
+  .modes button.on{background:linear-gradient(135deg,#2dd4bf,#14a89a);color:#04231f}
+
+  .opts{display:flex;flex-direction:column;gap:11px;margin-top:16px}
+  .opt{display:flex;gap:10px;align-items:flex-start;cursor:pointer}
+  .opt input{margin-top:3px;flex:0 0 auto;accent-color:#2dd4bf}
+  .opt-body{font-size:13px;line-height:1.5}
+  .opt-body b{font-weight:600}
+  .opt-body span{display:block;color:#a49cc4;font-size:12px;margin-top:1px}
+
+  .ds-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(228px,1fr));gap:10px}
+  .ds{display:flex;gap:10px;align-items:flex-start;cursor:pointer;padding:11px 13px;border-radius:10px;
+    background:rgba(13,13,43,0.5);border:1px solid rgba(180,160,255,0.18)}
+  .ds:hover{border-color:rgba(45,212,191,0.45)}
+  .ds input{margin-top:2px;flex:0 0 auto;accent-color:#2dd4bf}
+  .ds-name{display:block;font-size:13.5px;font-weight:600}
+  .ds-meta{display:block;font-size:11.5px;color:#a49cc4;font-family:Consolas,Monaco,monospace;
+    margin-top:3px;word-break:break-all}
+  .ds-stat{display:block;font-size:11.5px;margin-top:5px}
+  .ds-stat:empty{display:none}
+  .ds-stat.good{color:#7fe6d8}
+  .ds-stat.warn{color:#fcd34d}
+
+  button{background:linear-gradient(135deg,#2dd4bf,#14a89a);color:#04231f;font-weight:700;
+    font-size:13.5px;padding:11px 22px;border:none;border-radius:9px;cursor:pointer;
+    font-family:inherit;transition:transform .15s,box-shadow .15s}
+  button:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 20px rgba(45,212,191,0.35)}
+  button:disabled{opacity:0.4;cursor:not-allowed;transform:none;box-shadow:none}
+  button.ghost{background:transparent;border:1px solid rgba(180,160,255,0.35);color:#d8d2f0}
+  button.small{font-size:12px;padding:7px 14px}
+  .btn-row{display:flex;gap:11px;flex-wrap:wrap;align-items:center;margin-top:18px}
+
+  .msg{margin-top:15px;padding:12px 15px;border-radius:9px;font-size:13px;line-height:1.6;display:none}
+  .msg.show{display:block}
+  .msg.err{background:rgba(220,38,38,0.12);border:1px solid rgba(248,113,113,0.40);color:#fca5a5}
+  .msg.ok{background:rgba(45,212,191,0.10);border:1px solid rgba(45,212,191,0.35);color:#7fe6d8}
+  .msg.warn{background:rgba(245,158,11,0.11);border:1px solid rgba(251,191,36,0.40);color:#fcd34d}
+  .msg.info{background:rgba(124,92,232,0.12);border:1px solid rgba(167,139,250,0.35);color:#c4b5fd}
+
+  table.stats{width:100%;border-collapse:collapse;margin-top:16px;font-size:12.5px}
+  table.stats th{text-align:left;font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;
+    color:#a78bfa;font-weight:700;padding:7px 10px;border-bottom:1px solid rgba(180,160,255,0.22)}
+  table.stats td{padding:7px 10px;border-bottom:1px solid rgba(180,160,255,0.10);color:#ded8f4}
+  table.stats td.n{font-family:Consolas,Monaco,monospace;text-align:right}
+  table.stats tr.best td{color:#7fe6d8;font-weight:600}
+  .samples{font-family:Consolas,Monaco,monospace;font-size:12px;color:#b8b0d8}
+  .hint{font-size:12px;color:#8880b8;margin-top:7px}
+
+  .bar{height:7px;border-radius:4px;background:rgba(255,255,255,0.09);overflow:hidden;margin-top:14px}
+  .bar > i{display:block;height:100%;width:0;border-radius:4px;
+    background:linear-gradient(90deg,#2dd4bf,#7c5ce8);transition:width .4s ease}
+  .plog{margin-top:12px;max-height:170px;overflow-y:auto;font-family:Consolas,Monaco,monospace;
+    font-size:11.5px;line-height:1.75;color:#a49cc4;border-left:2px solid rgba(180,160,255,0.20);
+    padding-left:12px}
+
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(4,35,31,0.3);
+    border-top-color:#04231f;border-radius:50%;animation:sp .7s linear infinite;
+    vertical-align:-2px;margin-right:7px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="src" id="src"></div>
+
+  <!-- 1 · Connection -->
+  <div class="card" id="c-conn">
+    <div class="step"><div class="step-num">1</div><div class="step-title">Connect to the Data Warehouse</div></div>
+    <div class="grid c2">
+      <div><label class="fl">Warehouse login email</label>
+        <input type="text" id="user" placeholder="you@example.com" autocomplete="username"></div>
+      <div><label class="fl">Warehouse</label>
+        <input type="text" id="warehouse" placeholder="e.g. COMPUTE_WH"></div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-connect">Connect</button>
+      <button class="btn btn-secondary" id="btn-disconnect">Disconnect</button>
+      <button class="btn btn-secondary btn-sm" id="btn-recheck">Re-check</button>
+    </div>
+    <div id="conn-msg" class="msg show info">Checking&hellip;</div>
+    <div class="hint">Try <b>DEMO_WAREHOUSE &rsaquo; CLIENT_DATA &rsaquo; CLIENT_CRM_CUSTOMERS</b> as the audience table.</div>
+  </div>
+
+  <!-- 2 · Audience source -->
+  <div class="card dim" id="c-aud">
+    <div class="step"><div class="step-num">2</div><div class="step-title">Audience</div></div>
+    <div class="modes">
+      <button id="m-audience" class="on">Client table</button>
+      <button id="m-cluster">Lifestyle cluster</button>
+    </div>
+
+    <div id="pane-audience">
+      <div class="grid c4">
+        <div><label class="fl">Database</label><select id="db"><option value="">—</option></select></div>
+        <div><label class="fl">Schema</label><select id="sch" disabled><option value="">—</option></select></div>
+        <div><label class="fl">Table</label><select id="tbl" disabled><option value="">—</option></select></div>
+        <div><label class="fl">FSALDU key column</label><select id="col" disabled><option value="">—</option></select></div>
+      </div>
+      <div class="opts">
+        <label class="opt"><input type="checkbox" id="normalize" checked>
+          <span class="opt-body"><b>Normalise the audience key</b>
+          <span>Uppercase and strip spaces, hyphens and tabs, so "M5V 3A8" matches "M5V3A8".</span></span></label>
+        <label class="opt"><input type="checkbox" id="unique">
+          <span class="opt-body"><b>Count each FSALDU once instead of weighting</b>
+          <span>Off: a postal code with 40 customers counts 40 times. On: profiles the places, not the people.</span></span></label>
+      </div>
+    </div>
+
+    <div id="pane-cluster" style="display:none">
+      <div class="grid c2">
+        <div><label class="fl">Group by</label>
+          <select id="pz-level"><option value="Segment">Segment</option>
+            <option value="Social Group">Social Group</option>
+            <option value="Lifestage">Lifestage</option></select>
+          <div class="hint" id="pz-hint"></div>
+        </div>
+        <div><label class="fl">Select one or more</label>
+          <select id="pz-values" multiple></select>
+        </div>
+      </div>
+    </div>
+    <div id="aud-msg" class="msg"></div>
+  </div>
+
+  <!-- 3 · Geography -->
+  <div class="card dim" id="c-geo">
+    <div class="step"><div class="step-num">3</div><div class="step-title">Geography filter <span style="font-weight:400;color:#8880b8;font-size:13px">— optional</span></div></div>
+    <div class="grid c3">
+      <div><label class="fl">Provinces</label><select id="prov" multiple></select></div>
+      <div><label class="fl">Cities</label><select id="city" multiple></select></div>
+      <div><label class="fl">Compare against</label>
+        <select id="baseline">
+          <option value="scoped">The selected geography</option>
+          <option value="national">All of Canada</option>
+        </select>
+        <div class="hint">Scoped isolates the audience effect within the filter. National leaves
+          province-vs-Canada differences folded into every index.</div>
+        <div class="btn-row"><button class="btn btn-secondary btn-sm" id="btn-geo-clear">Clear filter</button></div>
+      </div>
+    </div>
+    <div id="geo-msg" class="msg"></div>
+  </div>
+
+  <!-- 4 · Verify -->
+  <div class="card dim" id="c-check">
+    <div class="step"><div class="step-num">4</div><div class="step-title">Verify the selection</div></div>
+    <div class="btn-row"><button class="btn btn-secondary" id="btn-check">Run check</button></div>
+    <div id="check-msg" class="msg"></div>
+    <div id="check-out"></div>
+  </div>
+
+  <!-- 5 · Datasets -->
+  <div class="card dim" id="c-ds">
+    <div class="step"><div class="step-num">5</div><div class="step-title">Datasets — one Excel tab each</div></div>
+    <div class="ds-grid" id="ds-grid"></div>
+    <div class="btn-row">
+      <button class="btn btn-secondary btn-sm" id="btn-all">Select all</button>
+      <button class="btn btn-secondary btn-sm" id="btn-none">Select none</button>
+      <button class="btn btn-secondary" id="btn-inspect">Check availability</button>
+    </div>
+    <div id="ds-msg" class="msg"></div>
+  </div>
+
+  <!-- 6 · Report -->
+  <div class="card dim" id="c-run">
+    <div class="step"><div class="step-num">6</div><div class="step-title">Generate report</div></div>
+    <div class="grid c2">
+      <div><label class="fl">Audience label</label>
+        <input type="text" id="label" placeholder="e.g. Q3 Loyalty Members" value="Audience"></div>
+      <div><label class="fl">Report style</label>
+        <select id="style">
+          <option value="full">Full — values, % and index</option>
+          <option value="index_pct">Slim — % composition and index only</option>
+        </select></div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-run">Generate report</button>
+      <button class="btn btn-secondary" id="btn-cancel" style="display:none">Cancel</button>
+    </div>
+    <div id="run-msg" class="msg"></div>
+    <div class="bar" id="bar" style="display:none"><i></i></div>
+    <div class="plog" id="plog" style="display:none"></div>
+    <div id="run-preview"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* Every endpoint answers JSON, but a proxy hiccup or unhandled error can still
+   hand back HTML — parsing that blind surfaces as "Unexpected token '<'", which
+   says nothing about what broke. */
+async function readJson(r) {
+  const text = await r.text();
+  try { return JSON.parse(text); }
+  catch (e) {
+    const snip = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 220);
+    throw new Error(`HTTP ${r.status} — server did not return JSON. ${snip}`);
+  }
+}
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const d = await readJson(r);
+  if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
+  return d;
+}
+const post = (url, body) => api(url, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body || {}),
+});
+function show(el, cls, html) { el.className = `msg show ${cls}`; el.innerHTML = html; }
+function hide(el) { el.className = 'msg'; }
+const n = v => (v === null || v === undefined) ? '—' : Number(v).toLocaleString();
+const picked = sel => [...sel.selectedOptions].map(o => o.value);
+
+let connected = false, DATASETS = [], CLUSTERS = null, mode = 'audience';
+
+/* ── 1 · connection ─────────────────────────────────────────────────── */
+async function checkConn(quiet) {
+  if (!quiet) show($('conn-msg'), 'info', '<span class="spin"></span>Checking…');
+  try {
+    const d = await api('/ca-geo-fsaldu/api/status');
+    connected = d.connected;
+    DATASETS = d.datasets;
+    const totalTables = d.datasets.reduce((s, x) => s + x.parts, 0);
+    $('src').innerHTML =
+      `<span class="chip">${d.source}</span>` +
+      `<span class="chip">GEO = ${d.geo_level}</span>` +
+      `<span class="chip">key ${d.geo_key}</span>` +
+      `<span class="chip muted">${d.datasets.length} datasets · ${totalTables} tables</span>` +
+      (d.account ? `<span class="chip muted">${d.account}</span>` : '');
+    if (!$('user').value && d.default_user) $('user').value = d.default_user;
+    if (!$('warehouse').value && d.warehouse) $('warehouse').value = d.warehouse;
+    renderDatasets();
+
+    if (connected) {
+      show($('conn-msg'), 'ok', 'Connected.');
+      $('c-aud').classList.remove('dim');
+      loadDatabases();
+    } else if (!d.configured) {
+      show($('conn-msg'), 'err',
+        'The warehouse isn\'t configured — "account" is missing from tools/data/warehouse_config.json.');
+      $('c-aud').classList.add('dim');
+    } else {
+      show($('conn-msg'), 'info',
+        'Not connected. Enter your login email and warehouse, then Connect (demo: any values work).'
+        + (d.last_error ? `<br><br>Last error: ${d.last_error}` : ''));
+      $('c-aud').classList.add('dim');
+    }
+    gate();
+  } catch (e) { connected = false; show($('conn-msg'), 'err', e.message); }
+}
+
+$('btn-connect').onclick = async () => {
+  const b = $('btn-connect');
+  b.disabled = true;
+  show($('conn-msg'), 'info',
+    '<span class="spin"></span>Connecting to the demo warehouse…');
+  try {
+    await post('/ca-geo-fsaldu/api/connect',
+      { user: $('user').value.trim(), warehouse: $('warehouse').value.trim() });
+    await checkConn(true);
+  } catch (e) { show($('conn-msg'), 'err', e.message); }
+  finally { b.disabled = false; }
+};
+$('btn-disconnect').onclick = async () => {
+  try { await post('/ca-geo-fsaldu/api/disconnect'); } catch (e) {}
+  await checkConn(true);
+};
+$('btn-recheck').onclick = () => checkConn();
+
+/* ── 2 · source mode ────────────────────────────────────────────────── */
+function setMode(m) {
+  mode = m;
+  $('m-audience').classList.toggle('on', m === 'audience');
+  $('m-cluster').classList.toggle('on', m === 'cluster');
+  $('pane-audience').style.display = m === 'audience' ? '' : 'none';
+  $('pane-cluster').style.display = m === 'cluster' ? '' : 'none';
+  hide($('aud-msg')); hide($('check-msg')); $('check-out').innerHTML = '';
+  if (m === 'cluster' && !CLUSTERS) loadCluster();
+  gate();
+}
+$('m-audience').onclick = () => setMode('audience');
+$('m-cluster').onclick = () => setMode('cluster');
+
+async function loadCluster() {
+  try {
+    CLUSTERS = await api('/ca-geo-fsaldu/api/cluster/levels');
+    fillClusterValues();
+  } catch (e) { show($('aud-msg'), 'err', e.message); }
+}
+function fillClusterValues() {
+  if (!CLUSTERS) return;
+  const level = $('pz-level').value;
+  const vals = CLUSTERS.values[level] || [];
+  $('pz-values').innerHTML = vals.map(v =>
+    `<option value="${v.value.replace(/"/g, '&quot;')}">${v.value} — ${n(v.count)} FSALDU</option>`).join('');
+  $('pz-hint').textContent =
+    `${vals.length} ${level.toLowerCase()} values · ${n(CLUSTERS.total_fsaldu)} postal codes total`;
+}
+$('pz-level').onchange = () => { fillClusterValues(); gate(); };
+$('pz-values').onchange = gate;
+
+/* ── cascading table pickers ────────────────────────────────────────── */
+function fill(sel, items, placeholder) {
+  sel.innerHTML = `<option value="">${placeholder}</option>` +
+    items.map(o => `<option value="${o.value}">${o.text}</option>`).join('');
+  sel.disabled = items.length === 0;
+}
+function reset(sel) { sel.innerHTML = '<option value="">—</option>'; sel.disabled = true; }
+
+async function loadDatabases() {
+  try {
+    const d = await api('/ca-geo-fsaldu/api/databases');
+    fill($('db'), d.databases.map(x => ({ value: x, text: x })), 'Select a database…');
+    hide($('aud-msg'));
+  } catch (e) { show($('aud-msg'), 'err', e.message); }
+}
+
+$('db').onchange = async () => {
+  [$('sch'), $('tbl'), $('col')].forEach(reset); gate();
+  if (!$('db').value) return;
+  try {
+    const d = await api('/ca-geo-fsaldu/api/schemas?database=' + encodeURIComponent($('db').value));
+    fill($('sch'), d.schemas.map(x => ({ value: x, text: x })), 'Select a schema…');
+    hide($('aud-msg'));
+  } catch (e) { show($('aud-msg'), 'err', e.message); }
+};
+$('sch').onchange = async () => {
+  [$('tbl'), $('col')].forEach(reset); gate();
+  if (!$('sch').value) return;
+  try {
+    const d = await api('/ca-geo-fsaldu/api/tables?database=' + encodeURIComponent($('db').value) +
+      '&schema=' + encodeURIComponent($('sch').value));
+    fill($('tbl'), d.tables.map(t => ({
+      value: t.name, text: t.rows === null ? t.name : `${t.name}  (${n(t.rows)} rows)`
+    })), 'Select a table…');
+    hide($('aud-msg'));
+  } catch (e) { show($('aud-msg'), 'err', e.message); }
+};
+$('tbl').onchange = async () => {
+  reset($('col')); gate();
+  if (!$('tbl').value) return;
+  try {
+    const d = await api('/ca-geo-fsaldu/api/columns?database=' + encodeURIComponent($('db').value) +
+      '&schema=' + encodeURIComponent($('sch').value) + '&table=' + encodeURIComponent($('tbl').value));
+    fill($('col'), d.columns.map(c => ({ value: c.name, text: `${c.name}  ·  ${c.type}` })),
+      'Select the key column…');
+    if (d.suggested_key) {
+      $('col').value = d.suggested_key;
+      show($('aud-msg'), 'info',
+        `Pre-selected <b>${d.suggested_key}</b> — change it if that's not the FSALDU key.`);
+    } else {
+      show($('aud-msg'), 'info', 'Pick the column holding the six-character FSALDU.');
+    }
+    gate();
+  } catch (e) { show($('aud-msg'), 'err', e.message); }
+};
+$('col').onchange = gate;
+
+/* ── 3 · geography ──────────────────────────────────────────────────── */
+async function loadGeoFilters() {
+  if ($('prov').options.length) return;
+  try {
+    const d = await api('/ca-geo-fsaldu/api/geo-filters');
+    $('prov').innerHTML = d.provinces.map(p => `<option value="${p}">${p}</option>`).join('');
+    $('city').innerHTML = d.cities.map(c => `<option value="${c}">${c}</option>`).join('');
+  } catch (e) { show($('geo-msg'), 'err', e.message); }
+}
+$('btn-geo-clear').onclick = () => {
+  [...$('prov').options].forEach(o => o.selected = false);
+  [...$('city').options].forEach(o => o.selected = false);
+  hide($('geo-msg')); gate();
+};
+$('prov').onchange = $('city').onchange = () => {
+  const p = picked($('prov')), c = picked($('city'));
+  if (!p.length && !c.length) hide($('geo-msg'));
+  else show($('geo-msg'), 'info',
+    `Filtering to ${p.length ? p.length + ' province(s)' : 'all provinces'}` +
+    `${c.length ? ' and ' + c.length + ' city/cities' : ''}. ` +
+    `Cities are matched from the FSA lookup, so an FSA missing from it is excluded by a city filter.`);
+  gate();
+};
+const geoSpec = () => ({
+  provinces: picked($('prov')), cities: picked($('city')), baseline: $('baseline').value,
+});
+
+/* ── request bodies ─────────────────────────────────────────────────── */
+function sourceSpec() {
+  if (mode === 'cluster') {
+    return { mode: 'cluster', level: $('pz-level').value, values: picked($('pz-values')) };
+  }
+  return {
+    mode: 'audience', database: $('db').value, schema: $('sch').value,
+    table: $('tbl').value, column: $('col').value,
+    normalize: $('normalize').checked, unique_fsaldu: $('unique').checked,
+  };
+}
+const body = () => Object.assign(sourceSpec(), { geo: geoSpec() });
+function ready() {
+  if (!connected) return false;
+  if (mode === 'cluster') return picked($('pz-values')).length > 0;
+  const s = sourceSpec();
+  return !!(s.database && s.schema && s.table && s.column);
+}
+function gate() {
+  const ok = ready();
+  ['c-geo', 'c-check', 'c-ds'].forEach(id => $(id).classList.toggle('dim', !ok));
+  if (connected) $('c-geo').classList.remove('dim');
+  $('c-run').classList.toggle('dim', !ok || selectedTabs().length === 0);
+}
+
+/* ── 4 · verify ─────────────────────────────────────────────────────── */
+$('btn-check').onclick = async () => {
+  const btn = $('btn-check');
+  btn.disabled = true;
+  $('check-out').innerHTML = '';
+  show($('check-msg'), 'info', '<span class="spin"></span>Checking…');
+  try {
+    if (mode === 'cluster') await checkCluster();
+    else await checkJoin();
+  } catch (e) { show($('check-msg'), 'err', e.message); }
+  finally { btn.disabled = false; }
+};
+
+async function checkCluster() {
+  const d = await post('/ca-geo-fsaldu/api/cluster/resolve', body());
+  $('check-out').innerHTML = `
+    <table class="stats">
+      <tr><th>Measure</th><th>Value</th></tr>
+      <tr><td>Postal codes in selection</td><td class="n">${n(d.codes_before_geo)}</td></tr>
+      <tr class="best"><td>After the geography filter</td><td class="n">${n(d.codes)}</td></tr>
+      <tr><td>FSAs in the geography filter</td>
+        <td class="n">${d.fsa_in_filter === null ? 'no filter' : n(d.fsa_in_filter)}</td></tr>
+      <tr><td>Query batches per table</td><td class="n">${n(d.chunks)}</td></tr>
+    </table>`;
+  const notes = [];
+  if (!d.codes) notes.push('<b>Nothing left after filtering.</b> Widen the province/city filter or pick another segment.');
+  else if (d.codes < 500) notes.push(`<b>Only ${n(d.codes)} postal codes.</b> Indices on a base this small
+    move a long way on small differences — treat them as directional.`);
+  if (d.codes_before_geo && d.codes < d.codes_before_geo)
+    notes.push(`The geography filter removed ${n(d.codes_before_geo - d.codes)} of
+      ${n(d.codes_before_geo)} postal codes.`);
+  if (notes.length) show($('check-msg'), d.codes ? 'warn' : 'err', notes.join('<br><br>'));
+  else show($('check-msg'), 'ok', `${n(d.codes)} postal codes will be profiled,
+    in ${n(d.chunks)} batch(es) per source table.`);
+}
+
+async function checkJoin() {
+  const d = await post('/ca-geo-fsaldu/api/precheck', body());
+  const raw = d.match.raw, norm = d.match.normalized;
+  const better = norm.rows >= raw.rows ? 'normalized' : 'raw';
+  $('normalize').checked = (better === 'normalized');
+
+  $('check-out').innerHTML = `
+    <table class="stats">
+      <tr><th>Key handling</th><th>Matched rows</th><th>% of audience</th><th>Distinct FSALDUs</th></tr>
+      <tr class="${better === 'raw' ? 'best' : ''}"><td>As stored</td>
+        <td class="n">${n(raw.rows)}</td><td class="n">${raw.pct.toFixed(1)}%</td>
+        <td class="n">${n(raw.distinct_fsaldu)}</td></tr>
+      <tr class="${better === 'normalized' ? 'best' : ''}"><td>Normalised</td>
+        <td class="n">${n(norm.rows)}</td><td class="n">${norm.pct.toFixed(1)}%</td>
+        <td class="n">${n(norm.distinct_fsaldu)}</td></tr>
+    </table>
+    <table class="stats">
+      <tr><th>Side</th><th>Rows</th><th>Distinct keys</th><th>Key length</th></tr>
+      <tr><td>Audience table</td><td class="n">${n(d.audience.rows)}</td>
+        <td class="n">${n(d.audience.distinct_keys)}</td>
+        <td class="n">${d.audience.key_len.join('–')}</td></tr>
+      <tr><td>${d.probe_table}${d.fsa_in_filter !== null ? ' (geo-filtered)' : ''}</td>
+        <td class="n">${n(d.source.rows)}</td><td class="n">${n(d.source.distinct_keys)}</td>
+        <td class="n">${d.source.key_len.join('–')}</td></tr>
+    </table>
+    <p class="samples" style="margin-top:12px">Sample audience keys: ${
+      d.audience.samples.map(s => `"${s}"`).join(', ') || '(none)'}</p>`;
+
+  const notes = [], best = d.match[better];
+  if (best.pct < 50) notes.push(`<b>Only ${best.pct.toFixed(1)}% of audience rows match an FSALDU.</b>
+    Usually the wrong column, or codes at a different grain — a three-character FSA won't match a
+    six-character FSALDU. This report would rest on ${n(best.rows)} rows.`);
+  if (d.source.fanout && d.source.fanout > 1.001) notes.push(`<b>${d.probe_table} has
+    ${d.source.fanout.toFixed(2)} rows per postal code</b>, so CODE is not unique there and every sum is
+    multiplied by that.`);
+  if (!d.probe_has_geo) notes.push(`<b>${d.probe_table} has no GEO column</b>, so no FSALDU filter was
+    applied — every row was used.`);
+  if (d.audience.non_null_keys < d.audience.rows) notes.push(`${n(d.audience.rows - d.audience.non_null_keys)}
+    audience rows have no value in <b>${$('col').value}</b> and can never match.`);
+
+  if (notes.length) show($('check-msg'), 'warn', notes.join('<br><br>'));
+  else show($('check-msg'), 'ok', `Join looks sound — ${best.pct.toFixed(1)}% of ${n(d.audience.rows)}
+    audience rows match ${n(best.distinct_fsaldu)} distinct FSALDUs.
+    "${better === 'normalized' ? 'Normalise the key' : 'As stored'}" is better and has been applied.`);
+}
+
+/* ── 5 · datasets ───────────────────────────────────────────────────── */
+function renderDatasets() {
+  const prev = new Set(selectedTabs());
+  $('ds-grid').innerHTML = DATASETS.map(d => {
+    const on = prev.size ? prev.has(d.tab) : d.tab === 'Demographics';
+    return `<label class="ds">
+      <input type="checkbox" class="ds-cb" value="${d.tab}" ${on ? 'checked' : ''}>
+      <span>
+        <span class="ds-name">${d.tab}</span>
+        <span class="ds-meta">${d.parts === 1 ? d.tables[0] : d.parts + ' part tables · base ' + d.base}</span>
+        <span class="ds-stat" id="stat-${d.tab}"></span>
+      </span></label>`;
+  }).join('');
+  document.querySelectorAll('.ds-cb').forEach(cb => cb.onchange = gate);
+}
+const selectedTabs = () => [...document.querySelectorAll('.ds-cb:checked')].map(cb => cb.value);
+$('btn-all').onclick = () => { document.querySelectorAll('.ds-cb').forEach(cb => cb.checked = true); gate(); };
+$('btn-none').onclick = () => { document.querySelectorAll('.ds-cb').forEach(cb => cb.checked = false); gate(); };
+
+$('btn-inspect').onclick = async () => {
+  const tabs = selectedTabs();
+  if (!tabs.length) { show($('ds-msg'), 'warn', 'Select at least one dataset first.'); return; }
+  const btn = $('btn-inspect');
+  btn.disabled = true;
+  show($('ds-msg'), 'info', `<span class="spin"></span>Scanning ${tabs.length} dataset(s)…`);
+  try {
+    const d = await post('/ca-geo-fsaldu/api/inspect', { tabs });
+    const warn = [];
+    d.datasets.forEach(x => {
+      const el = $('stat-' + x.tab);
+      if (!el) return;
+      if (!x.base_present) {
+        el.className = 'ds-stat warn';
+        el.textContent = `base ${x.base} not found`;
+        warn.push(`<b>${x.tab}</b>: base column ${x.base} is missing from every part table — this tab can't be produced.`);
+        return;
+      }
+      el.className = x.empty > 0 ? 'ds-stat warn' : 'ds-stat good';
+      el.textContent = `${n(x.populated)} of ${n(x.traits)} traits populated`;
+      if (x.empty > 0) warn.push(`<b>${x.tab}</b>: ${n(x.empty)} of ${n(x.traits)} traits are entirely empty
+        at FSALDU level and will be excluded.`);
+      if (x.missing_tables.length) warn.push(`<b>${x.tab}</b>: not visible to this role — ${x.missing_tables.join(', ')}.`);
+      if (x.unlabelled > 0) warn.push(`<b>${x.tab}</b>: ${n(x.unlabelled)} traits aren't in the taxonomy and
+        appear under "Unclassified".`);
+    });
+    const total = d.datasets.reduce((s, x) => s + x.populated, 0);
+    const head = `${n(total)} traits across ${d.datasets.length} tab(s).`;
+    if (warn.length) show($('ds-msg'), 'warn', head + '<br><br>' + warn.join('<br><br>'));
+    else show($('ds-msg'), 'ok', head + ' Every trait carries FSALDU-level data.');
+  } catch (e) { show($('ds-msg'), 'err', e.message); }
+  finally { btn.disabled = false; }
+};
+
+/* ── 6 · report (background job + polling) ──────────────────────────── */
+let jobId = null, poll = null;
+const stopPolling = () => { if (poll) { clearInterval(poll); poll = null; } };
+
+$('btn-run').onclick = async () => {
+  const tabs = selectedTabs();
+  if (!tabs.length) { show($('run-msg'), 'warn', 'Select at least one dataset in step 5.'); return; }
+  $('btn-run').disabled = true;
+  $('btn-cancel').style.display = '';
+  $('bar').style.display = ''; $('plog').style.display = ''; $('plog').innerHTML = '';
+  show($('run-msg'), 'info', '<span class="spin"></span>Starting…');
+  try {
+    const d = await post('/ca-geo-fsaldu/api/report/start', Object.assign(body(), {
+      tabs, label: $('label').value.trim() || 'Audience', report_style: $('style').value,
+    }));
+    jobId = d.job_id;
+    poll = setInterval(tick, 1200);
+    tick();
+  } catch (e) {
+    show($('run-msg'), 'err', e.message);
+    $('btn-run').disabled = false; $('btn-cancel').style.display = 'none';
+  }
+};
+
+$('btn-cancel').onclick = async () => {
+  if (!jobId) return;
+  try { await post('/ca-geo-fsaldu/api/report/cancel', { job_id: jobId }); } catch (e) {}
+  stopPolling();
+  show($('run-msg'), 'warn', 'Cancelled. The query already in flight finishes on the warehouse\'s side.');
+  $('btn-run').disabled = false; $('btn-cancel').style.display = 'none';
+};
+
+async function tick() {
+  if (!jobId) return;
+  let d;
+  try { d = await api('/ca-geo-fsaldu/api/report/progress?job_id=' + jobId); }
+  catch (e) { stopPolling(); show($('run-msg'), 'err', e.message);
+              $('btn-run').disabled = false; $('btn-cancel').style.display = 'none'; return; }
+
+  const pct = d.total ? Math.round(d.step / d.total * 100) : 0;
+  $('bar').firstElementChild.style.width = pct + '%';
+  if (d.log.length) $('plog').innerHTML = d.log.map(l => `<div>${l}</div>`).join('');
+  $('plog').scrollTop = $('plog').scrollHeight;
+
+  if (d.status === 'running') {
+    show($('run-msg'), 'info',
+      `<span class="spin"></span>${d.current} — step ${d.step} of ${d.total} (${pct}%), ${d.elapsed}s elapsed.`);
+    return;
+  }
+  stopPolling();
+  $('btn-cancel').style.display = 'none';
+  $('btn-run').disabled = false;
+  if (d.status === 'error') { show($('run-msg'), 'err', d.error); return; }
+  if (d.status === 'cancelled') { show($('run-msg'), 'warn', 'Cancelled.'); return; }
+
+  show($('run-msg'), 'ok', `Done in ${d.elapsed}s. <button class="btn btn-primary btn-sm" id="btn-dl" style="margin-left:10px">⬇ Download workbook</button>`);
+  $('btn-dl').onclick = () => Mock.downloadFrom('/ca-geo-fsaldu/api/report/download?job_id=' + jobId);
+  renderPreview(d.preview || []);
+}
+
+function renderPreview(rows) {
+  if (!rows.length) { $('run-preview').innerHTML = ''; return; }
+  const fmt = (x, k) => k === 'count' ? x.toFixed(1) + '%' : Number(x).toLocaleString(undefined, { maximumFractionDigits: 1 });
+  const col = i => i >= 120 ? '#5eead4' : i <= 80 ? '#fca5a5' : 'var(--text)';
+  $('run-preview').innerHTML = `<label style="display:block;margin:18px 0 8px">Strongest differences vs baseline</label>
+    <table class="stats"><thead><tr><th>Tab</th><th>Variable</th><th>Description</th><th>Baseline</th><th>Audience</th><th>Index</th></tr></thead><tbody>${
+    rows.map(r => `<tr><td>${r.tab}</td><td>${r.variable}</td><td>${r.description}</td><td class="n">${fmt(r.nat, r.kind)}</td><td class="n">${fmt(r.aud, r.kind)}</td><td class="n" style="color:${col(r.index)};font-weight:700">${r.index.toFixed(1)}</td></tr>`).join('')}</tbody></table>`;
+  $('run-preview').querySelectorAll('tbody tr').forEach((tr, i) => tr.animate([{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }], { duration: 340, delay: i * 50, fill: 'both', easing: 'cubic-bezier(.2,.8,.2,1)' }));
+}
+
+// Province/city and lifestyle clusters both come from local files, so they populate straight
+// away rather than waiting on a warehouse session that only the run itself needs.
+loadGeoFilters();
+loadCluster();
+checkConn();
+</script>
+</body>
+</html>

@@ -1,0 +1,702 @@
+<script data-demo="cross_impute">
+// 1P / 2P Cross Impute — in-browser port of tools/cross_impute.py.
+// Outer-joins two REAL_ID CSVs, flags segments, resolves collided columns by a
+// priority rule, and imputes nulls (segment median/mode, or KNN k=5 distance-
+// weighted with nan-euclidean distance, mirroring scikit-learn's KNNImputer).
+(function () {
+  'use strict';
+
+  var jobs = {}, jobOrder = [], JOB_CAP = 12;
+  var META = { _merge: 1, data_segment: 1, has_1p: 1, has_survey: 1, data_quality_score: 1 };
+  var KEY_CANDIDATES = ['real_id', 'realid', 'id'];
+  // Strings pandas.read_csv treats as missing by default.
+  var NA_STR = { '': 1, 'NA': 1, 'N/A': 1, 'n/a': 1, 'NaN': 1, 'nan': 1, '-NaN': 1, '-nan': 1, 'null': 1,
+                 'NULL': 1, '<NA>': 1, '#N/A': 1, '#NA': 1, 'None': 1, '-1.#IND': 1, '1.#QNAN': 1 };
+
+  function hex32() { var s = ''; for (var i = 0; i < 32; i++) s += Math.floor(Math.random() * 16).toString(16); return s; }
+  function isNull(v) { return v === null || v === undefined || (typeof v === 'number' && isNaN(v)); }
+  function median(vals) {
+    var s = vals.filter(function (v) { return !isNull(v); }).sort(function (a, b) { return a - b; }), n = s.length;
+    if (!n) return null;
+    return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
+  }
+  function modeOf(vals) {
+    var counts = {}, first = {};
+    vals.forEach(function (v) {
+      if (isNull(v)) return;
+      var k = String(v);
+      counts[k] = (counts[k] || 0) + 1;
+      if (!(k in first)) first[k] = v;
+    });
+    var ks = Object.keys(counts);
+    if (!ks.length) return null;
+    var best = Math.max.apply(null, ks.map(function (k) { return counts[k]; }));
+    var winners = ks.filter(function (k) { return counts[k] === best; });
+    var allNum = winners.every(function (k) { return typeof first[k] === 'number'; });
+    winners.sort(allNum ? function (a, b) { return first[a] - first[b]; } : undefined);
+    return first[winners[0]];
+  }
+
+  // Parse a CSV the way pandas would, closely enough: NA strings -> null,
+  // a column is numeric only if every non-null value parses as a number.
+  async function readCSV(file) {
+    var text = await Mock.readFile(file);
+    var p = Mock.csv.parse(text);
+    var cols = p.columns.map(function (c) { return String(c).trim(); });
+    if (!cols.length || (cols.length === 1 && cols[0] === '')) throw new Error('No columns to parse from file');
+    var types = {};
+    var rows = p.rows.map(function (r) {
+      var o = {};
+      p.columns.forEach(function (c, i) {
+        var v = r[c];
+        if (typeof v === 'string' && NA_STR[v.trim()]) v = null;
+        o[cols[i]] = v;
+      });
+      return o;
+    });
+    cols.forEach(function (c) {
+      var num = rows.every(function (r) { return isNull(r[c]) || typeof r[c] === 'number'; });
+      types[c] = num ? 'num' : 'obj';
+      if (!num) rows.forEach(function (r) { if (!isNull(r[c])) r[c] = String(r[c]); });
+    });
+    return { cols: cols, rows: rows, types: types };
+  }
+
+  function pickJoinKey(requested, colsA, colsB) {
+    var la = {}, lb = {};
+    colsA.forEach(function (c) { if (!(c.toLowerCase() in la)) la[c.toLowerCase()] = c; });
+    colsB.forEach(function (c) { if (!(c.toLowerCase() in lb)) lb[c.toLowerCase()] = c; });
+    if (requested) {
+      var rl = requested.toLowerCase();
+      if (rl in la && rl in lb) return [la[rl], lb[rl]];
+      var e = new Error("Join key '" + requested + "' must exist in both files."); e.bad = true; throw e;
+    }
+    for (var i = 0; i < KEY_CANDIDATES.length; i++) {
+      var k = KEY_CANDIDATES[i];
+      if (k in la && k in lb) return [la[k], lb[k]];
+    }
+    var shared = Object.keys(la).filter(function (k) { return k in lb; });
+    if (shared.length) return [la[shared[0]], lb[shared[0]]];
+    var e2 = new Error('No common column to join on. Provide a join key present in both files.'); e2.bad = true; throw e2;
+  }
+
+  // ── KNNImputer(n_neighbors=5, weights='distance') on the given columns ────
+  function knnImpute(rows, cols, k) {
+    var n = rows.length, F = cols.length;
+    var X = rows.map(function (r) { return cols.map(function (c) { return isNull(r[c]) ? null : r[c]; }); });
+    var colMean = cols.map(function (c, j) {
+      var s = 0, m = 0;
+      X.forEach(function (x) { if (x[j] !== null) { s += x[j]; m++; } });
+      return m ? s / m : null;
+    });
+    function dist(a, b) {
+      var s = 0, present = 0;
+      for (var j = 0; j < F; j++) {
+        if (a[j] !== null && b[j] !== null) { var d = a[j] - b[j]; s += d * d; present++; }
+      }
+      return present ? Math.sqrt(s * F / present) : NaN;
+    }
+    var out = X.map(function (x) { return x.slice(); });
+    var distCache = {};
+    for (var j = 0; j < F; j++) {
+      var donors = [];
+      for (var i = 0; i < n; i++) if (X[i][j] !== null) donors.push(i);
+      if (!donors.length) continue;
+      for (var r = 0; r < n; r++) {
+        if (X[r][j] !== null) continue;
+        var drow = distCache[r] || (distCache[r] = {});
+        var cand = donors.map(function (d) {
+          if (!(d in drow)) drow[d] = dist(X[r], X[d]);
+          return { d: d, dist: drow[d] };
+        });
+        var valid = cand.filter(function (c) { return !isNaN(c.dist); });
+        if (!valid.length) { out[r][j] = colMean[j]; continue; }
+        cand.sort(function (a, b) {
+          var x = isNaN(a.dist) ? Infinity : a.dist, y = isNaN(b.dist) ? Infinity : b.dist;
+          return x - y;
+        });
+        var nn = cand.slice(0, Math.min(k, donors.length));
+        var zero = nn.some(function (c) { return c.dist === 0; });
+        var ws = 0, acc = 0;
+        nn.forEach(function (c) {
+          var w = isNaN(c.dist) ? 0 : zero ? (c.dist === 0 ? 1 : 0) : 1 / c.dist;
+          ws += w; acc += w * X[c.d][j];
+        });
+        out[r][j] = ws > 0 ? acc / ws : colMean[j];
+      }
+    }
+    rows.forEach(function (row, i) { cols.forEach(function (c, j) { row[c] = out[i][j]; }); });
+  }
+
+  Mock.route('GET', '/cross-impute/api/caps', function () {
+    return { knn: true };   // the demo ships a JS KNN imputer
+  }, { latency: 0 });
+
+  Mock.route('POST', '/cross-impute/api/merge', async function (req) {
+    var fd = req.form;
+    var f1 = fd && fd.get('file_1p'), f2 = fd && fd.get('file_survey');
+    if (!f1 || !f2 || typeof f1 === 'string' || typeof f2 === 'string')
+      return Mock.json({ error: 'Upload both a 1P CSV and a Survey CSV.' }, 400);
+    var priority = String(fd.get('priority') || '1p').toLowerCase();
+    var method = String(fd.get('method') || 'median').toLowerCase();
+    var reqKey = String(fd.get('join_key') || '').trim();
+
+    try {
+      var d1 = await readCSV(f1), d2 = await readCSV(f2);
+      var kk = pickJoinKey(reqKey, d1.cols, d2.cols);
+      var key = kk[0], key2 = kk[1];
+      if (key2 !== key) {
+        d2.cols = d2.cols.map(function (c) { return c === key2 ? key : c; });
+        d2.rows.forEach(function (r) { r[key] = r[key2]; delete r[key2]; });
+        d2.types[key] = d2.types[key2];
+      }
+      function normKey(v) { return isNull(v) ? 'nan' : String(v).trim(); }
+      d1.rows.forEach(function (r) { r[key] = normKey(r[key]); });
+      d2.rows.forEach(function (r) { r[key] = normKey(r[key]); });
+
+      // ── Outer merge with suffixes + indicator ───────────────────────────
+      var c2set = {}; d2.cols.forEach(function (c) { c2set[c] = 1; });
+      var c1set = {}; d1.cols.forEach(function (c) { c1set[c] = 1; });
+      var types = {}, cols = [], map1 = {}, map2 = {};
+      d1.cols.forEach(function (c) {
+        var out = c === key ? c : (c2set[c] ? c + '_1p' : c);
+        map1[c] = out; cols.push(out); types[out] = c === key ? 'obj' : d1.types[c];
+      });
+      d2.cols.forEach(function (c) {
+        if (c === key) return;
+        var out = c1set[c] ? c + '_survey' : c;
+        map2[c] = out; cols.push(out); types[out] = d2.types[c];
+      });
+      function groupBy(rows) {
+        var g = {};
+        rows.forEach(function (r) { (g[r[key]] = g[r[key]] || []).push(r); });
+        return g;
+      }
+      var g1 = groupBy(d1.rows), g2 = groupBy(d2.rows);
+      var keys = Array.from(new Set(Object.keys(g1).concat(Object.keys(g2)))).sort();
+      var merged = [];
+      function build(a, b, tag) {
+        var o = {};
+        cols.forEach(function (c) { o[c] = null; });
+        o[key] = a ? a[key] : b[key];
+        if (a) d1.cols.forEach(function (c) { if (c !== key) o[map1[c]] = a[c]; });
+        if (b) d2.cols.forEach(function (c) { if (c !== key) o[map2[c]] = b[c]; });
+        o._merge = tag;
+        return o;
+      }
+      keys.forEach(function (k) {
+        var A = g1[k], B = g2[k];
+        if (A && B) A.forEach(function (a) { B.forEach(function (b) { merged.push(build(a, b, 'both')); }); });
+        else if (A) A.forEach(function (a) { merged.push(build(a, null, 'left_only')); });
+        else B.forEach(function (b) { merged.push(build(null, b, 'right_only')); });
+      });
+      cols.push('_merge'); types._merge = 'obj';
+
+      var SEG = { left_only: '1p_only', right_only: 'survey_only', both: 'overlap' };
+      merged.forEach(function (r) {
+        r.data_segment = SEG[r._merge];
+        r.has_1p = r.data_segment === '1p_only' || r.data_segment === 'overlap';
+        r.has_survey = r.data_segment === 'survey_only' || r.data_segment === 'overlap';
+        r.data_quality_score = (r.has_1p ? 1 : 0) + (r.has_survey ? 1 : 0);
+      });
+      ['data_segment', 'has_1p', 'has_survey', 'data_quality_score'].forEach(function (c) { cols.push(c); });
+      types.data_segment = 'obj'; types.has_1p = 'bool'; types.has_survey = 'bool'; types.data_quality_score = 'num';
+
+      // ── Conflict resolution for collided (suffixed) columns ─────────────
+      var conflicts = 0;
+      cols.slice().forEach(function (c) {
+        if (META[c] || !/_1p$/.test(c)) return;
+        var base = c.slice(0, -3), sc = base + '_survey';
+        if (cols.indexOf(sc) < 0 || META[base]) return;
+        merged.forEach(function (r) {
+          var a = r[c], b = r[sc];
+          if (!isNull(a) && !isNull(b) && String(a) !== String(b)) conflicts++;
+          r[base] = priority === 'survey' ? (!isNull(b) ? b : a) : (!isNull(a) ? a : b);
+        });
+        if (cols.indexOf(base) < 0) cols.push(base);
+        types[base] = (types[c] === 'num' && types[sc] === 'num') ? 'num' : 'obj';
+      });
+
+      // ── Imputation targets ──────────────────────────────────────────────
+      var imputeCols = cols.filter(function (c) {
+        return c !== key && !META[c] && !/_source$/.test(c) && !/_1p$/.test(c) && !/_survey$/.test(c);
+      });
+      var n = merged.length;
+      var naBefore = {}, origNA = {};
+      imputeCols.forEach(function (c) {
+        origNA[c] = merged.map(function (r) { return isNull(r[c]); });
+        naBefore[c] = n ? origNA[c].filter(Boolean).length / n : 0;
+      });
+
+      var useKNN = method === 'knn';
+      var numCols = imputeCols.filter(function (c) { return types[c] === 'num'; });
+      var catCols = imputeCols.filter(function (c) { return types[c] !== 'num'; });
+      var methodUsed;
+      var segs = ['overlap', '1p_only', 'survey_only'];
+      function segRows(s) { return merged.filter(function (r) { return r.data_segment === s; }); }
+
+      if (useKNN && numCols.length) {
+        var usable = numCols.filter(function (c) { return merged.some(function (r) { return !isNull(r[c]); }); });
+        if (usable.length) knnImpute(merged, usable, 5);
+        methodUsed = 'knn';
+      }
+      if (!useKNN) {
+        methodUsed = 'median';
+        numCols.forEach(function (c) {
+          segs.forEach(function (s) {
+            var rs = segRows(s), med = median(rs.map(function (r) { return r[c]; }));
+            if (med !== null) rs.forEach(function (r) { if (isNull(r[c])) r[c] = med; });
+          });
+          var g = median(merged.map(function (r) { return r[c]; }));
+          if (g !== null) merged.forEach(function (r) { if (isNull(r[c])) r[c] = g; });
+        });
+      }
+      if (useKNN && !numCols.length) methodUsed = 'knn';
+
+      // Categorical — segment mode, then global mode fallback.
+      catCols.forEach(function (c) {
+        segs.forEach(function (s) {
+          var rs = segRows(s), m = modeOf(rs.map(function (r) { return r[c]; }));
+          if (m !== null) rs.forEach(function (r) { if (isNull(r[c])) r[c] = m; });
+        });
+        var gm = modeOf(merged.map(function (r) { return r[c]; }));
+        if (gm !== null) merged.forEach(function (r) { if (isNull(r[c])) r[c] = gm; });
+      });
+
+      // Provenance columns + null rates after.
+      var naAfter = {};
+      imputeCols.forEach(function (c) {
+        var sc = c + '_source';
+        merged.forEach(function (r, i) { r[sc] = origNA[c][i] ? 'imputed' : 'observed'; });
+        if (cols.indexOf(sc) < 0) cols.push(sc);
+        naAfter[c] = n ? merged.filter(function (r) { return isNull(r[c]); }).length / n : 0;
+      });
+
+      var segments = { overlap: 0, '1p_only': 0, survey_only: 0 };
+      merged.forEach(function (r) { segments[r.data_segment]++; });
+
+      var nullRates = imputeCols.filter(function (c) { return naBefore[c] > 0; }).map(function (c) {
+        return { col: c, before: Mock.round(naBefore[c] * 100, 1), after: Mock.round(naAfter[c] * 100, 1) };
+      });
+      nullRates.sort(function (a, b) { return b.before - a.before; });
+
+      var job = hex32();
+      if (jobOrder.length >= JOB_CAP) delete jobs[jobOrder.shift()];
+      jobs[job] = { rows: merged, cols: cols, key: key };
+      jobOrder.push(job);
+
+      return {
+        job: job, key: key, method_used: methodUsed, rows: n, cols: cols.length,
+        conflicts: conflicts, segments: segments, null_rates: nullRates, imputed_cols: nullRates.length
+      };
+    } catch (e) {
+      if (e && e.bad) return Mock.json({ error: e.message }, 400);
+      throw e;
+    }
+  }, { latency: [400, 800] });
+
+  Mock.route('GET', '/cross-impute/api/download', function (req) {
+    var entry = jobs[req.query.job || ''];
+    var which = req.query.which || 'merged';
+    if (!entry) return Mock.json({ error: 'Job expired — re-run the merge.' }, 404);
+    function cell(v) {
+      if (isNull(v)) return '';
+      if (v === true) return 'True';
+      if (v === false) return 'False';
+      return v;
+    }
+    var rows, cols, fname;
+    if (which === 'merged') {
+      cols = entry.cols; rows = entry.rows; fname = 'merged_realid_universe.csv';
+    } else if (which === 'overlap' || which === '1p_only' || which === 'survey_only') {
+      cols = [entry.key];
+      rows = entry.rows.filter(function (r) { return r.data_segment === which; });
+      fname = 'realid_segment_' + which + '.csv';
+    } else {
+      return Mock.json({ error: 'Unknown export.' }, 400);
+    }
+    var out = rows.map(function (r) { var o = {}; cols.forEach(function (c) { o[c] = cell(r[c]); }); return o; });
+    return Mock.file(Mock.csv.stringify(out, cols) + '\r\n', fname, 'text/csv');
+  });
+
+  // ── Demo sample inputs (generated, overlapping fake REAL_IDs) ────────────
+  function sample(which) {
+    var r = Mock.rng('cross-impute-sample-v1');
+    var pool = [];
+    for (var i = 100; i < 1000; i++) pool.push('RID' + String(i).padStart(6, '0'));
+    pool = Mock.shuffle(pool, r);
+    var ids1 = pool.slice(0, 90);                       // 1P universe
+    var ids2 = ids1.slice(0, 32).concat(pool.slice(90, 136)); // 32 overlap + 46 survey-only
+    var fsas = Mock.fsaList.map(function (f) { return f.FSA; });
+    var AGE = ['18-24', '25-34', '35-44', '45-54', '55-64', '65+'];
+    // One latent profile per id so both files are loosely consistent.
+    var prof = {};
+    pool.slice(0, 136).forEach(function (id) {
+      prof[id] = { age: Math.min(5, Math.max(0, Math.round(Mock.gauss(2.3, 1.4, r)))),
+                   value: Mock.gauss(0, 1, r), fsa: Mock.pick(fsas, r) };
+    });
+    function maybe(v, p, rr) { return rr() < p ? '' : v; }
+    if (which === '1p') {
+      var r1 = Mock.rng('cross-impute-1p');
+      return Mock.shuffle(ids1, r1).map(function (id) {
+        var p = prof[id];
+        var spend = Math.max(40, Math.round(900 + p.value * 420 + Mock.gauss(0, 150, r1)));
+        return {
+          real_id: id,
+          fsa: maybe(p.fsa, 0.05, r1),
+          age_band: maybe(AGE[p.age], 0.35, r1),                 // modelled age, often missing
+          ltv_band: maybe(spend > 1300 ? 'High' : spend > 700 ? 'Mid' : 'Low', 0.08, r1),
+          rfm_score: maybe(Mock.round(Math.min(5, Math.max(1, 3 + p.value * 0.9 + Mock.gauss(0, 0.5, r1))), 1), 0.1, r1),
+          loyalty_tier: maybe(Mock.pick(['Bronze', 'Silver', 'Silver', 'Gold', 'Platinum'], r1), 0.12, r1),
+          spend_12m: maybe(spend, 0.06, r1)
+        };
+      });
+    }
+    var r2 = Mock.rng('cross-impute-2p');
+    return Mock.shuffle(ids2, r2).map(function (id) {
+      var p = prof[id];
+      var statedAge = r2() < 0.15 ? Math.min(5, p.age + 1) : p.age;   // some self-report drift -> conflicts
+      return {
+        real_id: id,
+        age_band: maybe(AGE[statedAge], 0.04, r2),
+        hhi_band: maybe(Mock.pick(['<$50k', '$50-100k', '$50-100k', '$100-150k', '$150k+'], r2), 0.1, r2),
+        brand_affinity: maybe(Math.round(100 + p.value * 25 + Mock.gauss(0, 12, r2)), 0.07, r2),
+        media_hours_week: maybe(Mock.round(Math.max(2, Mock.gauss(18 - p.age * 1.5, 5, r2)), 1), 0.09, r2),
+        purchase_intent: maybe(Mock.pick(['Low', 'Medium', 'Medium', 'High'], r2), 0.11, r2),
+        streaming_subs: maybe(Mock.randInt(0, 5, r2), 0.08, r2)
+      };
+    });
+  }
+
+  Mock.route('GET', '/cross-impute/api/demo-sample', function (req) {
+    var which = (req.query.which || '1p').toLowerCase() === '2p' ? '2p' : '1p';
+    return Mock.file(Mock.csv.stringify(sample(which)) + '\r\n',
+                     which === '1p' ? 'sample_1P.csv' : 'sample_2P.csv', 'text/csv');
+  }, { latency: [60, 160] });
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1P · 2P Cross Impute — Audience Analytics Engine</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{
+    --navy:#0d0d2b; --deep:#131447; --surface:rgba(255,255,255,0.05);
+    --violet:#7c5ce8; --purple:#5b4fcf; --lavender:#a78bfa;
+    --teal:#2dd4bf; --sky:#60a5fa; --amber:#fbbf24; --pink:#f472b6; --green:#3fb950;
+    --border:rgba(180,160,255,0.28); --text:#f0eeff; --text-sec:#c8c0e8; --muted:#8880b8;
+    --input-bg:rgba(255,255,255,0.06); --input-border:rgba(180,160,255,0.30);
+    --red:#f87171; --mono:'Cascadia Code',Consolas,monospace;
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html,body{position:relative;min-height:100vh;background:var(--navy);color:var(--text);font-family:Helvetica,Arial,sans-serif;font-size:14px;line-height:1.6}
+  body::before{content:'';position:absolute;inset:0;z-index:0;pointer-events:none;
+    background:radial-gradient(ellipse 70% 55% at 8% 10%,rgba(91,79,207,0.28)0%,transparent 60%),
+      radial-gradient(ellipse 55% 45% at 92% 90%,rgba(45,212,191,0.12)0%,transparent 55%),
+      radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%)}
+  .shell{position:relative;z-index:1}
+
+  nav{position:sticky;top:0;z-index:100;background:rgba(13,13,43,0.9);backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--border);display:flex;gap:4px;padding:9px 24px;flex-wrap:wrap;align-items:center}
+  nav .logo{color:var(--lavender);font-weight:700;font-size:13px;margin-right:14px;display:flex;align-items:center;gap:7px}
+  nav .logo .dot{width:9px;height:9px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7)}
+  nav button{background:none;border:1px solid transparent;color:var(--muted);padding:6px 14px;border-radius:7px;cursor:pointer;font-size:12px;font-family:inherit;transition:all .15s}
+  nav button:hover{color:var(--text);border-color:var(--border)}
+  nav button.active{color:var(--lavender);border-color:var(--border);background:rgba(124,92,232,0.12)}
+  nav .back{margin-left:auto;color:var(--muted);text-decoration:none;font-size:12px}
+  nav .back:hover{color:var(--text)}
+
+  main{max-width:1080px;margin:0 auto;padding:30px 24px 64px}
+  section{display:none} section.active{display:block}
+  h1{font-size:26px;font-weight:700;letter-spacing:-0.4px;margin-bottom:8px}
+  h2{font-size:18px;font-weight:600;margin:30px 0 12px;color:var(--lavender)}
+  h3{font-size:14px;font-weight:600;margin:18px 0 8px}
+  p{color:var(--text-sec);margin-bottom:12px}
+
+  .hero{padding:34px 0 26px;border-bottom:1px solid var(--border);margin-bottom:28px}
+  .hero .eyebrow{font-size:11px;color:var(--teal);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:10px}
+  .hero p{color:var(--muted);max-width:660px;font-size:15px}
+  .pill-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:16px;backdrop-filter:blur(10px)}
+  .card-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+  @media(max-width:680px){.card-grid{grid-template-columns:1fr}}
+
+  .badge{display:inline-block;padding:2px 9px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}
+  .b-violet{background:rgba(124,92,232,0.16);color:var(--lavender);border:1px solid rgba(167,139,250,0.35)}
+  .b-teal{background:rgba(45,212,191,0.14);color:var(--teal);border:1px solid rgba(45,212,191,0.3)}
+  .b-amber{background:rgba(251,191,36,0.14);color:var(--amber);border:1px solid rgba(251,191,36,0.3)}
+  .b-red{background:rgba(248,113,113,0.14);color:var(--red);border:1px solid rgba(248,113,113,0.3)}
+  .b-sky{background:rgba(96,165,250,0.14);color:var(--sky);border:1px solid rgba(96,165,250,0.3)}
+
+  .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}
+  @media(max-width:680px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:center}
+  .stat .val{font-size:26px;font-weight:700;font-family:var(--mono)}
+  .stat .lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;margin-top:4px}
+
+  .alert{border-left:3px solid;border-radius:0 7px 7px 0;padding:12px 16px;margin:12px 0;font-size:13px;color:var(--text-sec)}
+  .alert-teal{border-color:var(--teal);background:rgba(45,212,191,0.07)}
+  .alert-sky{border-color:var(--sky);background:rgba(96,165,250,0.07)}
+  .alert-amber{border-color:var(--amber);background:rgba(251,191,36,0.07)}
+
+  .tbl-wrap{overflow-x:auto;margin:12px 0 20px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{background:rgba(255,255,255,0.04);color:var(--muted);font-weight:600;text-align:left;padding:9px 12px;border-bottom:2px solid var(--border);white-space:nowrap;font-size:11px;text-transform:uppercase;letter-spacing:0.4px}
+  td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:middle}
+  code{font-family:var(--mono);font-size:12px;color:var(--sky)}
+  .filled{color:var(--teal);font-weight:500}.nullc{color:var(--muted);font-style:italic}.warnc{color:var(--amber)}
+
+  .flow{display:flex;gap:0;margin:18px 0;overflow-x:auto;padding-bottom:6px;align-items:stretch}
+  .flow-node{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;min-width:132px;flex-shrink:0}
+  .flow-node .lbl{font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--muted);margin-bottom:3px}
+  .flow-node .ttl{font-size:13px;font-weight:600}
+  .flow-node .sub{font-size:11px;color:var(--muted);margin-top:3px}
+  .flow-arrow{display:flex;align-items:center;padding:0 5px;color:var(--muted);font-size:18px}
+
+  .strategy{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:14px 0}
+  @media(max-width:680px){.strategy{grid-template-columns:1fr}}
+  .strat{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:15px}
+  .strat h4{font-size:13px;margin-bottom:6px}
+  .strat .when{font-size:11px;color:var(--muted);margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
+
+  label{display:block;font-size:12px;color:var(--text-sec);margin-bottom:6px;font-weight:600}
+  input[type=text],select{width:100%;padding:9px 12px;border:1px solid var(--input-border);border-radius:8px;
+    font-size:13px;font-family:inherit;background:var(--input-bg);color:var(--text)}
+  select option{background:#fff;color:#1a1a2e}
+  input[type=text]:focus,select:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+  .dropzone{border:1.5px dashed var(--input-border);border-radius:9px;padding:20px;text-align:center;
+    cursor:pointer;color:var(--muted);font-size:13px;transition:all .15s;background:var(--input-bg)}
+  .dropzone:hover{border-color:rgba(167,139,250,0.6);color:var(--text-sec)}
+  .dropzone.has-file{border-color:var(--teal);color:var(--teal)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:680px){.row2{grid-template-columns:1fr}}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+  @media(max-width:680px){.row3{grid-template-columns:1fr}}
+
+  .btn{display:inline-flex;align-items:center;gap:7px;padding:10px 22px;font-size:13px;font-weight:600;border-radius:8px;cursor:pointer;border:none;font-family:inherit;transition:all .18s}
+  .btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+  .btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+  .btn-primary:disabled{opacity:0.6;cursor:default;transform:none;box-shadow:none}
+  .btn-secondary{background:rgba(255,255,255,0.05);color:var(--text-sec);border:1px solid var(--border)}
+  .btn-sm{padding:7px 14px;font-size:12px}
+  .actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}
+
+  .status{padding:11px 15px;border-radius:8px;font-size:13px;margin-top:14px;display:none;border:1px solid transparent}
+  .status.info{background:rgba(96,165,250,0.10);color:var(--sky);border-color:rgba(96,165,250,0.25)}
+  .status.ok{background:rgba(45,212,191,0.10);color:var(--teal);border-color:rgba(45,212,191,0.25)}
+  .status.err{background:rgba(248,113,113,0.10);color:var(--red);border-color:rgba(248,113,113,0.25)}
+  .spinner{display:inline-block;width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .chart-box{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin:14px 0}
+  .chart-box canvas{max-height:280px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<main>
+
+<!-- ══ RUN IT ══ -->
+<section id="run" class="active">
+
+  <div class="card">
+    <div class="row2">
+      <div>
+        <label>First-party CSV (1P)</label>
+        <div class="dropzone" id="dz1" onclick="document.getElementById('file1').click()">Click to choose the 1P CSV</div>
+        <input type="file" id="file1" accept=".csv" class="hidden">
+      </div>
+      <div>
+        <label>Survey CSV (2P / panel)</label>
+        <div class="dropzone" id="dz2" onclick="document.getElementById('file2').click()">Click to choose the Survey CSV</div>
+        <input type="file" id="file2" accept=".csv" class="hidden">
+      </div>
+    </div>
+
+    <div class="row3" style="margin-top:16px">
+      <div>
+        <label>Join key <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
+        <input type="text" id="joinKey" placeholder="auto-detect real_id">
+      </div>
+      <div>
+        <label>Conflict priority</label>
+        <select id="priority">
+          <option value="1p">1P wins (behavioural truth)</option>
+          <option value="survey">Survey wins (stated truth)</option>
+        </select>
+      </div>
+      <div>
+        <label>Imputation method</label>
+        <select id="method">
+          <option value="median">Segment median / mode (fast)</option>
+        </select>
+        <p style="font-size:11px;color:var(--muted);margin-top:5px" id="methodHint">Segment-aware, no dependencies.</p>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-primary" id="runBtn" onclick="runMerge()">Run merge &amp; impute</button>
+      <button class="btn btn-secondary btn-sm" onclick="useSample()">Use sample data</button>
+    </div>
+    <p style="font-size:11px;color:var(--muted);margin:10px 0 0">Samples:
+      <a href="/cross-impute/api/demo-sample?which=1p" style="color:var(--lavender)">sample_1P.csv</a> ·
+      <a href="/cross-impute/api/demo-sample?which=2p" style="color:var(--lavender)">sample_2P.csv</a></p>
+    <div class="status" id="runStatus"></div>
+  </div>
+
+  <!-- RESULTS -->
+  <div id="results" class="hidden">
+    <div class="stat-grid">
+      <div class="stat"><div class="val" style="color:var(--amber)" id="sOverlap">–</div><div class="lbl">Overlap</div></div>
+      <div class="stat"><div class="val" style="color:var(--sky)" id="s1p">–</div><div class="lbl">1P only</div></div>
+      <div class="stat"><div class="val" style="color:var(--lavender)" id="sSurvey">–</div><div class="lbl">Survey only</div></div>
+      <div class="stat"><div class="val" style="color:var(--teal)" id="sTotal">–</div><div class="lbl">Merged universe</div></div>
+    </div>
+    <div class="alert alert-sky" id="runMeta"></div>
+
+    <div class="card-grid">
+      <div class="chart-box"><h3>Segment composition</h3><canvas id="chartDonut"></canvas></div>
+      <div class="chart-box"><h3>Null rate by field — before vs after imputation</h3><canvas id="chartNull"></canvas></div>
+    </div>
+
+    <h2>Download</h2>
+    <div class="actions" style="margin-top:0">
+      <button class="btn btn-primary btn-sm" onclick="dl('merged')">Merged universe (full)</button>
+      <button class="btn btn-secondary btn-sm" onclick="dl('overlap')">Overlap REAL_IDs</button>
+      <button class="btn btn-secondary btn-sm" onclick="dl('1p_only')">1P-only REAL_IDs</button>
+      <button class="btn btn-secondary btn-sm" onclick="dl('survey_only')">Survey-only REAL_IDs</button>
+    </div>
+  </div>
+</section>
+
+<!-- ══ OVERVIEW ══ -->
+<!-- ══ PROBLEM SPACE ══ -->
+<!-- ══ MERGE STRATEGY ══ -->
+<!-- ══ IMPUTATION METHODS ══ -->
+</main>
+</div>
+
+<script>
+// ── Section nav ──
+function showSection(id, btn){
+  document.querySelectorAll('section').forEach(function(s){s.classList.remove('active');});
+  document.querySelectorAll('nav button').forEach(function(b){b.classList.remove('active');});
+  document.getElementById(id).classList.add('active');
+  if(btn) btn.classList.add('active');
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function setStatus(t,m){var e=document.getElementById('runStatus');e.className='status '+t;e.innerHTML=m;e.style.display='block';}
+
+// ── File pickers ──
+function wireDrop(inputId, dzId){
+  document.getElementById(inputId).addEventListener('change',function(e){
+    var f=e.target.files[0], dz=document.getElementById(dzId);
+    if(f){ dz.textContent=f.name; dz.classList.add('has-file'); }
+    else { dz.classList.remove('has-file'); }
+  });
+}
+wireDrop('file1','dz1'); wireDrop('file2','dz2');
+
+// ── Capability check: show KNN only if backend has scikit-learn ──
+fetch('/cross-impute/api/caps').then(function(r){return r.json();}).then(function(d){
+  if(d && d.knn){
+    var sel=document.getElementById('method');
+    var o=document.createElement('option'); o.value='knn'; o.textContent='KNN (k=5) — numeric fields';
+    sel.appendChild(o);
+    document.getElementById('methodHint').textContent='KNN available (runs in your browser).';
+    var note=document.getElementById('knnNote'); if(note) note.style.display='none';
+  }
+}).catch(function(){});
+
+var _job=null, _donut=null, _nullChart=null;
+
+// Demo: load both generated sample CSVs into the pickers.
+async function useSample(){
+  try{
+    var pairs=[['1p','file1','sample_1P.csv'],['2p','file2','sample_2P.csv']];
+    for(var i=0;i<pairs.length;i++){
+      var r=await fetch('/cross-impute/api/demo-sample?which='+pairs[i][0]);
+      var b=await r.blob(), dt=new DataTransfer();
+      dt.items.add(new File([b],pairs[i][2],{type:'text/csv'}));
+      var inp=document.getElementById(pairs[i][1]); inp.files=dt.files;
+      inp.dispatchEvent(new Event('change'));
+    }
+    setStatus('info','Sample files loaded — click <strong>Run merge &amp; impute</strong>.');
+  }catch(e){ setStatus('err','Could not load sample data: '+e.message); }
+}
+
+async function runMerge(){
+  var f1=document.getElementById('file1').files[0];
+  var f2=document.getElementById('file2').files[0];
+  if(!f1||!f2){ setStatus('err','Choose both a 1P CSV and a Survey CSV.'); return; }
+  var btn=document.getElementById('runBtn'), old=btn.innerHTML;
+  btn.disabled=true; btn.innerHTML='<span class="spinner"></span> Running…';
+  setStatus('info','<span class="spinner"></span> Merging and imputing… large files may take a moment.');
+
+  var fd=new FormData();
+  fd.append('file_1p',f1); fd.append('file_survey',f2);
+  fd.append('join_key',document.getElementById('joinKey').value.trim());
+  fd.append('priority',document.getElementById('priority').value);
+  fd.append('method',document.getElementById('method').value);
+
+  var d;
+  try{
+    var r=await fetch('/cross-impute/api/merge',{method:'POST',body:fd});
+    d=await r.json(); if(d.error) throw new Error(d.error);
+  }catch(e){ setStatus('err','Merge failed: '+e.message); btn.disabled=false; btn.innerHTML=old; return; }
+
+  _job=d.job;
+  var seg=d.segments||{};
+  document.getElementById('sOverlap').textContent=(seg.overlap||0).toLocaleString();
+  document.getElementById('s1p').textContent=(seg['1p_only']||0).toLocaleString();
+  document.getElementById('sSurvey').textContent=(seg.survey_only||0).toLocaleString();
+  document.getElementById('sTotal').textContent=(d.rows||0).toLocaleString();
+  document.getElementById('runMeta').innerHTML=
+    'Joined on <code>'+esc(d.key)+'</code> · method: <strong>'+esc(d.method_used)+'</strong> · '+
+    d.conflicts.toLocaleString()+' overlap conflict(s) resolved · '+d.cols+' columns · '+
+    d.imputed_cols+' field(s) imputed.';
+  document.getElementById('results').classList.remove('hidden');
+  drawCharts(seg, d.null_rates||[]);
+  setStatus('ok','✓ Done — '+(d.rows||0).toLocaleString()+' REAL_IDs in the merged universe. Download below.');
+  btn.disabled=false; btn.innerHTML=old;
+}
+
+function drawCharts(seg, nulls){
+  var cText='#c8c0e8', grid='rgba(255,255,255,0.06)';
+  Chart.defaults.color=cText; Chart.defaults.borderColor=grid;
+  if(_donut) _donut.destroy();
+  _donut=new Chart(document.getElementById('chartDonut'),{
+    type:'doughnut',
+    data:{labels:['1P only','Overlap','Survey only'],
+      datasets:[{data:[seg['1p_only']||0,seg.overlap||0,seg.survey_only||0],
+        backgroundColor:['rgba(96,165,250,0.7)','rgba(251,191,36,0.75)','rgba(167,139,250,0.7)'],
+        borderColor:['#60a5fa','#fbbf24','#a78bfa'],borderWidth:1.5}]},
+    options:{responsive:true,plugins:{legend:{position:'bottom'}},cutout:'62%'}
+  });
+
+  var top=nulls.slice(0,12);
+  if(_nullChart) _nullChart.destroy();
+  _nullChart=new Chart(document.getElementById('chartNull'),{
+    type:'bar',
+    data:{labels:top.map(function(r){return r.col;}),
+      datasets:[
+        {label:'Before',data:top.map(function(r){return r.before;}),backgroundColor:'rgba(248,113,113,0.6)',borderColor:'#f87171',borderWidth:1},
+        {label:'After', data:top.map(function(r){return r.after;}), backgroundColor:'rgba(45,212,191,0.6)',borderColor:'#2dd4bf',borderWidth:1}
+      ]},
+    options:{indexAxis:'y',responsive:true,plugins:{legend:{position:'bottom'}},
+      scales:{x:{max:100,ticks:{callback:function(v){return v+'%';}},grid:{color:grid}},
+        y:{grid:{display:false},ticks:{font:{size:10}}}}}
+  });
+}
+
+function dl(which){
+  if(!_job){ setStatus('err','Run a merge first.'); return; }
+  Mock.downloadFrom('/cross-impute/api/download?job='+encodeURIComponent(_job)+'&which='+which);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,84 @@
+/* Shared look for every tool page, injected by build.js after the page's own CSS.
+   The shell supplies the header, background and About panel; pages only draw their tool.
+   Selectors start with `html body` so they win over each page's own rules. */
+:root {
+  --bg: #0b0b1f; --surface: rgba(255,255,255,.045); --surface-2: rgba(255,255,255,.08);
+  --line: rgba(180,160,255,.2); --line-strong: rgba(180,160,255,.38);
+  --text: #f0eeff; --muted: #a9a3c9; --faint: #7d78a0;
+  --accent: #8b6cf0; --accent-2: #6a4fd8; --amber: #fbbf24; --teal: #2dd4bf;
+  --font: "Segoe UI", system-ui, -apple-system, Helvetica, Arial, sans-serif;
+  color-scheme: dark;
+}
+* { scrollbar-width: thin; scrollbar-color: rgba(180,160,255,.35) transparent; }
+html, html body { background: transparent !important; }
+html body { color: var(--text); font: 14px/1.5 var(--font); margin: 0; overflow-x: hidden; }
+html body::before, html body::after { display: none !important; }
+html body button, html body input, html body select, html body textarea { font-family: inherit; }
+
+/* Page frame: one width and gutter for every tool */
+html body .shell { min-height: 0; background: none; }
+html body .container, html body .wrap, html body main { max-width: 1120px; width: 100%; margin: 0 auto; padding: 14px 24px 56px; position: static; box-sizing: border-box; }
+html body #chips, html body #src { display: none !important; }
+html body .crumbs:not(:has(a)) { display: none; }
+
+/* Section headings and card titles */
+html body .sec-head, html body .sec-label { display: flex; align-items: center; gap: 12px; margin: 26px 0 12px; font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+html body .sec-head::after, html body .sec-label::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+html body .sec-head:first-child { margin-top: 4px; }
+html body .card h2, html body .step-title, html body .modal h2, html body .modal-head-title { font-size: 15px; font-weight: 700; color: var(--text); letter-spacing: 0; text-transform: none; }
+html body .card .step-num { background: rgba(139,108,240,.2); border: 1px solid rgba(139,108,240,.45); color: #d6c9ff; }
+
+/* Cards */
+html body .card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: none; backdrop-filter: none; }
+html body .card::before, html body .card::after { display: none; }
+html body .card:hover { transform: none; box-shadow: none; border-color: var(--line); }
+html body .card.link:hover { border-color: var(--line-strong); background: var(--surface-2); }
+
+/* Buttons */
+html body .btn, html body .btn-search, html body .btn-export { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 36px; padding: 0 16px; border-radius: 9px; font: 600 13px/1 var(--font); letter-spacing: 0; text-transform: none; text-decoration: none; color: var(--text); background: var(--surface); border: 1px solid var(--line-strong); box-shadow: none; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+html body .btn:hover:not(:disabled), html body .btn-export:hover:not(:disabled) { background: var(--surface-2); border-color: rgba(180,160,255,.62); transform: none; box-shadow: none; }
+html body .btn-primary, html body .btn-search { background: var(--accent); border-color: transparent; color: #fff; }
+html body .btn-primary:hover:not(:disabled), html body .btn-search:hover:not(:disabled) { background: var(--accent-2); border-color: transparent; }
+html body .btn-primary::after { display: none; }
+html body .btn-danger { color: #fca5a5; background: rgba(248,113,113,.08); border-color: rgba(248,113,113,.42); }
+html body .btn-danger:hover:not(:disabled) { background: rgba(248,113,113,.18); border-color: rgba(248,113,113,.6); }
+html body .btn-sm { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+html body .btn:disabled, html body .btn-search:disabled, html body .btn-export:disabled { opacity: .45; cursor: not-allowed; }
+html body .btn-search { min-height: 44px; }
+
+/* Fields */
+html body input:not([type=checkbox]):not([type=radio]):not([type=file]):not([type=range]), html body select, html body textarea, html body .inp {
+  background: rgba(0,0,0,.28); border: 1px solid var(--line-strong); border-radius: 9px; color: var(--text); }
+html body input:not([type=checkbox]):not([type=radio]):not([type=file]):focus, html body select:focus, html body textarea:focus, html body .inp:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(139,108,240,.25); }
+html body input::placeholder, html body textarea::placeholder { color: var(--faint); }
+html body select option { background: #15153a; color: var(--text); }
+html body input[type=file] { color: var(--muted); font-size: 12.5px; }
+html body input[type=file]::file-selector-button { font: 600 12.5px var(--font); color: var(--text); background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 8px; padding: 6px 12px; margin-right: 10px; cursor: pointer; }
+html body label, html body label.fl, html body .mfield label, html body .field label { font-size: 12px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--muted); }
+html body .hint { font-size: 12px; color: var(--faint); line-height: 1.45; }
+html body a { color: #b9a6ff; }
+html body a.btn { color: var(--text); }
+html body a.btn-primary { color: #fff; }
+:where(select, textarea, input[type=text], input[type=number], input[type=url], input[type=search], input[type=email], input[type=password]) { padding: 8px 11px; min-height: 36px; font-size: 13.5px; }
+:where(.field) :where(input:not([type=checkbox]):not([type=radio]):not([type=file]), select, textarea) { width: 100%; box-sizing: border-box; }
+:where(.field) { display: flex; flex-direction: column; gap: 6px; }
+:where(.grid-2) { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+:where(.grid-3) { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+
+/* Drop zones */
+html body .dropzone, html body .drop-zone { border: 1.5px dashed var(--line-strong); border-radius: 12px; background: rgba(255,255,255,.03); color: var(--muted); }
+html body .dropzone:hover, html body .dropzone.drag, html body .drop-zone:hover, html body .drop-zone.drag-over { border-color: var(--accent); background: rgba(139,108,240,.09); color: var(--text); }
+html body .dropzone.has-file, html body .drop-zone.filled { border-style: solid; border-color: rgba(45,212,191,.6); color: var(--text); }
+
+/* Callouts: one look, tinted by meaning */
+html body .info-note, html body .info-box, html body .banner, html body .confirm-box, html body .alert, html body .status.info, html body .msg.info {
+  border-radius: 10px; border: 1px solid rgba(167,139,250,.3); background: rgba(139,108,240,.09); color: #d9d0ff; font-size: 13px; line-height: 1.55; }
+html body .status.ok, html body .msg.ok, html body .alert-teal { border-color: rgba(45,212,191,.38); background: rgba(45,212,191,.09); color: #8ef0e0; }
+html body .status.warn, html body .msg.warn, html body .banner.warn, html body .alert-amber { border-color: rgba(251,191,36,.42); background: rgba(251,191,36,.09); color: #fcd34d; }
+html body .status.err, html body .msg.err, html body .error-box, html body .banner.err { border-color: rgba(248,113,113,.45); background: rgba(248,113,113,.1); color: #fca5a5; }
+
+/* Modals */
+html body .modal-back, html body .modal-overlay { background: rgba(5,5,18,.72); backdrop-filter: blur(3px); }
+html body .modal, html body .modal-box { background: #14143a; border: 1px solid var(--line-strong); border-radius: 16px; box-shadow: 0 24px 60px -12px rgba(0,0,0,.65); }
+html body .modal-box::before { display: none; }

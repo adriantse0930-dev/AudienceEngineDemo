@@ -1,0 +1,2647 @@
+<script data-demo="one_p_modeling">
+// 1P Modelling mock: a pretend data warehouse (DEMO_WAREHOUSE) with
+// generated households, a client CRM extract that joins to them, and in-browser
+// re-implementations of the blueprint's modelling: tree-ensemble trait ranking,
+// logistic-regression lookalike scoring, NTILE distributions, taxonomy
+// profiling, k-means sweep/fit and the polled Excel exports.
+(function () {
+  'use strict';
+  var P = '/1p-modeling/api';
+  var IDENT = /^[A-Za-z_][A-Za-z0-9_$]*$/;
+  var CFG = {
+    account: 'demo-account.ca-central-1', user: 'demo.analyst@example.com', role: 'DEMO_ANALYST',
+    database: 'DEMO_WAREHOUSE', schema: 'COMPANY_DATA', warehouse: 'DEMO_WH'
+  };
+  var state = { connected: false };
+  var MODELS = {}, CLUSTERS = {}, EXPORTS = {};
+
+  function err(msg, status) { return Mock.json({ error: msg }, status || 400); }
+  function notConn() { return err('Not connected yet — click Connect first.'); }
+  function uid() { return Math.random().toString(16).slice(2, 8) + Date.now().toString(16).slice(-6); }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function toInt(v, dflt) {
+    if (v === undefined || v === null || v === '') return dflt;
+    var n = Number(v);
+    if (!isFinite(n)) throw new Error('nan');
+    return Math.trunc(n);
+  }
+  function fmt(n) { return Number(n).toLocaleString('en-US'); }
+  function sigmoid(z) { return 1 / (1 + Math.exp(-z)); }
+  function median(a) {
+    var v = a.filter(function (x) { return x != null && isFinite(x); }).sort(function (x, y) { return x - y; });
+    if (!v.length) return null;
+    var m = v.length >> 1;
+    return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+  }
+
+  // ══ The warehouse ══════════════════════════════════════════════════════════
+  var TYPES = ['Urban Young Professionals', 'Suburban Families', 'Affluent Empty Nesters',
+               'Rural Traditionalists', 'Budget Starters', 'Active Retirees'];
+  var TYPE_W = [0.18, 0.24, 0.14, 0.14, 0.16, 0.14];
+  // Taxonomy: category > insight group > leaves; probs per latent type.
+  var GROUPS = [
+    { cat: 'Demographics', group: 'Household Income', ex: true, prec: 'Household',
+      desc: 'Modelled annual household income band', leaves: [
+        ['Under $50K', [.20, .15, .05, .40, .60, .30]], ['$50K–$100K', [.40, .40, .20, .40, .30, .40]],
+        ['$100K–$150K', [.25, .30, .35, .15, .08, .20]], ['$150K+', [.15, .15, .40, .05, .02, .10]]] },
+    { cat: 'Demographics', group: 'Age of Head of Household', ex: true, prec: 'Individual',
+      desc: 'Modelled age band of the head of household', leaves: [
+        ['18–34', [.70, .20, .02, .20, .60, .01]], ['35–54', [.28, .70, .28, .40, .30, .05]],
+        ['55+', [.02, .10, .70, .40, .10, .94]]] },
+    { cat: 'Demographics', group: 'Household Composition', prec: 'Household',
+      desc: 'Likelihood the household matches this composition', leaves: [
+        ['Children Present', [.15, .80, .10, .45, .30, .05]], ['Single Person', [.45, .05, .20, .15, .40, .35]]] },
+    { cat: 'Lifestyle & Interests', group: 'Outdoor Activities', prec: 'Household',
+      desc: 'Likelihood of participating in this activity in the past 12 months', leaves: [
+        ['Camping', [.20, .40, .15, .55, .20, .15]], ['Cycling', [.45, .30, .20, .10, .25, .20]],
+        ['Golf', [.10, .20, .45, .15, .05, .40]], ['Hiking', [.40, .35, .30, .35, .20, .35]]] },
+    { cat: 'Lifestyle & Interests', group: 'Home & Garden', prec: 'Household',
+      desc: 'Likelihood of regular engagement with this hobby', leaves: [
+        ['DIY Projects', [.15, .50, .35, .55, .20, .30]], ['Gardening', [.10, .35, .55, .50, .10, .65]]] },
+    { cat: 'Media Consumption', group: 'Streaming Video', ex: true, prec: 'Individual',
+      desc: 'Weekly hours of subscription video streaming', leaves: [
+        ['Heavy', [.60, .40, .20, .25, .55, .15]], ['Medium', [.30, .40, .40, .35, .30, .30]],
+        ['Light', [.10, .20, .40, .40, .15, .55]]] },
+    { cat: 'Media Consumption', group: 'Podcasts', prec: 'Individual',
+      desc: 'Podcast listening frequency', leaves: [
+        ['Heavy', [.40, .20, .10, .08, .25, .05]], ['Light', [.35, .35, .30, .20, .30, .20]]] },
+    { cat: 'Purchase Behaviour', group: 'Grocery Channel', prec: 'Household',
+      desc: 'Primary grocery shopping channel propensity', leaves: [
+        ['Discount', [.30, .45, .15, .50, .75, .35]], ['Premium', [.35, .20, .55, .10, .05, .30]],
+        ['Online', [.50, .35, .25, .10, .20, .10]]] },
+    { cat: 'Purchase Behaviour', group: 'Travel', prec: 'Household',
+      desc: 'Likelihood of taking this type of trip in the next 12 months', leaves: [
+        ['Domestic Trips', [.50, .55, .60, .35, .20, .55]], ['International Trips', [.45, .20, .55, .08, .10, .35]]] },
+    { cat: 'Financial', group: 'Investments', prec: 'Household',
+      desc: 'Likelihood of holding this product', leaves: [
+        ['Retirement Savings Plan', [.40, .60, .80, .40, .15, .70]], ['Tax-Free Savings Account', [.55, .55, .70, .35, .30, .60]],
+        ['Self-Directed Trader', [.30, .15, .30, .05, .10, .15]]] },
+    { cat: 'Automotive', group: 'Vehicle Intent', prec: 'Household',
+      desc: 'Likelihood of purchasing this vehicle type in the next 2 years', leaves: [
+        ['EV Intender', [.35, .20, .25, .03, .08, .10]], ['SUV Intender', [.20, .55, .30, .30, .15, .20]],
+        ['Pickup Intender', [.05, .20, .08, .55, .10, .10]]] }
+  ];
+  var SEGMENTS = [
+    ['LS01', 'Downtown Dynamos', 0], ['LS02', 'Condo Commuters', 0], ['LS03', 'Minivan Mornings', 1],
+    ['LS04', 'Cul-de-sac Comfort', 1], ['LS05', 'Lakeside Leisure', 2], ['LS06', 'Established Elegance', 2],
+    ['LS07', 'Country Roots', 3], ['LS08', 'Small-Town Steady', 3], ['LS09', 'First-Apartment Frugal', 4],
+    ['LS10', 'Side-Hustle Savers', 4], ['LS11', 'Fairway Retirees', 5], ['LS12', 'Snowbird Circuit', 5]
+  ];
+
+  var W = null;
+  function warehouse() { return W || (W = buildWarehouse()); }
+
+  function buildWarehouse() {
+    var r = Mock.rng('1p-demo-warehouse-v1');
+    var fsas = Mock.fsaList.length ? Mock.fsaList : [{ FSA: 'M5V', CITY: 'Toronto', REGION: 'GTA', PROVINCE: 'ON', POPULATION: 30000, HOUSEHOLDS: 12000 }];
+    function pickW(w) { var t = r() * w.reduce(function (a, b) { return a + b; }, 0); for (var i = 0; i < w.length; i++) { t -= w[i]; if (t <= 0) return i; } return w.length - 1; }
+    var used = {};
+    function hid() { var s; do { s = 'h'; for (var i = 0; i < 15; i++) s += '0123456789abcdef'[Math.floor(r() * 16)]; } while (used[s]); used[s] = 1; return s; }
+    function pc(fsa) { return fsa + ' ' + Math.floor(r() * 10) + 'ABCEGHJKLMNPRSTVWXYZ'[Math.floor(r() * 20)] + Math.floor(r() * 10); }
+    function date(y0, y1) { var y = Mock.randInt(y0, y1, r), m = Mock.randInt(1, 12, r), d = Mock.randInt(1, 28, r); return y + '-' + (m < 10 ? '0' : '') + m + '-' + (d < 10 ? '0' : '') + d; }
+
+    // Concepts -> column codes + dictionary
+    var concepts = [], dict = [], code = 101;
+    GROUPS.forEach(function (g, gi) {
+      g.leaves.forEach(function (lf, li) {
+        var c = { gi: gi, li: li, leaf: lf[0], probs: lf[1], code: 'TR' + code,
+                  ix: 'TR' + code + '_IX', pc: 'TR' + code + '_PC', bn: 'TR' + code + '_BN' };
+        var elem = g.group + ' > ' + lf[0];
+        dict.push({ COLUMN_NAME: c.ix, ELEMENT_NAME: elem + ' (Index)', DESCRIPTION: g.desc, CATEGORY: g.cat, DECODES: '', PRECISION_LEVEL: g.prec, DATA_TYPE: 'NUMBER' });
+        dict.push({ COLUMN_NAME: c.pc, ELEMENT_NAME: elem + ' (Percentage)', DESCRIPTION: g.desc, CATEGORY: g.cat, DECODES: '', PRECISION_LEVEL: g.prec, DATA_TYPE: 'NUMBER' });
+        dict.push({ COLUMN_NAME: c.bn, ELEMENT_NAME: elem + ' (Binary)', DESCRIPTION: g.desc, CATEGORY: g.cat, DECODES: 'Y = Yes; N = No', PRECISION_LEVEL: g.prec, DATA_TYPE: 'TEXT' });
+        concepts.push(c); code++;
+      });
+    });
+    dict.push({ COLUMN_NAME: 'HH_SIZE', ELEMENT_NAME: 'Household Size', DESCRIPTION: 'Estimated number of people in the household', CATEGORY: 'Demographics', DECODES: '', PRECISION_LEVEL: 'Household', DATA_TYPE: 'NUMBER' });
+    dict.push({ COLUMN_NAME: 'EST_INCOME_K', ELEMENT_NAME: 'Estimated Household Income ($K)', DESCRIPTION: 'Modelled household income in thousands', CATEGORY: 'Demographics', DECODES: '', PRECISION_LEVEL: 'Household', DATA_TYPE: 'NUMBER' });
+    dict.push({ COLUMN_NAME: 'YEARS_AT_ADDRESS', ELEMENT_NAME: 'Length of Residence (Years)', DESCRIPTION: 'Years at current address', CATEGORY: 'Demographics', DECODES: '', PRECISION_LEVEL: 'Household', DATA_TYPE: 'NUMBER' });
+    dict.push({ COLUMN_NAME: 'GENDER_HEAD', ELEMENT_NAME: 'Gender of Head of Household', DESCRIPTION: 'Modelled gender', CATEGORY: 'Demographics', DECODES: 'F = Female; M = Male; U = Unknown', PRECISION_LEVEL: 'Individual', DATA_TYPE: 'TEXT' });
+
+    // Households
+    var N = 2000, hh = [], latent = [];
+    var cov = [0.90, 0.90, 0.92, 0.74, 0.80, 0.88];
+    var hhSize = [1.8, 3.9, 2.1, 3.0, 1.9, 1.9];
+    for (var i = 0; i < N; i++) {
+      var t = pickW(TYPE_W);
+      var f = fsas[Math.floor(r() * fsas.length)];
+      var segs = SEGMENTS.filter(function (s) { return s[2] === t; });
+      var row = { HASHED_ID: hid(), FSA: f.FSA, LIFESTYLE_SEGMENT: segs[Math.floor(r() * segs.length)][0],
+                  GENDER_HEAD: r() < 0.06 ? 'U' : (r() < 0.5 ? 'F' : 'M') };
+      var p = {};
+      GROUPS.forEach(function (g, gi) {
+        var cs = concepts.filter(function (c) { return c.gi === gi; });
+        var chosen = -1;
+        if (g.ex) chosen = pickW(cs.map(function (c) { return c.probs[t]; }));
+        cs.forEach(function (c, li) {
+          var pr = g.ex ? (li === chosen ? 0.72 + 0.23 * r() : 0.02 + 0.08 * r())
+                        : clamp(c.probs[t] * Math.exp(Mock.gauss(0, 0.35, r)), 0.01, 0.97);
+          p[c.code] = pr;
+          row[c.pc] = r() < 0.03 ? null : Mock.round(pr * 100, 1);
+          row[c.bn] = r() < cov[t] ? (r() < pr ? 'Y' : 'N') : null;
+        });
+      });
+      var inc = [35, 75, 125, 190];
+      var band = [0, 1, 2, 3].reduce(function (b, k) { return p[concepts[k].code] > p[concepts[b].code] ? k : b; }, 0);
+      row.EST_INCOME_K = r() < 0.04 ? null : Math.round(inc[band] * Math.exp(Mock.gauss(0, 0.18, r)));
+      row.HH_SIZE = Math.max(1, Math.round(hhSize[t] + Mock.gauss(0, 0.9, r)));
+      row.YEARS_AT_ADDRESS = Math.max(0, Math.round((t === 2 || t === 5 ? 16 : t === 0 || t === 4 ? 3 : 9) + Mock.gauss(0, 3.5, r)));
+      hh.push(row); latent.push({ t: t, p: p, band: band });
+    }
+    // Index columns: household likelihood vs the table-wide mean likelihood
+    concepts.forEach(function (c) {
+      var m = hh.reduce(function (a, _, k) { return a + latent[k].p[c.code]; }, 0) / N;
+      hh.forEach(function (row, k) { row[c.ix] = r() < 0.03 ? null : clamp(Math.round(100 * latent[k].p[c.code] / m + Mock.gauss(0, 6, r)), 0, 400); });
+    });
+
+    // Client CRM — an outdoor/travel retailer whose customers skew affluent,
+    // outdoorsy, EV-curious and well-travelled (so the lookalike has signal).
+    function pv(k, leaf, gname) { var c = concepts.filter(function (x) { return x.leaf === leaf && GROUPS[x.gi].group === gname; })[0]; return latent[k].p[c.code]; }
+    var members = [];
+    hh.forEach(function (row, k) {
+      var L = latent[k];
+      var z = -3.6 + 1.1 * (L.band >= 2 ? 1 : 0) + 1.7 * (pv(k, 'Hiking', 'Outdoor Activities') + pv(k, 'Camping', 'Outdoor Activities'))
+            + 2.2 * pv(k, 'EV Intender', 'Vehicle Intent') + 1.3 * pv(k, 'International Trips', 'Travel') - 0.7 * (L.t === 4 ? 1 : 0);
+      if (r() < sigmoid(z)) members.push(row);
+    });
+    var tiers = ['Bronze', 'Silver', 'Gold', 'Platinum', 'Lapsed'];
+    var crm = [];
+    members.forEach(function (m) { crm.push({ HASHED_ID: m.HASHED_ID, FSA: m.FSA }); });
+    for (var d = 0; d < 18; d++) { var m2 = members[Math.floor(r() * members.length)]; crm.push({ HASHED_ID: m2.HASHED_ID, FSA: m2.FSA }); }
+    while (crm.length < 1500) crm.push({ HASHED_ID: hid(), FSA: fsas[Math.floor(r() * fsas.length)].FSA });
+    crm = Mock.shuffle(crm, r).map(function (c, k) {
+      return { CUSTOMER_ID: 'C' + String(100001 + k), HASHED_ID: c.HASHED_ID, POSTAL_CODE: pc(c.FSA), FSA: c.FSA,
+               SIGNUP_DATE: date(2016, 2026), LOYALTY_TIER: tiers[pickW([.35, .28, .18, .07, .12])],
+               LIFETIME_SPEND: Mock.round(Math.exp(Mock.gauss(6.2, 0.9, r)), 2), EMAIL_OPT_IN: r() < 0.62 ? 'Y' : 'N' };
+    });
+    var cats = ['Footwear', 'Tents & Shelter', 'Apparel', 'Cycling', 'Paddle Sports', 'Climbing', 'Travel Gear', 'Camp Kitchen'];
+    var txns = [];
+    for (var x = 0; x < 1200; x++) {
+      var cu = crm[Math.floor(r() * crm.length)];
+      txns.push({ TXN_ID: 'T' + String(5000001 + x), HASHED_ID: cu.HASHED_ID, CUSTOMER_ID: cu.CUSTOMER_ID,
+                  TXN_DATE: date(2024, 2026), CATEGORY: cats[Math.floor(r() * cats.length)],
+                  AMOUNT: Mock.round(Math.exp(Mock.gauss(4.3, 0.8, r)), 2), CHANNEL: pickW([.55, .45]) ? 'Online' : 'Store' });
+    }
+    var demo = fsas.map(function (f) {
+      return { FSA: f.FSA, CITY: f.CITY, REGION: f.REGION, PROVINCE: f.PROVINCE, POPULATION: f.POPULATION, HOUSEHOLDS: f.HOUSEHOLDS,
+               MEDIAN_AGE: Mock.round(Mock.randFloat(31, 49, r), 1), AVG_HH_INCOME: Math.round(Mock.randFloat(62000, 168000, r)),
+               PCT_UNIVERSITY: Mock.round(Mock.randFloat(18, 64, r), 1), PCT_RENTERS: Mock.round(Mock.randFloat(12, 71, r), 1),
+               PCT_VISIBLE_MINORITY: Mock.round(Mock.randFloat(8, 72, r), 1) };
+    });
+    var segRows = SEGMENTS.map(function (s) {
+      var n = hh.filter(function (h) { return h.LIFESTYLE_SEGMENT === s[0]; }).length;
+      return { SEGMENT_CODE: s[0], SEGMENT_NAME: s[1], SEGMENT_FAMILY: TYPES[s[2]], HH_SHARE_PCT: Mock.round(n / N * 100, 2),
+               MEDIAN_AGE: [31, 42, 63, 51, 28, 71][s[2]] + Mock.randInt(-3, 3, r),
+               DESCRIPTION: TYPES[s[2]] + ' — synthetic lifestyle cluster for demo purposes' };
+    });
+    var cal = [];
+    for (var w = 0; w < 24; w++) cal.push({ WEEK_START: '2026-' + String(Math.floor(w / 4) + 1).padStart(2, '0') + '-' + String(1 + (w % 4) * 7).padStart(2, '0'),
+      CAMPAIGN: ['Spring Launch', 'Trail Season', 'Summer Escape', 'Back to Basics', 'Fall Layers', 'Holiday Gear'][Math.floor(w / 4)],
+      CHANNEL: ['Social', 'Search', 'CTV', 'Display'][w % 4], PLANNED_SPEND: Math.round(Mock.randFloat(8000, 42000, r)) });
+
+    function cols(rows, types) {
+      return Object.keys(rows[0]).map(function (k) {
+        return { name: k, type: types[k] || (rows.some(function (x) { return typeof x[k] === 'number'; }) ? 'NUMBER' : 'TEXT') };
+      });
+    }
+    function tbl(name, rows, extra) {
+      extra = extra || {};
+      return { name: name, rows: rows, columns: cols(rows, extra.types || {}), type: extra.view ? 'VIEW' : 'BASE TABLE',
+               altered: extra.altered || '2026-09-18 07:42:11.000 -0700', comment: extra.comment || '' };
+    }
+    var hhTypes = { LIFESTYLE_SEGMENT: 'TEXT', GENDER_HEAD: 'TEXT', FSA: 'TEXT', HASHED_ID: 'TEXT' };
+    dict.forEach(function (dr) { hhTypes[dr.COLUMN_NAME] = dr.DATA_TYPE; });
+    var dictRows = dict.map(function (dr) { return { COLUMN_NAME: dr.COLUMN_NAME, ELEMENT_NAME: dr.ELEMENT_NAME, DESCRIPTION: dr.DESCRIPTION, CATEGORY: dr.CATEGORY, DECODES: dr.DECODES, PRECISION_LEVEL: dr.PRECISION_LEVEL }; });
+    var dbs = {
+      DEMO_WAREHOUSE: {
+        CLIENT_DATA: [
+          tbl('CLIENT_CRM_CUSTOMERS', crm, { altered: '2026-09-21 16:05:47.000 -0700', types: { SIGNUP_DATE: 'DATE' } }),
+          tbl('CLIENT_TRANSACTIONS', txns, { altered: '2026-09-22 03:15:02.000 -0700', types: { TXN_DATE: 'DATE' } }),
+          tbl('V_ACTIVE_CUSTOMERS', crm.filter(function (c) { return c.LOYALTY_TIER !== 'Lapsed'; }), { view: true, types: { SIGNUP_DATE: 'DATE' } })
+        ],
+        COMPANY_DATA: [
+          tbl('DEMOGRAPHICS_FSA', demo, { altered: '2026-08-30 11:20:00.000 -0700' }),
+          tbl('HOUSEHOLD_ATTRIBUTES', hh, { types: hhTypes, altered: '2026-09-15 02:10:33.000 -0700' }),
+          tbl('HOUSEHOLD_ATTRIBUTES_DICTIONARY', dictRows, { altered: '2026-09-15 02:11:04.000 -0700' }),
+          tbl('LIFESTYLE_SEGMENTS', segRows, { altered: '2026-07-02 09:00:00.000 -0700' })
+        ],
+        INFORMATION_SCHEMA: []
+      },
+      SANDBOX: { PUBLIC: [tbl('CAMPAIGN_CALENDAR', cal, { types: { WEEK_START: 'DATE' } })], INFORMATION_SCHEMA: [] }
+    };
+    return { dbs: dbs };
+  }
+
+  function getTable(db, schema, table) {
+    var d = warehouse().dbs[db]; if (!d || !d[schema]) return null;
+    return d[schema].filter(function (t) { return t.name === table; })[0] || null;
+  }
+  function refOk(side, keys) {
+    for (var i = 0; i < keys.length; i++) if (!IDENT.test(String(side[keys[i]] == null ? '' : side[keys[i]]))) return keys[i];
+    return null;
+  }
+  function validateSides(pairs, keys) {
+    for (var i = 0; i < pairs.length; i++) {
+      var bad = refOk(pairs[i][1] || {}, keys || ['db', 'schema', 'table', 'column']);
+      if (bad) return err('Invalid ' + pairs[i][0] + ' ' + bad + '.');
+    }
+    return null;
+  }
+  function tableOr404(side) {
+    var t = getTable(side.db, side.schema, side.table);
+    if (!t) throw new Error("SQL compilation error: Object '" + side.db + '.' + side.schema + '.' + side.table + "' does not exist or not authorized.");
+    return t;
+  }
+  function colOr(t, c) {
+    if (!t.columns.some(function (x) { return x.name === c; })) throw new Error("SQL compilation error: invalid identifier '" + c + "'");
+  }
+  function keyOf(v) { return v == null || v === '' ? null : String(v); }
+  function semiJoin(base, client) {
+    var bt = tableOr404(base), ct = tableOr404(client);
+    colOr(bt, base.column); colOr(ct, client.column);
+    var set = {};
+    ct.rows.forEach(function (r) { var k = keyOf(r[client.column]); if (k != null) set[k] = 1; });
+    return { bt: bt, ct: ct, set: set, rows: bt.rows.filter(function (r) { var k = keyOf(r[base.column]); return k != null && set[k]; }) };
+  }
+
+  // Dictionary / candidate features (mirrors _load_dictionary + _all_candidate_features)
+  function dictionaryFor(db, schema, table) {
+    var d = getTable(db, schema, table + '_DICTIONARY');
+    if (!d) return null;
+    var out = {};
+    d.rows.forEach(function (r) { out[r.COLUMN_NAME] = { label: r.ELEMENT_NAME || '', description: r.DESCRIPTION || '', category: r.CATEGORY || '', decodes: r.DECODES || '', precision: r.PRECISION_LEVEL || '' }; });
+    return out;
+  }
+  function candidateFeatures(base, t) {
+    var dict = dictionaryFor(base.db, base.schema, base.table) || {};
+    var cols = t.columns.filter(function (c) { return (c.type === 'NUMBER' || c.type === 'TEXT') && c.name !== base.column; })
+      .sort(function (a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+    var out = [];
+    cols.forEach(function (c) {
+      var meta = dict[c.name] || {}, label = meta.label || '', kind;
+      if (c.type === 'NUMBER') kind = /\(Index\)$/.test(label) ? 'index' : /\(Percentage\)$/.test(label) ? 'percentage' : 'other';
+      else {
+        if (!(meta.decodes || '').trim().toUpperCase().startsWith('Y = YES')) return;
+        kind = 'binary';
+      }
+      out.push({ column: c.name, kind: kind, label: label || c.name, description: meta.description || '', category: meta.category || '' });
+    });
+    return out;
+  }
+  function featVal(row, f) {
+    var v = row[f.column];
+    if (f.kind === 'binary') return v === 'Y' ? 1 : 0;
+    if (v == null || v === '') return NaN;
+    v = Number(v);
+    return isFinite(v) ? v : NaN;
+  }
+
+  // ══ Maths ══════════════════════════════════════════════════════════════════
+  function standardize(X, cols) {           // StandardScaler (ddof 0)
+    var n = X.length, mean = [], scale = [];
+    cols.forEach(function (j, c) {
+      var s = 0; for (var i = 0; i < n; i++) s += X[i][j];
+      var m = s / n, v = 0; for (i = 0; i < n; i++) v += (X[i][j] - m) * (X[i][j] - m);
+      mean[c] = m; scale[c] = Math.sqrt(v / n) || 1;
+    });
+    return { mean: mean, scale: scale, Z: X.map(function (row) { return cols.map(function (j, c) { return (row[j] - mean[c]) / scale[c]; }); }) };
+  }
+  function solve(A, b) {                    // Gaussian elimination, partial pivoting
+    var n = b.length, M = A.map(function (r, i) { return r.concat([b[i]]); });
+    for (var c = 0; c < n; c++) {
+      var p = c; for (var r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+      var tmp = M[c]; M[c] = M[p]; M[p] = tmp;
+      var d = M[c][c] || 1e-12;
+      for (r = c + 1; r < n; r++) { var f = M[r][c] / d; if (!f) continue; for (var k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
+    }
+    var x = new Array(n);
+    for (var i = n - 1; i >= 0; i--) { var s = M[i][n]; for (var j = i + 1; j < n; j++) s -= M[i][j] * x[j]; x[i] = s / (M[i][i] || 1e-12); }
+    return x;
+  }
+  // LogisticRegression(C=1, class_weight='balanced'), fitted by Newton/IRLS.
+  function fitLogistic(Z, y) {
+    var n = Z.length, d = Z[0].length, n1 = y.reduce(function (a, b) { return a + b; }, 0), n0 = n - n1;
+    var sw = y.map(function (v) { return v ? n / (2 * n1) : n / (2 * n0); });
+    var beta = new Array(d + 1).fill(0);        // [intercept, w...]
+    for (var it = 0; it < 30; it++) {
+      var g = new Array(d + 1).fill(0), H = [];
+      for (var a = 0; a <= d; a++) H.push(new Array(d + 1).fill(0));
+      for (var i = 0; i < n; i++) {
+        var z = beta[0]; for (var j = 0; j < d; j++) z += beta[j + 1] * Z[i][j];
+        var p = sigmoid(z), e = sw[i] * (p - y[i]), wgt = sw[i] * p * (1 - p);
+        var xi = [1].concat(Z[i]);
+        for (a = 0; a <= d; a++) { g[a] += e * xi[a]; var wa = wgt * xi[a]; for (var b = a; b <= d; b++) H[a][b] += wa * xi[b]; }
+      }
+      for (a = 0; a <= d; a++) for (b = 0; b < a; b++) H[a][b] = H[b][a];
+      for (a = 1; a <= d; a++) { g[a] += beta[a]; H[a][a] += 1; }
+      var step = solve(H, g), mx = 0;
+      for (a = 0; a <= d; a++) { beta[a] -= step[a]; mx = Math.max(mx, Math.abs(step[a])); }
+      if (mx < 1e-7) break;
+    }
+    return { intercept: beta[0], coef: beta.slice(1) };
+  }
+  function predictLogistic(m, Z) {
+    return Z.map(function (row) { var z = m.intercept; for (var j = 0; j < row.length; j++) z += m.coef[j] * row[j]; return sigmoid(z); });
+  }
+  function auc(y, s) {                      // Mann-Whitney with tie-averaged ranks
+    var idx = s.map(function (_, i) { return i; }).sort(function (a, b) { return s[a] - s[b]; });
+    var ranks = new Array(s.length), i = 0;
+    while (i < idx.length) { var j = i; while (j + 1 < idx.length && s[idx[j + 1]] === s[idx[i]]) j++; var rk = (i + j) / 2 + 1; for (var k = i; k <= j; k++) ranks[idx[k]] = rk; i = j + 1; }
+    var n1 = 0, sum = 0; y.forEach(function (v, q) { if (v) { n1++; sum += ranks[q]; } });
+    var n0 = y.length - n1;
+    return n1 && n0 ? (sum - n1 * (n1 + 1) / 2) / (n1 * n0) : 0.5;
+  }
+  // RandomForestClassifier stand-in: bagged, depth-limited Gini trees with
+  // class_weight='balanced', max_samples=0.25, sqrt(p) features per split.
+  function forestImportance(X, y, rows, F, rnd) {
+    var nTrees = 80, maxDepth = 8, minLeaf = 20, mtry = Math.max(1, Math.round(Math.sqrt(F)));
+    var n1 = 0; rows.forEach(function (i) { n1 += y[i]; });
+    var n0 = rows.length - n1, w1 = rows.length / (2 * n1), w0 = rows.length / (2 * n0);
+    var imp = new Array(F).fill(0);
+    function gini(a, b) { var t = a + b; if (!t) return 0; var p = a / t, q = b / t; return 1 - p * p - q * q; }
+    for (var t = 0; t < nTrees; t++) {
+      var m = Math.max(2 * minLeaf, Math.floor(rows.length * 0.25)), samp = [];
+      for (var s = 0; s < m; s++) samp.push(rows[Math.floor(rnd() * rows.length)]);
+      var timp = new Array(F).fill(0);
+      (function grow(ids, depth) {
+        var a1 = 0, a0 = 0; ids.forEach(function (i) { if (y[i]) a1 += w1; else a0 += w0; });
+        if (depth >= maxDepth || ids.length < 2 * minLeaf || !a1 || !a0) return;
+        var parent = (a1 + a0) * gini(a1, a0), best = null;
+        var feats = Mock.shuffle(Array.from({ length: F }, function (_, k) { return k; }), rnd).slice(0, mtry);
+        feats.forEach(function (f) {
+          var ord = ids.slice().sort(function (p, q) { return X[p][f] - X[q][f]; });
+          var l1 = 0, l0 = 0;
+          for (var k = 0; k < ord.length - 1; k++) {
+            if (y[ord[k]]) l1 += w1; else l0 += w0;
+            if (k + 1 < minLeaf || ord.length - k - 1 < minLeaf) continue;
+            if (X[ord[k]][f] === X[ord[k + 1]][f]) continue;
+            var dec = parent - (l1 + l0) * gini(l1, l0) - (a1 - l1 + a0 - l0) * gini(a1 - l1, a0 - l0);
+            if (!best || dec > best.dec) best = { dec: dec, f: f, thr: (X[ord[k]][f] + X[ord[k + 1]][f]) / 2 };
+          }
+        });
+        if (!best || best.dec <= 1e-12) return;
+        timp[best.f] += best.dec;
+        var L = [], R = []; ids.forEach(function (i) { (X[i][best.f] <= best.thr ? L : R).push(i); });
+        grow(L, depth + 1); grow(R, depth + 1);
+      })(samp, 0);
+      var tot = timp.reduce(function (a, b) { return a + b; }, 0);
+      if (tot > 0) for (var f = 0; f < F; f++) imp[f] += timp[f] / tot;
+    }
+    var all = imp.reduce(function (a, b) { return a + b; }, 0) || 1;
+    return imp.map(function (v) { return v / all; });
+  }
+
+  // K-means (k-means++ init, Lloyd iterations) on flat Float64Arrays.
+  function kmeans(Z, k, seed, nInit, maxIter) {
+    var n = Z.length, d = Z[0].length, rnd = Mock.rng(seed), best = null;
+    var flat = new Float64Array(n * d); for (var i = 0; i < n; i++) for (var j = 0; j < d; j++) flat[i * d + j] = Z[i][j];
+    for (var run = 0; run < nInit; run++) {
+      var C = new Float64Array(k * d), dist = new Float64Array(n).fill(Infinity);
+      var first = Math.floor(rnd() * n); for (j = 0; j < d; j++) C[j] = flat[first * d + j];
+      for (var c = 1; c < k; c++) {
+        var tot = 0;
+        for (i = 0; i < n; i++) { var s = 0; for (j = 0; j < d; j++) { var q = flat[i * d + j] - C[(c - 1) * d + j]; s += q * q; } if (s < dist[i]) dist[i] = s; tot += dist[i]; }
+        var tgt = rnd() * tot, pick = n - 1;
+        for (i = 0; i < n; i++) { tgt -= dist[i]; if (tgt <= 0) { pick = i; break; } }
+        for (j = 0; j < d; j++) C[c * d + j] = flat[pick * d + j];
+      }
+      var lab = new Int32Array(n), inertia = 0;
+      for (var it = 0; it < maxIter; it++) {
+        var moved = 0; inertia = 0;
+        for (i = 0; i < n; i++) {
+          var bd = Infinity, bc = 0;
+          for (c = 0; c < k; c++) { s = 0; for (j = 0; j < d; j++) { q = flat[i * d + j] - C[c * d + j]; s += q * q; } if (s < bd) { bd = s; bc = c; } }
+          if (lab[i] !== bc || it === 0) { moved++; lab[i] = bc; }
+          inertia += bd;
+        }
+        var S = new Float64Array(k * d), cnt = new Int32Array(k);
+        for (i = 0; i < n; i++) { cnt[lab[i]]++; for (j = 0; j < d; j++) S[lab[i] * d + j] += flat[i * d + j]; }
+        for (c = 0; c < k; c++) {
+          if (!cnt[c]) { var r0 = Math.floor(rnd() * n); for (j = 0; j < d; j++) C[c * d + j] = flat[r0 * d + j]; continue; }
+          for (j = 0; j < d; j++) C[c * d + j] = S[c * d + j] / cnt[c];
+        }
+        if (!moved && it > 0) break;
+      }
+      // final inertia against final centroids
+      inertia = 0;
+      for (i = 0; i < n; i++) { bd = Infinity; bc = 0; for (c = 0; c < k; c++) { s = 0; for (j = 0; j < d; j++) { q = flat[i * d + j] - C[c * d + j]; s += q * q; } if (s < bd) { bd = s; bc = c; } } lab[i] = bc; inertia += bd; }
+      if (!best || inertia < best.inertia) best = { inertia: inertia, labels: Array.from(lab), C: C };
+    }
+    var centers = []; for (c = 0; c < k; c++) centers.push(Array.from(best.C.slice(c * d, c * d + d)));
+    return { labels: best.labels, centers: centers, inertia: best.inertia };
+  }
+  function edist(a, b) { var s = 0; for (var j = 0; j < a.length; j++) { var q = a[j] - b[j]; s += q * q; } return Math.sqrt(s); }
+  function clusterMetrics(Z, lab) {
+    var ks = Array.from(new Set(lab)); if (ks.length < 2) return null;
+    var n = Z.length, d = Z[0].length, byC = {};
+    lab.forEach(function (l, i) { (byC[l] = byC[l] || []).push(i); });
+    // silhouette
+    var sil = 0;
+    for (var i = 0; i < n; i++) {
+      var sums = {}; ks.forEach(function (c) { sums[c] = 0; });
+      for (var j = 0; j < n; j++) if (j !== i) sums[lab[j]] += edist(Z[i], Z[j]);
+      var own = byC[lab[i]].length;
+      if (own <= 1) continue;
+      var a = sums[lab[i]] / (own - 1), b = Infinity;
+      ks.forEach(function (c) { if (c !== lab[i]) b = Math.min(b, sums[c] / byC[c].length); });
+      sil += (b - a) / Math.max(a, b);
+    }
+    sil /= n;
+    var mean = new Array(d).fill(0); Z.forEach(function (r) { for (var j = 0; j < d; j++) mean[j] += r[j] / n; });
+    var cent = {}, scat = {}, B = 0, Wt = 0;
+    ks.forEach(function (c) {
+      var m = new Array(d).fill(0), ids = byC[c];
+      ids.forEach(function (i) { for (var j = 0; j < d; j++) m[j] += Z[i][j] / ids.length; });
+      cent[c] = m;
+      var sc = 0; ids.forEach(function (i) { var e = edist(Z[i], m); Wt += e * e; sc += e; });
+      scat[c] = sc / ids.length;
+      var e2 = edist(m, mean); B += ids.length * e2 * e2;
+    });
+    var k = ks.length;
+    var ch = Wt ? (B / (k - 1)) / (Wt / (n - k)) : null;
+    var db = 0;
+    ks.forEach(function (c) { var mx = 0; ks.forEach(function (o) { if (o !== c) { var md = edist(cent[c], cent[o]); if (md) mx = Math.max(mx, (scat[c] + scat[o]) / md); } }); db += mx; });
+    return { silhouette: sil, ch: ch, db: db / k };
+  }
+  var SIL_SAMPLE = 700;
+  function silSample(n) {
+    if (n <= SIL_SAMPLE) return Array.from({ length: n }, function (_, i) { return i; });
+    return Mock.shuffle(Array.from({ length: n }, function (_, i) { return i; }), Mock.rng(42)).slice(0, SIL_SAMPLE);
+  }
+
+  // ══ Scoring helpers ════════════════════════════════════════════════════════
+  function scoreRow(model, row) {
+    var z = model.intercept;
+    model.features.forEach(function (f) {
+      var v = featVal(row, f); if (isNaN(v)) v = f.impute;
+      z += f.coef * ((v - f.mean) / f.scale);
+    });
+    return sigmoid(z);
+  }
+  function ranked(model) {                  // ORDER BY score DESC, ID
+    if (model._ranked) return model._ranked;
+    var t = getTable(model.base.db, model.base.schema, model.base.table), col = model.base.column;
+    var list = t.rows.map(function (r) { return { row: r, id: r[col], s: scoreRow(model, r) }; });
+    list.sort(function (a, b) { return b.s - a.s || (String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0); });
+    return (model._ranked = list);
+  }
+  function ntile(n, b) {                    // sizes per bucket, NTILE semantics
+    var base = Math.floor(n / b), extra = n % b, out = [];
+    for (var i = 0; i < b; i++) out.push(base + (i < extra ? 1 : 0));
+    return out.filter(function (x) { return x > 0; });
+  }
+  function thresholds(model, buckets) {
+    var list = ranked(model), sizes = ntile(list.length, buckets), out = {}, pos = 0;
+    sizes.forEach(function (sz, i) {
+      var slice = list.slice(pos, pos + sz); pos += sz;
+      out[i + 1] = { lo: slice[slice.length - 1].s, hi: slice[0].s, n: sz,
+                     avg: slice.reduce(function (a, x) { return a + x.s; }, 0) / sz };
+    });
+    return out;
+  }
+
+  // ══ Taxonomy (mirrors _build_taxonomy) ═════════════════════════════════════
+  var SUFFIX = /\s*\((Index|Percentage|Binary)\)\s*$/i;
+  function buildTaxonomy(base) {
+    var t = getTable(base.db, base.schema, base.table);
+    var d = getTable(base.db, base.schema, base.table + '_DICTIONARY');
+    if (!t || !d) return null;
+    var real = {}; t.columns.forEach(function (c) { real[c.name] = 1; });
+    var concepts = {}, order = [];
+    d.rows.forEach(function (r) {
+      if (!real[r.COLUMN_NAME]) return;
+      var elem = String(r.ELEMENT_NAME || '').trim(), m = elem.match(SUFFIX);
+      if (!m) return;
+      var cat = String(r.CATEGORY || '').trim() || 'Uncategorized', concept = elem.replace(SUFFIX, '');
+      var key = cat + '\u0001' + concept;
+      if (!concepts[key]) { concepts[key] = { cat: cat, concept: concept, description: '', precision: '', cols: {} }; order.push(key); }
+      var rec = concepts[key];
+      rec.cols[m[1].toLowerCase()] = r.COLUMN_NAME;
+      if (r.DESCRIPTION && !rec.description) rec.description = String(r.DESCRIPTION).trim();
+      if (r.PRECISION_LEVEL && !rec.precision) rec.precision = String(r.PRECISION_LEVEL).trim();
+    });
+    var groups = {};
+    order.forEach(function (key) {
+      var rec = concepts[key]; if (!rec.cols.binary) return;
+      var parts = rec.concept.split('>').map(function (p) { return p.trim(); }).filter(Boolean);
+      var leaf = parts.length ? parts[parts.length - 1] : rec.concept;
+      var gname = parts.length > 1 ? parts.slice(0, -1).join(' > ') : leaf;
+      var gk = rec.cat + '\u0001' + gname;
+      (groups[gk] = groups[gk] || { category: rec.cat, group: gname, traits: [] }).traits.push({
+        label: leaf, concept: rec.concept, description: rec.description, precision: rec.precision,
+        bin_col: rec.cols.binary, index_col: rec.cols.index || null });
+    });
+    var byCat = {}, cmp = function (a, b) { return a < b ? -1 : a > b ? 1 : 0; };
+    Object.keys(groups).forEach(function (gk) {
+      var g = groups[gk]; g.traits.sort(function (a, b) { return cmp(a.label, b.label); });
+      (byCat[g.category] = byCat[g.category] || []).push(g);
+    });
+    var cats = Object.keys(byCat).sort(cmp).map(function (c) { return { category: c, groups: byCat[c].sort(function (a, b) { return cmp(a.group, b.group); }) }; });
+    return { categories: cats, group_count: Object.keys(groups).length,
+             trait_count: Object.keys(groups).reduce(function (a, k) { return a + groups[k].traits.length; }, 0) };
+  }
+  function allTraits(tax) {
+    var out = [];
+    tax.categories.forEach(function (c) { c.groups.forEach(function (g) { g.traits.forEach(function (t) { out.push(Object.assign({}, t, { category: c.category, group: g.group })); }); }); });
+    return out;
+  }
+  function aggTraits(rows, traits) {         // COUNT(*), COUNT_IF(='Y'), COUNT(col), AVG(index)
+    var out = { n: rows.length, yes: {}, pop: {}, acx: {} };
+    traits.forEach(function (t) {
+      var y = 0, p = 0, s = 0, c = 0;
+      rows.forEach(function (r) {
+        var v = r[t.bin_col]; if (v != null && v !== '') { p++; if (v === 'Y') y++; }
+        if (t.index_col) { var x = r[t.index_col]; if (x != null && x !== '') { s += Number(x); c++; } }
+      });
+      out.yes[t.bin_col] = y; out.pop[t.bin_col] = p; out.acx[t.bin_col] = c ? s / c : null;
+    });
+    return out;
+  }
+  function popStats(base, traits) {
+    var t = getTable(base.db, base.schema, base.table), a = aggTraits(t.rows, traits), out = {};
+    traits.forEach(function (tr) { out[tr.bin_col] = { total: a.n, yes: a.yes[tr.bin_col], populated: a.pop[tr.bin_col], avg_index: a.acx[tr.bin_col] }; });
+    return out;
+  }
+
+  // ══ Excel builder (array-of-arrays so layouts match the original) ══════════
+  async function workbook(sheets) {
+    var X = await Mock.loadXLSX(), wb = X.utils.book_new();
+    sheets.forEach(function (s) {
+      var ws = X.utils.aoa_to_sheet(s.rows);
+      if (s.merges) ws['!merges'] = s.merges.map(function (m) { return { s: { r: m[0], c: m[1] }, e: { r: m[2], c: m[3] } }; });
+      if (s.cols) ws['!cols'] = s.cols.map(function (w) { return { wch: w }; });
+      X.utils.book_append_sheet(wb, ws, s.name.slice(0, 31));
+    });
+    return new Blob([X.write(wb, { bookType: 'xlsx', type: 'array' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+  function num(v, d) { return v == null || !isFinite(v) ? 'N/A' : Mock.round(v, d == null ? 2 : d); }
+
+  // ══ Export jobs (simulated progress over a few seconds) ════════════════════
+  var STEP_MS = 1300;
+  function newExport(steps, label, build, filename) {
+    var id = uid();
+    EXPORTS[id] = { status: 'running', steps: steps, total: steps.length, started: Date.now(), label: label,
+                    build: build, filename: filename, blob: null, error: null };
+    var ids = Object.keys(EXPORTS); while (ids.length > 4) delete EXPORTS[ids.shift()];
+    return id;
+  }
+  function jobView(j) {
+    var el = Date.now() - j.started, k = Math.floor(el / STEP_MS);
+    if (j.status === 'running' && k >= j.total) j.status = 'done';
+    var step = j.status === 'done' ? j.total : Math.min(k, j.total);
+    if (j.status === 'cancelled') step = j.cancelStep;
+    return {
+      status: j.status, step: step, total: j.total,
+      current: j.status === 'done' ? 'Ready' : j.steps[Math.min(step, j.total - 1)].current,
+      log: j.steps.slice(0, step).map(function (s) { return s.note; }).filter(Boolean).slice(-30),
+      error: j.error, elapsed: Mock.round((j.status === 'cancelled' ? j.cancelAt - j.started : el) / 1000, 1),
+      ready: j.status === 'done', label: j.label
+    };
+  }
+
+  // ══ Routes: connection & browsing ══════════════════════════════════════════
+  Mock.route('GET', P + '/status', function () {
+    return { configured: true, account: CFG.account, default_user: CFG.user, role: CFG.role, database: CFG.database,
+             schema: CFG.schema, warehouse: CFG.warehouse, connected: state.connected, last_error: '' };
+  }, { latency: [60, 150] });
+
+  Mock.route('POST', P + '/connect', async function (req) {
+    var user = String(req.json.user || CFG.user).trim(), wh = String(req.json.warehouse || CFG.warehouse).trim();
+    if (!user) return err('Enter your warehouse login email first.');
+    if (!wh) return err('Enter a warehouse name first — none is set in the config.');
+    await Mock.sleep(900);
+    warehouse(); state.connected = true; CFG.warehouse = wh;
+    return { ok: true };
+  });
+  Mock.route('POST', P + '/disconnect', function () { state.connected = false; return { ok: true }; });
+
+  Mock.route('GET', P + '/databases', function () {
+    if (!state.connected) return notConn();
+    return { databases: Object.keys(warehouse().dbs).sort() };
+  });
+  Mock.route('GET', P + '/schemas', function (req) {
+    if (!state.connected) return notConn();
+    var db = req.query.database || '';
+    if (!IDENT.test(db)) return err('Invalid database name.');
+    var d = warehouse().dbs[db];
+    if (!d) return err('Could not list schemas in ' + db + ": Database '" + db + "' does not exist or not authorized.", 502);
+    return { database: db, schemas: Object.keys(d).sort() };
+  });
+  Mock.route('GET', P + '/browse', function (req) {
+    if (!state.connected) return notConn();
+    var db = req.query.database || CFG.database, schema = req.query.schema || CFG.schema;
+    if (!IDENT.test(db) || !IDENT.test(schema)) return err('Invalid database or schema name.');
+    var d = warehouse().dbs[db];
+    var list = (d && d[schema]) || [];
+    return { database: db, schema: schema, objects: list.slice().sort(function (a, b) { return a.name < b.name ? -1 : 1; }).map(function (t) {
+      var view = t.type === 'VIEW';
+      return { table_name: t.name, table_type: t.type, row_count: view ? null : t.rows.length,
+               bytes: view ? null : Math.round(t.rows.length * t.columns.length * 6.5 + 2048),
+               last_altered: t.altered, comment: t.comment || null };
+    }) };
+  });
+  Mock.route('GET', P + '/preview', function (req) {
+    if (!state.connected) return notConn();
+    var table = req.query.table || '', db = req.query.database || CFG.database, schema = req.query.schema || CFG.schema;
+    var limit = clamp(parseInt(req.query.limit, 10) || 50, 1, 200);
+    if (!IDENT.test(table) || !IDENT.test(db) || !IDENT.test(schema)) return err('Invalid table, database, or schema name.');
+    var t = getTable(db, schema, table);
+    if (!t) return err('"' + table + '" was not found in ' + db + '.' + schema + '.', 404);
+    var cols = t.columns.map(function (c) { return c.name; });
+    return { table: table, columns: cols, rows: t.rows.slice(0, limit).map(function (r) {
+      return cols.map(function (c) { return r[c] == null ? '' : String(r[c]); });
+    }) };
+  });
+
+  Mock.route('POST', P + '/test-join', function (req) {
+    if (!state.connected) return notConn();
+    var base = req.json.base || {}, client = req.json.client || {};
+    var bad = validateSides([['base', base], ['client', client]]); if (bad) return bad;
+    try {
+      var bt = tableOr404(base), ct = tableOr404(client);
+      colOr(bt, base.column); colOr(ct, client.column);
+      var counts = {};
+      bt.rows.forEach(function (r) { var k = keyOf(r[base.column]); if (k != null) counts[k] = (counts[k] || 0) + 1; });
+      var matches = 0;
+      ct.rows.forEach(function (r) { var k = keyOf(r[client.column]); if (k != null && counts[k]) matches += counts[k]; });
+      var total = ct.rows.length;
+      return { matches: matches, client_total: total, pct: total ? matches / total * 100 : 0 };
+    } catch (e) { return err('Join test failed: ' + e.message, 502); }
+  });
+
+  // ══ Lookalike ══════════════════════════════════════════════════════════════
+  Mock.route('POST', P + '/lookalike/train', async function (req) {
+    if (!state.connected) return notConn();
+    var d = req.json, base = d.base || {}, client = d.client || {};
+    var bad = validateSides([['base', base], ['client', client]]); if (bad) return bad;
+    var sampleSize, topN, cap;
+    try { sampleSize = toInt(d.sample_size, 500000); topN = toInt(d.top_n, 40); }
+    catch (e) { return err('sample_size and top_n must be numbers.'); }
+    sampleSize = clamp(sampleSize, 10000, 2000000); topN = clamp(topN, 5, 150);
+    try { cap = toInt(d.positive_cap, 500000); } catch (e) { cap = 500000; }
+    cap = clamp(cap, 0, 5000000);
+
+    var t0 = Date.now(), sj, cands;
+    try {
+      sj = semiJoin(base, client);
+      cands = candidateFeatures(base, sj.bt);
+    } catch (e) { return err('Data pull failed: ProgrammingError: ' + e.message, 502); }
+    if (!cands.length) return err('No usable feature columns found on the base table.');
+    var rnd = Mock.rng('lk-' + base.table + base.column + client.table + client.column + topN);
+    var pos = sj.rows;
+    if (cap && pos.length > cap) pos = Mock.shuffle(pos, rnd).slice(0, cap);
+    if (pos.length < 200) return err('Only ' + pos.length + ' matched rows — too few to train on. Check the join first.');
+    var posIds = {}; pos.forEach(function (r) { posIds[keyOf(r[base.column])] = 1; });
+    var bg = Mock.shuffle(sj.bt.rows.filter(function (r) { return !posIds[keyOf(r[base.column])]; }), rnd).slice(0, sampleSize);
+    if (bg.length < 50) return err('Only ' + bg.length + ' background rows are left once the matched IDs are removed — the join matches nearly the whole base table. Pick an ID-level join column rather than a geography.');
+    await Mock.sleep(700);
+    var secsPull = Mock.round((Date.now() - t0) / 1000 + 1.8, 1);
+
+    var F = cands.length, all = pos.concat(bg), y = all.map(function (_, i) { return i < pos.length ? 1 : 0; });
+    var X = all.map(function (r) { return cands.map(function (f) { return featVal(r, f); }); });
+    var med = cands.map(function (_, j) { var m = median(X.map(function (row) { return row[j]; })); return m == null ? 0 : m; });
+    X.forEach(function (row) { for (var j = 0; j < F; j++) if (!isFinite(row[j])) row[j] = med[j]; });
+
+    // stratified 80/20 split
+    var tr = [], te = [];
+    [1, 0].forEach(function (cls) {
+      var ids = Mock.shuffle(y.map(function (v, i) { return v === cls ? i : -1; }).filter(function (i) { return i >= 0; }), rnd);
+      var nTe = Math.round(ids.length * 0.2);
+      te = te.concat(ids.slice(0, nTe)); tr = tr.concat(ids.slice(nTe));
+    });
+    var t1 = Date.now();
+    var imp = forestImportance(X, y, tr, F, rnd);
+    var secsRank = Mock.round((Date.now() - t1) / 1000 + 2.4, 1);
+    var order = imp.map(function (v, j) { return j; }).sort(function (a, b) { return imp[b] - imp[a]; });
+    var top = order.slice(0, topN);
+
+    var scTr = standardize(tr.map(function (i) { return X[i]; }), top);
+    var lr = fitLogistic(scTr.Z, tr.map(function (i) { return y[i]; }));
+    var Zte = te.map(function (i) { return top.map(function (j, c) { return (X[i][j] - scTr.mean[c]) / scTr.scale[c]; }); });
+    var yte = te.map(function (i) { return y[i]; });
+    var probs = predictLogistic(lr, Zte);
+    var aucV = auc(yte, probs);
+    var ord = probs.map(function (_, i) { return i; }).sort(function (a, b) { return probs[b] - probs[a]; });
+    var baseRate = yte.reduce(function (a, b) { return a + b; }, 0) / yte.length, lift = {};
+    [1, 5, 10].forEach(function (pct) {
+      var k = Math.max(1, Math.floor(ord.length * pct / 100)), s = 0;
+      for (var i = 0; i < k; i++) s += yte[ord[i]];
+      lift[String(pct)] = baseRate > 0 ? (s / k) / baseRate : 0;
+    });
+    var scFull = standardize(X, top);
+    var lrFull = fitLogistic(scFull.Z, y);
+
+    var featureRows = [], modelFeats = [];
+    top.forEach(function (j, c) {
+      var m = cands[j];
+      featureRows.push({ column: m.column, kind: m.kind, label: m.label, description: m.description, category: m.category,
+                         importance: imp[j], coefficient: lrFull.coef[c] });
+      modelFeats.push({ column: m.column, kind: m.kind, label: m.label, description: m.description, category: m.category,
+                        impute: med[j], mean: scFull.mean[c], scale: scFull.scale[c] || 1, coef: lrFull.coef[c] });
+    });
+    var jobId = uid();
+    MODELS[jobId] = { features: modelFeats, intercept: lrFull.intercept, base: base, client: client };
+    var ids = Object.keys(MODELS); while (ids.length > 10) delete MODELS[ids.shift()];
+    return {
+      job_id: jobId, positive_count: pos.length, background_count: bg.length, candidate_features: F,
+      timings: { pull_secs: secsPull, rank_secs: secsRank, total_secs: Mock.round(secsPull + secsRank + 0.6, 1) },
+      positive_capped: !!(cap && pos.length >= cap), auc: aucV, lift: lift, base_rate_pct: baseRate * 100,
+      features: featureRows, base_table_rows: sj.bt.rows.length, arrow_fast_path: true
+    };
+  }, { latency: [300, 500] });
+
+  function modelOr(jobId, msg) { var m = MODELS[jobId || '']; return m ? m : null; }
+  var EXPIRED = 'That model has expired — click "Build Lookalike Model" again.';
+
+  Mock.route('POST', P + '/lookalike/distribution', async function (req) {
+    if (!state.connected) return notConn();
+    var model = modelOr(req.json.job_id); if (!model) return err(EXPIRED);
+    var b; try { b = clamp(toInt(req.json.buckets, 10), 2, 100); } catch (e) { return err('buckets must be a number.'); }
+    await Mock.sleep(600);
+    var th = thresholds(model, b), out = [], cum = 0;
+    Object.keys(th).map(Number).sort(function (x, y) { return x - y; }).forEach(function (k) {
+      cum += th[k].n;
+      out.push({ bucket: k, n: th[k].n, cumulative: cum, min_score: th[k].lo, max_score: th[k].hi, avg_score: th[k].avg });
+    });
+    return { buckets: out, total: cum };
+  });
+
+  Mock.route('POST', P + '/lookalike/insights', async function (req) {
+    if (!state.connected) return notConn();
+    var model = modelOr(req.json.job_id); if (!model) return err(EXPIRED);
+    var limit; try { limit = clamp(toInt(req.json.limit, 0), 1, 80000000); } catch (e) { return err('limit must be a number.'); }
+    await Mock.sleep(500);
+    var topRows = ranked(model).slice(0, limit).map(function (x) { return x.row; });
+    var res = model.features.map(function (f) {
+      var s = 0, c = 0;
+      topRows.forEach(function (r) { var v = featVal(r, f); if (!isNaN(v)) { s += v; c++; } });
+      var seg = c ? s / c : f.impute, pop = f.mean;
+      return { column: f.column, kind: f.kind, label: f.label, description: f.description, category: f.category,
+               segment_avg: seg, population_avg: pop, index: pop ? seg / pop * 100 : null };
+    });
+    res.sort(function (a, b) { return Math.abs((b.index == null ? 100 : b.index) - 100) - Math.abs((a.index == null ? 100 : a.index) - 100); });
+    return { limit: limit, features: res };
+  });
+
+  Mock.route('POST', P + '/lookalike/score', async function (req) {
+    if (!state.connected) return notConn();
+    var model = modelOr(req.json.job_id); if (!model) return err(EXPIRED);
+    var limit; try { limit = clamp(toInt(req.json.limit, 50000), 100, 80000000); } catch (e) { return err('limit must be a number.'); }
+    await Mock.sleep(400);
+    var lines = ['ID,LOOKALIKE_SCORE'];
+    ranked(model).slice(0, limit).forEach(function (x) { lines.push(x.id + ',' + x.s.toFixed(6)); });
+    return Mock.file(lines.join('\n') + '\n', 'lookalike_scores_' + model.base.table + '.csv', 'text/csv');
+  });
+
+  // ══ Taxonomy & profile ═════════════════════════════════════════════════════
+  Mock.route('POST', P + '/taxonomy', function (req) {
+    if (!state.connected) return notConn();
+    var base = req.json.base || {};
+    var bad = validateSides([['base', base]], ['db', 'schema', 'table']); if (bad) return bad;
+    var tax = buildTaxonomy(base);
+    if (!tax) return err(base.table + ' has no ' + base.table + '_DICTIONARY table, so its traits cannot be grouped into insight groups.');
+    return tax;
+  });
+
+  Mock.route('POST', P + '/profile', async function (req) {
+    if (!state.connected) return notConn();
+    var d = req.json, base = d.base || {};
+    var bad = validateSides([['base', base]]); if (bad) return bad;
+    var category = String(d.category || ''), group = String(d.group || ''), audience = d.audience || 'matched';
+    var tax = buildTaxonomy(base);
+    if (!tax) return err('That base table has no dictionary to group traits by.');
+    var g = null;
+    tax.categories.forEach(function (c) { if (c.category === category) c.groups.forEach(function (x) { if (x.group === group) g = x; }); });
+    if (!g) return err('Pick a category and insight group first.');
+    var traits = g.traits.slice(0, 60), dropped = g.traits.length - traits.length;
+    var rows, label;
+    try {
+      if (audience === 'segment') {
+        var model = MODELS[d.job_id || ''];
+        if (!model) return err('No trained model in memory — build a lookalike model first, or profile the matched audience instead.');
+        var limit; try { limit = clamp(toInt(d.limit, 1000000), 1, 80000000); } catch (e) { return err('limit must be a number.'); }
+        rows = ranked(model).slice(0, limit).map(function (x) { return x.row; });
+        label = 'Top ' + fmt(limit) + ' lookalike scores';
+      } else {
+        var client = d.client || {};
+        var bad2 = validateSides([['client', client]]); if (bad2) return bad2;
+        rows = semiJoin(base, client).rows;
+        label = 'Matched audience from ' + client.table;
+      }
+    } catch (e) { return err('Profile query failed: ProgrammingError: ' + e.message, 502); }
+    await Mock.sleep(400);
+    var got = aggTraits(rows, traits), pop = popStats(base, traits), n = got.n;
+    if (!n) return err('That audience came back empty — check the join before profiling.');
+    var out = traits.map(function (t) {
+      var p = pop[t.bin_col], yes = got.yes[t.bin_col], ap = got.pop[t.bin_col], pp = p.populated;
+      var audPct = yes / n * 100, popPct = p.total ? p.yes / p.total * 100 : null;
+      var segIdx = popPct ? audPct / popPct * 100 : null;
+      var audCov = ap ? yes / ap * 100 : null, popCov = pp ? p.yes / pp * 100 : null;
+      var covIdx = audCov != null && popCov ? audCov / popCov * 100 : null;
+      var acx = got.acx[t.bin_col], popIx = p.avg_index;
+      return { label: t.label, concept: t.concept, description: t.description, precision: t.precision,
+               audience_count: yes, audience_pct: audPct, population_pct: popPct, index: segIdx, coverage_index: covIdx,
+               audience_coverage: n ? ap / n * 100 : null, population_coverage: p.total ? pp / p.total * 100 : null,
+               provider_index: acx, provider_index_rel: acx != null && popIx ? acx / popIx * 100 : null, population_index: popIx };
+    });
+    function med2(vals) { var v = vals.filter(function (x) { return x != null; }).sort(function (a, b) { return a - b; }); return v.length ? v[v.length >> 1] : null; }
+    return { category: category, group: group, audience_label: label, audience_rows: n,
+             population_rows: pop[traits[0].bin_col].total,
+             audience_coverage_median: med2(out.map(function (t) { return t.audience_coverage; })),
+             population_coverage_median: med2(out.map(function (t) { return t.population_coverage; })),
+             traits: out, dropped: dropped };
+  });
+
+  // ══ Full-taxonomy decile export ════════════════════════════════════════════
+  Mock.route('POST', P + '/lookalike/insights-export/start', function (req) {
+    if (!state.connected) return notConn();
+    var d = req.json, base = d.base || {};
+    var bad = validateSides([['base', base]]); if (bad) return bad;
+    var model = MODELS[d.job_id || ''];
+    if (!model) return err('No trained model in memory — build a lookalike model first.');
+    var buckets; try { buckets = clamp(toInt(d.buckets, 10), 2, 100); } catch (e) { return err('buckets must be a number.'); }
+    var selected = d.selected && d.selected.length ? d.selected : Array.from({ length: buckets }, function (_, i) { return i + 1; });
+    selected = Array.from(new Set(selected.map(Number).filter(function (b) { return b >= 1 && b <= buckets; }))).sort(function (a, b) { return a - b; });
+    if (selected.some(isNaN)) return err('selected must be a list of bucket numbers.');
+    if (!selected.length) return err('Select at least one decile.');
+    var tax = buildTaxonomy(base);
+    if (!tax) return err('That base table has no dictionary to group traits by.');
+    var traits = allTraits(tax);
+    if (!traits.length) return err('No traits with a Binary flag in this taxonomy.');
+    var layout = d.layout === 'consolidated' ? 'consolidated' : 'by_decile';
+
+    // Compute now; the job just reveals progress over time.
+    var th = thresholds(model, buckets), list = ranked(model), sel = {};
+    selected.forEach(function (b) { sel[b] = 1; });
+    var nb = Object.keys(th).length, groupsB = {};
+    list.forEach(function (x) {                 // CASE WHEN S >= lo_b THEN b
+      var b = buckets;
+      for (var k = 1; k <= nb; k++) if (x.s >= th[k].lo) { b = k; break; }
+      (groupsB[b] = groupsB[b] || []).push(x.row);
+    });
+    var agg = {};
+    Object.keys(groupsB).forEach(function (b) { agg[b] = aggTraits(groupsB[b], traits); });
+    var pop = popStats(base, traits);
+    var total = list.length;
+    var steps = [
+      { current: 'Finding decile score thresholds (one narrow pass)', note: 'thresholds: ' + nb + ' buckets, ' + fmt(total) + ' rows' },
+      { current: 'Aggregating traits 1–' + traits.length + ' of ' + traits.length + ' (pass 1 of 1)', note: 'pass 1/1: ' + traits.length + ' traits across ' + Object.keys(agg).length + ' deciles' },
+      { current: 'Reading base-table rates', note: '' },
+      { current: 'Building workbook', note: '' }
+    ];
+    var job = newExport(steps, traits.length + ' traits × ' + selected.length + ' deciles', function () {
+      return decileWorkbook(base, model, traits, agg, pop, buckets, selected, th, layout);
+    }, 'trait_insights_' + base.table + '_' + selected.length + 'deciles.xlsx');
+    return { job: job, total: steps.length, traits: traits.length, buckets: buckets, selected: selected, dropped: 0, layout: layout };
+  });
+
+  Mock.route('GET', P + '/lookalike/insights-export/progress', function (req) {
+    var j = EXPORTS[req.query.job || ''];
+    if (!j) return err('That export has expired — start it again.', 404);
+    return jobView(j);
+  }, { latency: [40, 120] });
+  Mock.route('POST', P + '/lookalike/insights-export/cancel', function (req) {
+    var j = EXPORTS[req.json.job || ''];
+    if (!j) return err('That export has expired.', 404);
+    jobView(j);
+    if (j.status === 'running') { j.cancelStep = jobView(j).step; j.status = 'cancelled'; j.cancelAt = Date.now(); }
+    return { ok: true };
+  });
+  Mock.route('GET', P + '/lookalike/insights-export/download', async function (req) {
+    var j = EXPORTS[req.query.job || ''];
+    if (!j) return err('That export has expired — start it again.', 404);
+    jobView(j);
+    if (j.status !== 'done') return err('Not finished yet (status: ' + j.status + ').', 409);
+    if (!j.blob) j.blob = await j.build();
+    return Mock.file(j.blob, j.filename);
+  });
+
+  function decileWorkbook(base, model, traits, agg, pop, buckets, selected, th, layout) {
+    var meta = [
+      ['Base table', base.db + '.' + base.schema + '.' + base.table], ['ID column', base.column],
+      ['Client table', model.client.db + '.' + model.client.schema + '.' + model.client.table],
+      ['Model features', model.features.length],
+      ['Deciles', buckets + ' buckets, ranked by lookalike score (1 = highest scoring)'],
+      ['Deciles exported', selected.join(', ')], ['Traits exported', traits.length], ['Traits omitted', 'None'],
+      ['Layout', layout !== 'consolidated' ? 'One column block per decile, plus a combined block'
+        : 'Consolidated — one block for the whole selection: index, composition %, flag count'],
+      ['Deciles assigned by', 'Score thresholds from a single ranking pass. Rows sharing a boundary score fall in the same decile, so sizes are near-equal rather than exactly equal — the realised counts are listed below.'],
+      ['Provider Index', "Mean of the trait's own (Index) column — the provider's reference population, 100 = average"],
+      ['Share Index', 'Decile share ÷ base-table share × 100, over rows where the flag is populated'],
+      ['Coverage', 'Share of rows where the flag is populated at all; a low figure makes shares unreliable'],
+      ['Demo note', Mock.DEMO_NOTE]
+    ];
+    var sum = [['Trait Insights by Lookalike Decile'], []].concat(meta, [[], ['Decile sizes'], ['Decile', 'IDs', 'Cumulative from top', 'Score range', 'Exported']]);
+    var cum = 0, sset = {}; selected.forEach(function (b) { sset[b] = 1; });
+    Object.keys(th).map(Number).sort(function (a, b) { return a - b; }).forEach(function (b) {
+      cum += th[b].n; sum.push([b, th[b].n, cum, th[b].lo.toFixed(6) + ' – ' + th[b].hi.toFixed(6), sset[b] ? 'yes' : '']);
+    });
+
+    var fixed = ['Category', 'Insight Group', 'Trait', 'Description', 'Precision', 'Base-table %', 'Base-table Provider Index'];
+    var per = ['IDs', '%', 'Share Index', 'Provider Index', 'Coverage %'], blocks;
+    if (layout === 'consolidated') {
+      per = ['Index', 'Composition %', 'IDs (flag = Y)', 'Provider Index', 'Coverage %'];
+      blocks = [[selected.length === 1 ? 'Decile ' + selected[0] : 'Deciles ' + selected[0] + '–' + selected[selected.length - 1], null]];
+    } else {
+      blocks = selected.map(function (b) { return ['Decile ' + b, b]; });
+      if (selected.length > 1) blocks.push(['Deciles ' + selected[0] + '–' + selected[selected.length - 1] + ' combined', null]);
+    }
+    var h1 = fixed.slice(), h2 = fixed.map(function () { return ''; }), merges = [];
+    fixed.forEach(function (_, c) { merges.push([0, c, 1, c]); });
+    blocks.forEach(function (bl) {
+      merges.push([0, h1.length, 0, h1.length + per.length - 1]);
+      per.forEach(function (p, i) { h1.push(i ? '' : bl[0]); h2.push(p); });
+    });
+    var rows = [h1, h2];
+    traits.forEach(function (t) {
+      var bc = t.bin_col, p = pop[bc] || {}, popCov = p.populated ? p.yes / p.populated * 100 : null;
+      var row = [t.category, t.group, t.label, t.description, t.precision, num(p.total ? p.yes / p.total * 100 : null), num(p.avg_index, 1)];
+      blocks.forEach(function (bl) {
+        var n, yes, popd, acx;
+        if (bl[1] == null) {
+          n = 0; yes = 0; popd = 0; var nm = 0, dn = 0;
+          selected.forEach(function (k) { var a = agg[k]; if (!a) return; n += a.n; yes += a.yes[bc]; popd += a.pop[bc]; if (a.acx[bc] != null && a.pop[bc]) { nm += a.acx[bc] * a.pop[bc]; dn += a.pop[bc]; } });
+          acx = dn ? nm / dn : null;
+        } else {
+          var a = agg[bl[1]];
+          if (!a) { per.forEach(function () { row.push(''); }); return; }
+          n = a.n; yes = a.yes[bc]; popd = a.pop[bc]; acx = a.acx[bc];
+        }
+        var pct = n ? yes / n * 100 : null, pctCov = popd ? yes / popd * 100 : null;
+        var idx = pctCov != null && popCov ? pctCov / popCov * 100 : null, cov = n ? popd / n * 100 : null;
+        if (layout === 'consolidated') row.push(num(idx, 0), num(pct), yes, num(acx, 1), num(cov, 0));
+        else row.push(yes, num(pct), num(idx, 0), num(acx, 1), num(cov, 0));
+      });
+      rows.push(row);
+    });
+    return workbook([
+      { name: 'Summary', rows: sum, cols: [20, 96, 20, 26, 10] },
+      { name: 'Insights', rows: rows, merges: merges, cols: [26, 30, 34, 60, 14, 12, 14] }
+    ]);
+  }
+
+  // ══ K-Means ════════════════════════════════════════════════════════════════
+  function kmPrepare(rows, cands, nFeat) {
+    var cols = cands.map(function (f) { return f.column; });
+    var X = rows.map(function (r) { return cands.map(function (f) { return featVal(r, f); }); });
+    var impute = cols.map(function (_, j) { return median(X.map(function (row) { return row[j]; })); });
+    X.forEach(function (row) { for (var j = 0; j < cols.length; j++) if (!isFinite(row[j])) row[j] = impute[j] == null ? 0 : impute[j]; });
+    var keep = [], dropped = 0, disp = {};
+    cols.forEach(function (c, j) {
+      var mn = Infinity, mx = -Infinity; X.forEach(function (row) { mn = Math.min(mn, row[j]); mx = Math.max(mx, row[j]); });
+      if (mx - mn > 0) {
+        keep.push(j);
+        var n = X.length, m = 0; X.forEach(function (row) { m += (row[j] - mn) / (mx - mn); }); m /= n;
+        var v = 0; X.forEach(function (row) { var q = (row[j] - mn) / (mx - mn) - m; v += q * q; });
+        disp[j] = n > 1 ? v / (n - 1) : 0;
+      } else dropped++;
+    });
+    if (!keep.length) throw new Error('Every candidate trait is constant across this audience — nothing to cluster on.');
+    var chosen = keep.slice().sort(function (a, b) { return disp[b] - disp[a]; }).slice(0, Math.max(2, Math.min(nFeat, 60)));
+    var sc = standardize(X, chosen);
+    var feats = chosen.map(function (j, c) {
+      var f = cands[j];
+      return { column: f.column, kind: f.kind, label: f.label, category: f.category, impute: impute[j] == null ? 0 : impute[j],
+               mean: sc.mean[c], scale: sc.scale[c] || 1, dispersion: disp[j] };
+    });
+    return { Z: sc.Z, feats: feats, dropped: dropped };
+  }
+  function kmRecommend(sweep) {
+    var sil = sweep.filter(function (s) { return s.silhouette != null; });
+    var bestSil = sil.length ? sil.reduce(function (a, b) { return b.silhouette > a.silhouette ? b : a; }).k : null;
+    var elbow = null;
+    if (sweep.length >= 3) {
+      var xs = sweep.map(function (s) { return s.k; }), ys = sweep.map(function (s) { return s.inertia; });
+      var x1 = xs[0], y1 = ys[0], x2 = xs[xs.length - 1], y2 = ys[ys.length - 1];
+      var spanY = (Math.max.apply(null, ys) - Math.min.apply(null, ys)) || 1, spanX = (x2 - x1) || 1, bestD = -1;
+      elbow = xs[0];
+      xs.forEach(function (x, i) {
+        var nx = (x - x1) / spanX, ny = (ys[i] - y1) / spanY, lx = 1, ly = (y2 - y1) / spanY;
+        var dd = Math.abs(nx * ly - ny * lx) / Math.sqrt(lx * lx + ly * ly);
+        if (dd > bestD) { bestD = dd; elbow = x; }
+      });
+    }
+    var usable = sweep.filter(function (s) { return s.smallest_share >= 3; }), notes = [];
+    if (bestSil && elbow && bestSil !== elbow)
+      notes.push('Silhouette favours k=' + bestSil + ' (tightest, best-separated groups) while the inertia elbow sits at k=' + elbow + ' (where extra clusters stop paying for themselves). Either is defensible — pick on what you can act on.');
+    else if (bestSil) notes.push('Silhouette and the inertia elbow agree on k=' + bestSil + '.');
+    var thin = sweep.filter(function (s) { return s.smallest_share < 3; }).map(function (s) { return s.k; });
+    if (thin.length) notes.push('At k=' + thin.join(', ') + ' the smallest cluster falls under 3% of the audience, which is usually too thin to plan against.');
+    return { silhouette_k: bestSil, elbow_k: elbow,
+             suggested_k: bestSil && thin.indexOf(bestSil) < 0 ? bestSil : (usable.length ? usable[0].k : bestSil),
+             note: notes.join(' ') };
+  }
+
+  Mock.route('POST', P + '/kmeans/sweep', async function (req) {
+    if (!state.connected) return notConn();
+    var d = req.json, base = d.base || {}, client = d.client || {};
+    var bad = validateSides([['base', base], ['client', client]]); if (bad) return bad;
+    var sample, nf, kmin, kmax;
+    try {
+      sample = clamp(toInt(d.sample_size, 50000), 2000, 300000); nf = clamp(toInt(d.n_features, 40), 2, 60);
+      kmin = clamp(toInt(d.k_min, 2), 2, 20); kmax = clamp(toInt(d.k_max, 12), kmin + 1, 20);
+    } catch (e) { return err('sample_size, n_features and k range must be numbers.'); }
+    var sj, cands;
+    try { sj = semiJoin(base, client); cands = candidateFeatures(base, sj.bt); }
+    catch (e) { return err('Audience pull failed: ProgrammingError: ' + e.message, 502); }
+    if (!cands.length) return err('No usable feature columns on the base table.');
+    var rows = sj.rows.slice(0, sample);
+    if (rows.length < 50) return err('Only ' + rows.length + ' matched rows — far too few to cluster. Check the join first.');
+    await Mock.sleep(300);
+    var prep, sweep = [];
+    try {
+      prep = kmPrepare(rows, cands, nf);
+      var idx = silSample(prep.Z.length), Zs = idx.map(function (i) { return prep.Z[i]; });
+      for (var k = kmin; k <= kmax; k++) {
+        var km = kmeans(prep.Z, k, 42 + k, 2, 60);
+        var sizes = new Array(k).fill(0); km.labels.forEach(function (l) { sizes[l]++; });
+        var met = clusterMetrics(Zs, idx.map(function (i) { return km.labels[i]; }));
+        sweep.push({ k: k, inertia: km.inertia, silhouette: met ? met.silhouette : null,
+                     calinski_harabasz: met ? met.ch : null, davies_bouldin: met ? met.db : null,
+                     sizes: sizes, smallest_share: Math.min.apply(null, sizes) / prep.Z.length * 100 });
+      }
+    } catch (e) { return err('Clustering failed: ValueError: ' + e.message, 500); }
+    var token = uid();
+    CLUSTERS[token] = { stage: 'swept', base: base, client: client, features: prep.feats, Z: prep.Z, sweep: sweep, sample_rows: rows.length };
+    var ks = Object.keys(CLUSTERS); while (ks.length > 6) delete CLUSTERS[ks.shift()];
+    return { token: token, sample_rows: rows.length, features_used: prep.feats.length, features_dropped_constant: prep.dropped,
+             candidates: cands.length,
+             features: prep.feats.map(function (f) { return { column: f.column, label: f.label, category: f.category, dispersion: f.dispersion }; }),
+             sweep: sweep, recommended: kmRecommend(sweep) };
+  }, { latency: [200, 400] });
+
+  Mock.route('POST', P + '/kmeans/fit', async function (req) {
+    var rec = CLUSTERS[req.json.token || ''];
+    if (!rec) return err('That sweep has expired — run the sweep again.');
+    var k; try { k = clamp(toInt(req.json.k, 0), 2, 20); } catch (e) { return err('k must be a number.'); }
+    await Mock.sleep(300);
+    var Z = rec.Z, feats = rec.features, km = kmeans(Z, k, 42, 5, 150);
+    var sizes = new Array(k).fill(0); km.labels.forEach(function (l) { sizes[l]++; });
+    var idx = silSample(Z.length), met = clusterMetrics(idx.map(function (i) { return Z[i]; }), idx.map(function (i) { return km.labels[i]; }));
+    var sil = met ? met.silhouette : null;
+    var clusters = km.centers.map(function (c, i) {
+      var order = c.map(function (_, j) { return j; }).sort(function (a, b) { return Math.abs(c[b]) - Math.abs(c[a]); }).slice(0, 10);
+      return { cluster: i, size: sizes[i], share: sizes[i] / Z.length * 100,
+               distinguishing: order.map(function (j) { return { label: feats[j].label || feats[j].column, column: feats[j].column, category: feats[j].category, z: c[j] }; }) };
+    });
+    Object.assign(rec, { stage: 'fitted', k: k, centroids: km.centers, inertia: km.inertia, silhouette: sil, clusters: clusters });
+    return { token: req.json.token, k: k, silhouette: sil, inertia: km.inertia, sample_rows: Z.length, features_used: feats.length, clusters: clusters };
+  });
+
+  Mock.route('POST', P + '/kmeans/insights-export/start', function (req) {
+    if (!state.connected) return notConn();
+    var rec = CLUSTERS[req.json.token || ''];
+    if (!rec || rec.stage !== 'fitted') return err('Fit a cluster model first.');
+    var base = rec.base, tax = buildTaxonomy(base);
+    if (!tax) return err('That base table has no dictionary to group traits by.');
+    var traits = allTraits(tax);
+    if (!traits.length) return err('No traits with a Binary flag in this taxonomy.');
+    // Assign every matched row (not just the sample) to its nearest centroid.
+    var aud = semiJoin(base, rec.client).rows, byCl = {};
+    aud.forEach(function (r) {
+      var z = rec.features.map(function (f) { var v = featVal(r, f); if (isNaN(v)) v = f.impute; return (v - f.mean) / f.scale; });
+      var best = 0, bd = Infinity;
+      rec.centroids.forEach(function (c, i) { var s = 0; for (var j = 0; j < z.length; j++) { var q = z[j] - c[j]; s += q * q; } if (s < bd) { bd = s; best = i; } });
+      (byCl[best] = byCl[best] || []).push(r);
+    });
+    var agg = {}; Object.keys(byCl).forEach(function (c) { agg[c] = aggTraits(byCl[c], traits); });
+    var pop = popStats(base, traits);
+    var steps = [
+      { current: 'Aggregating traits 1–' + traits.length + ' of ' + traits.length + ' (pass 1 of 1)', note: 'pass 1/1: ' + traits.length + ' traits across ' + Object.keys(agg).length + ' clusters' },
+      { current: 'Reading base-table rates', note: '' },
+      { current: 'Building workbook', note: '' }
+    ];
+    var snap = Object.assign({}, rec, { Z: null });
+    var job = newExport(steps, traits.length + ' traits × ' + rec.k + ' clusters', function () {
+      return clusterWorkbook(snap, traits, agg, pop);
+    }, 'kmeans_clusters_' + rec.client.table + '_k' + rec.k + '.xlsx');
+    return { job: job, total: steps.length, traits: traits.length, k: rec.k, dropped: 0 };
+  });
+
+  function clusterWorkbook(rec, traits, agg, pop) {
+    var ids = Object.keys(agg).map(Number).sort(function (a, b) { return a - b; });
+    var totalN = ids.reduce(function (a, c) { return a + agg[c].n; }, 0) || 1;
+    var byId = {}; rec.clusters.forEach(function (c) { byId[c.cluster] = c; });
+    var meta = [
+      ['Clustered population', 'Matched client audience — ' + rec.client.db + '.' + rec.client.schema + '.' + rec.client.table],
+      ['Base table', rec.base.db + '.' + rec.base.schema + '.' + rec.base.table], ['Clusters (k)', rec.k],
+      ['Rows assigned', fmt(totalN)], ['Fitted on', fmt(rec.sample_rows) + ' sampled rows, ' + rec.features.length + ' traits'],
+      ['Silhouette', rec.silhouette != null ? rec.silhouette.toFixed(4) + ' (−1 to 1; above ~0.15 on this kind of sparse consumer data is usable structure)' : 'n/a'],
+      ['Inertia', rec.inertia.toFixed(1)], ['Traits profiled', traits.length], ['Traits omitted', 'None'],
+      ['On "accuracy"', 'K-means is unsupervised — nothing is predicted, so there is no accuracy. Judge it on silhouette, cluster balance, and whether the personas below are actionable.'],
+      ['Index', 'Cluster share ÷ base-table share × 100, over rows where the flag is populated. 100 = same as the general population.'],
+      ['Demo note', Mock.DEMO_NOTE]
+    ];
+    var sum = [['K-Means Audience Segmentation'], []].concat(meta, [[], ['Cluster sizes'], ['Cluster', 'IDs', 'Share of audience', 'Defined by (top traits, z-score)']]);
+    ids.forEach(function (c) {
+      var info = byId[c] || {};
+      sum.push(['Cluster ' + c, agg[c].n, num(agg[c].n / totalN * 100, 1),
+        (info.distinguishing || []).slice(0, 4).map(function (x) { return x.label + ' (' + (x.z >= 0 ? '+' : '') + x.z.toFixed(2) + ')'; }).join(', ')]);
+    });
+    var diag = [['How many clusters? — sweep results'], [], ['k', 'Inertia', 'Silhouette', 'Calinski-Harabasz', 'Davies-Bouldin', 'Smallest cluster %', 'Cluster sizes', 'Fitted']];
+    (rec.sweep || []).forEach(function (s) {
+      diag.push([s.k, num(s.inertia, 0), num(s.silhouette, 4), num(s.calinski_harabasz, 0), num(s.davies_bouldin, 3), num(s.smallest_share, 1), s.sizes.join(', '), s.k === rec.k ? '◀ fitted' : '']);
+    });
+    diag.push([], ['Higher silhouette and Calinski-Harabasz are better; lower Davies-Bouldin is better. The marked row is the k that was fitted.']);
+    var sheets = [{ name: 'Summary', rows: sum, cols: [22, 104, 18, 90] }, { name: 'Cluster diagnostics', rows: diag, cols: [6, 14, 12, 18, 16, 18, 44, 10] }];
+    ids.forEach(function (c) {
+      var rc = agg[c], n = rc.n || 1, info = byId[c] || {};
+      var head = [['Cluster ' + c + ' — ' + fmt(rc.n) + ' IDs (' + (rc.n / totalN * 100).toFixed(1) + '% of audience)'],
+        ['Defined by: ' + ((info.distinguishing || []).slice(0, 6).map(function (x) { return x.label + ' (' + (x.z >= 0 ? '+' : '') + x.z.toFixed(2) + ' SD)'; }).join(', ') || '—')], [],
+        ['Category', 'Insight Group', 'Trait', 'Description', 'IDs', '% of Cluster', '% of Population', 'Index', 'Provider Index', 'Coverage %']];
+      var body = traits.map(function (t) {
+        var bc = t.bin_col, p = pop[bc] || {};
+        var popAll = p.total ? p.yes / p.total * 100 : null, popCov = p.populated ? p.yes / p.populated * 100 : null;
+        var yes = rc.yes[bc] || 0, popd = rc.pop[bc] || 0, pct = yes / n * 100, pctCov = popd ? yes / popd * 100 : null;
+        var idx = pctCov != null && popCov ? pctCov / popCov * 100 : null;
+        return { t: t, idx: idx, row: [t.category, t.group, t.label, t.description, yes, num(pct), num(popAll), num(idx, 0), num(rc.acx[bc], 1), num(popd / n * 100, 0)] };
+      });
+      body.sort(function (a, b) { return Math.abs((b.idx == null ? 100 : b.idx) - 100) - Math.abs((a.idx == null ? 100 : a.idx) - 100); });
+      sheets.push({ name: 'Cluster ' + c, rows: head.concat(body.map(function (b) { return b.row; })), cols: [24, 28, 34, 56, 11, 13, 15, 9, 13, 12] });
+    });
+    return workbook(sheets);
+  }
+})();
+
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>1P Modelling – Audience Analytics Engine</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --navy:#0d0d2b;--deep:#131447;--violet:#7c5ce8;--purple:#5b4fcf;
+  --lavender:#a78bfa;--teal:#2dd4bf;--sky:#60a5fa;--amber:#fbbf24;--pink:#f472b6;--red:#f87171;
+  --card-bg:rgba(255,255,255,0.05);--card-border:rgba(180,160,255,0.28);
+  --text:#f0eeff;--text-sec:#cdc6ec;--muted:#9d95c9;
+  --input-bg:rgba(255,255,255,0.07);--input-border:rgba(180,160,255,0.30);
+}
+html,body{min-height:100vh;position:relative;font-family:Helvetica,Arial,sans-serif;font-size:14px;color:var(--text);background:var(--navy);overflow-x:hidden}
+body::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 70% 55% at 8% 15%,rgba(91,79,207,0.28)0%,transparent 60%),radial-gradient(ellipse 55% 45% at 92% 85%,rgba(45,212,191,0.12)0%,transparent 55%),radial-gradient(ellipse 60% 50% at 96% 94%,rgba(178,58,158,0.22) 0%,transparent 60%),linear-gradient(90deg,#020206 0%,#08081c 26%,#131447 52%,#3a1a52 76%,#7c1f6e 100%);pointer-events:none;z-index:0}
+body::after{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(162,140,250,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(162,140,250,0.03) 1px,transparent 1px);background-size:52px 52px;pointer-events:none;z-index:0}
+.shell{position:relative;z-index:1}
+@keyframes pageIn{from{opacity:0}to{opacity:1}}
+body{animation:pageIn .35s ease both}
+body.leaving{opacity:0;transform:scale(.99);transition:opacity .2s ease,transform .2s ease}
+@keyframes riseIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:0 44px;height:84px;background:rgba(13,13,43,0.70);backdrop-filter:blur(18px);border-bottom:1px solid rgba(180,160,255,0.12)}
+.topbar-left{display:flex;align-items:center;gap:12px}
+.brand-dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--violet),var(--teal));box-shadow:0 0 10px rgba(124,92,232,0.7);animation:pdot 2.6s ease-in-out infinite;flex-shrink:0}
+@keyframes pdot{0%,100%{box-shadow:0 0 8px rgba(124,92,232,0.7)}50%{box-shadow:0 0 18px rgba(45,212,191,0.9)}}
+.brand-name{font-size:1.2rem;font-weight:700;color:#e8e0ff;letter-spacing:0.01em}
+.brand-sep{width:1px;height:24px;background:var(--card-border)}
+.brand-sub{font-size:0.8rem;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase}
+.back-link{display:flex;align-items:center;gap:6px;font-size:0.78rem;color:var(--muted);text-decoration:none;padding:8px 14px;border-radius:8px;border:1px solid var(--card-border);background:rgba(255,255,255,0.03);transition:all .2s}
+.back-link:hover{color:var(--lavender);border-color:rgba(167,139,250,0.45);background:rgba(167,139,250,0.08)}
+.back-link svg{width:13px;height:13px;stroke:currentColor}
+
+.container{max-width:1180px;margin:0 auto;padding:28px 28px 72px}
+.sec-head{font-size:0.65rem;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:var(--lavender);margin:26px 0 14px;display:flex;align-items:center;gap:10px}
+.sec-head::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--card-border),transparent)}
+.sec-head:first-child{margin-top:0}
+
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:14px;padding:22px 24px;margin-bottom:14px;backdrop-filter:blur(12px);position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:10%;right:10%;height:1px;background:linear-gradient(90deg,transparent,rgba(167,139,250,0.35),transparent)}
+
+.btn{display:inline-flex;align-items:center;gap:7px;padding:11px 20px;font-size:13px;font-weight:600;border-radius:9px;cursor:pointer;border:none;font-family:inherit;transition:all .18s;min-height:44px;text-decoration:none}
+.btn-primary{background:linear-gradient(135deg,var(--violet),var(--purple));color:#fff;box-shadow:0 4px 16px rgba(124,92,232,0.3)}
+.btn-primary:hover{box-shadow:0 6px 24px rgba(124,92,232,0.5);transform:translateY(-1px)}
+.btn-primary:disabled{opacity:0.4;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-secondary{background:rgba(255,255,255,0.05);color:var(--text-sec);border:1px solid var(--card-border)}
+.btn-secondary:hover{border-color:rgba(167,139,250,0.45);color:var(--text)}
+.btn-danger{background:rgba(248,113,113,0.12);color:var(--red);border:1px solid rgba(248,113,113,0.3)}
+.btn-danger:hover{background:rgba(248,113,113,0.2)}
+.btn-sm{padding:7px 13px;font-size:12px;min-height:auto}
+
+.field{display:flex;flex-direction:column;gap:5px}
+.field label{font-size:11px;font-weight:600;color:var(--muted);letter-spacing:0.04em;text-transform:uppercase}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:720px){.grid-3,.grid-2{grid-template-columns:1fr}}
+
+.inp{width:100%;padding:11px 14px;border:1px solid var(--input-border);border-radius:9px;font-size:13.5px;font-family:inherit;background:var(--input-bg);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.inp:focus{outline:none;border-color:rgba(167,139,250,0.6);box-shadow:0 0 0 3px rgba(124,92,232,0.15)}
+.inp:not([readonly]){border-color:rgba(251,191,36,0.40);background:rgba(251,191,36,0.055);box-shadow:0 0 9px rgba(251,191,36,0.14)}
+.inp:not([readonly]):focus{border-color:rgba(251,191,36,0.85);box-shadow:0 0 0 3px rgba(251,191,36,0.20),0 0 12px rgba(251,191,36,0.3)}
+.inp[readonly]{opacity:0.65;cursor:not-allowed}
+/* The closed <select> box uses the app's light-on-dark theme, but the
+   native OS dropdown popup ignores our translucent background and renders
+   on plain white — so option text needs its own dark color or it's
+   unreadable (pale text on white). */
+select.inp option{color:#1a1a2e;background:#ffffff}
+
+.status-pill{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;padding:7px 14px;border-radius:20px;border:1px solid}
+.status-pill .dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.st-idle{color:var(--muted);border-color:var(--card-border);background:rgba(255,255,255,0.03)}
+.st-connecting{color:var(--amber);border-color:rgba(251,191,36,0.4);background:rgba(251,191,36,0.08)}
+.st-connecting .dot{animation:pulse 1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+.st-connected{color:var(--teal);border-color:rgba(45,212,191,0.4);background:rgba(45,212,191,0.08)}
+.st-error{color:var(--red);border-color:rgba(248,113,113,0.4);background:rgba(248,113,113,0.08)}
+
+.info-note{font-size:11.5px;color:var(--muted);background:rgba(255,255,255,0.03);border:1px solid rgba(180,160,255,0.12);border-radius:8px;padding:12px 14px;line-height:1.6;margin-top:14px}
+.info-note b{color:var(--text-sec)}
+.error-box{display:none;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.3);border-radius:10px;padding:14px 18px;font-size:13px;color:var(--red);margin-top:14px}
+.error-box.visible{display:block}
+
+#browseArea{display:none}
+#browseArea.visible{display:block;animation:riseIn .4s ease both}
+.action-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.action-bar .search-inp{flex:1;min-width:200px}
+
+.obj-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.obj-table th{background:rgba(255,255,255,0.04);color:var(--muted);font-weight:600;text-align:left;padding:10px 12px;border-bottom:1px solid var(--card-border);font-size:10.5px;text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap}
+.obj-table td{padding:11px 12px;border-bottom:1px solid rgba(180,160,255,0.08);vertical-align:middle}
+.obj-table tr{cursor:pointer;transition:background .12s}
+.obj-table tr:hover td{background:rgba(124,92,232,0.06)}
+.type-pill{display:inline-block;padding:3px 10px;border-radius:11px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;border:1px solid}
+.tp-table{color:var(--sky);border-color:rgba(96,165,250,0.4);background:rgba(96,165,250,0.10)}
+.tp-view{color:var(--lavender);border-color:rgba(167,139,250,0.4);background:rgba(124,92,232,0.10)}
+.mono{font-variant-numeric:tabular-nums;color:var(--text-sec)}
+
+.modal-back{position:fixed;inset:0;background:rgba(6,6,20,0.72);backdrop-filter:blur(4px);z-index:200;display:none;align-items:center;justify-content:center;padding:20px}
+.modal-back.open{display:flex}
+.modal{background:linear-gradient(160deg,#161638,#111130);border:1px solid var(--card-border);border-radius:16px;padding:26px;width:100%;max-width:1040px;box-shadow:0 20px 60px rgba(0,0,0,0.5);animation:mIn .25s cubic-bezier(.22,.9,.35,1.1);max-height:88vh;display:flex;flex-direction:column}
+@keyframes mIn{from{opacity:0;transform:translateY(16px) scale(.97)}to{opacity:1;transform:none}}
+.modal h2{font-size:1.05rem;margin-bottom:4px}
+.modal .sub{font-size:11.5px;color:var(--muted);margin-bottom:16px}
+.preview-scroll{overflow:auto;border:1px solid var(--card-border);border-radius:10px;flex:1}
+.preview-table{border-collapse:collapse;font-size:12px;white-space:nowrap}
+.preview-table th{position:sticky;top:0;background:#1a1a40;color:var(--lavender);font-weight:700;text-align:left;padding:8px 12px;border-bottom:1px solid var(--card-border);z-index:1}
+.preview-table td{padding:7px 12px;border-bottom:1px solid rgba(180,160,255,0.06);color:var(--text-sec)}
+.preview-table tr:hover td{background:rgba(124,92,232,0.05)}
+.modal-actions{display:flex;gap:10px;margin-top:16px;align-items:center}
+.modal-actions .spacer{flex:1}
+
+.kind-pill{display:inline-block;padding:2px 9px;border-radius:10px;font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;border:1px solid}
+.kind-index{color:var(--sky);border-color:rgba(96,165,250,0.4);background:rgba(96,165,250,0.10)}
+.kind-percentage{color:var(--lavender);border-color:rgba(167,139,250,0.4);background:rgba(124,92,232,0.10)}
+.kind-binary{color:var(--teal);border-color:rgba(45,212,191,0.4);background:rgba(45,212,191,0.10)}
+.kind-other{color:var(--muted);border-color:var(--card-border);background:rgba(255,255,255,0.04)}
+.feat-group-head{font-size:12px;font-weight:700;color:var(--text-sec);letter-spacing:0.03em;margin:16px 0 8px;display:flex;align-items:center;gap:8px}
+
+.ivbar-row{display:flex;align-items:center;gap:10px;padding:4px 0;font-size:11.5px}
+.ivbar-label{width:230px;flex-shrink:0;color:var(--text-sec);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ivbar-track{flex:1;position:relative;height:12px;background:rgba(255,255,255,0.06);border-radius:4px}
+.ivbar-baseline{position:absolute;top:-3px;bottom:-3px;width:1px;background:rgba(255,255,255,0.35)}
+.ivbar-fill{position:absolute;top:0;bottom:0;left:0;border-radius:4px;min-width:2px}
+.vbar-pop{position:absolute;top:-3px;bottom:-3px;width:2px;background:rgba(255,255,255,0.55);border-radius:1px}
+.ivbar-val{width:42px;text-align:right;flex-shrink:0;font-variant-numeric:tabular-nums;color:var(--text-sec)}
+
+.loader{display:none;text-align:center;padding:36px;color:var(--muted);font-size:13px}
+.loader.visible{display:block}
+.spinner{width:32px;height:32px;border:3px solid var(--card-border);border-top-color:var(--violet);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.page-footer{text-align:center;padding:20px;font-size:0.68rem;color:var(--muted);border-top:1px solid rgba(162,140,250,0.07);letter-spacing:0.04em;position:relative;z-index:1}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<div class="container">
+
+  <div class="sec-head">Warehouse Connection</div>
+  <div class="card">
+    <div class="grid-3" style="margin-bottom:14px">
+      <div class="field"><label>Account</label><input class="inp" id="fAccount" readonly></div>
+      <div class="field"><label>User (your warehouse login email)</label><input class="inp" id="fUser" placeholder="you@example.com"></div>
+      <div class="field"><label>Role</label><input class="inp" id="fRole" readonly></div>
+    </div>
+    <div class="grid-3" style="margin-bottom:14px">
+      <div class="field"><label>Database</label><input class="inp" id="fDatabase" readonly></div>
+      <div class="field"><label>Schema</label><input class="inp" id="fSchema" readonly></div>
+      <div class="field"><label>Warehouse</label><input class="inp" id="fWarehouse" placeholder="e.g. COMPUTE_WH"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="connectBtn" onclick="doConnect()">🔌 Connect to the Data Warehouse</button>
+      <button class="btn btn-secondary btn-sm" id="disconnectBtn" onclick="doDisconnect()" style="display:none">Disconnect</button>
+      <span class="status-pill st-idle" id="statusPill"><span class="dot"></span><span id="statusText">Not connected</span></span>
+    </div>
+    <div class="error-box" id="errorBox"></div>
+    <div class="loader" id="loader"><div class="spinner"></div>Connecting…</div>
+  </div>
+
+  <div id="browseArea">
+    <div class="sec-head">Browse</div>
+    <div class="action-bar">
+      <select class="inp" id="dbSelect" style="max-width:280px" onchange="onDbChange()"></select>
+      <select class="inp" id="schemaSelect" style="max-width:220px" onchange="loadObjects()"></select>
+    </div>
+    <div class="action-bar">
+      <input class="inp search-inp" id="searchBox" placeholder="Search tables and views…" oninput="renderObjects()">
+      <button class="btn btn-secondary btn-sm" onclick="loadObjects()">↺ Refresh</button>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <div style="overflow-x:auto">
+        <table class="obj-table" id="objTable">
+          <thead><tr><th>Name</th><th>Type</th><th>Rows</th><th>Size</th><th>Last Altered</th></tr></thead>
+          <tbody id="objBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="sec-head">Matching Setup</div>
+    <div class="card">
+      <div class="info-note" style="margin-bottom:14px">Preview a table, then set it as the base or client table. Test the join before building a model.</div>
+      <div class="grid-2">
+        <div class="field">
+          <label>Base Table</label>
+          <input class="inp" id="baseTableDisplay" readonly placeholder="Not set yet">
+          <select class="inp" id="baseColumnSelect" disabled style="margin-top:8px"><option value="">— select base join column —</option></select>
+        </div>
+        <div class="field">
+          <label>Client Table</label>
+          <input class="inp" id="clientTableDisplay" readonly placeholder="Not set yet">
+          <select class="inp" id="clientColumnSelect" disabled style="margin-top:8px"><option value="">— select client join column —</option></select>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;align-items:center;margin-top:16px;flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" id="testJoinBtn" onclick="testJoin()" disabled>🔎 Test This Join</button>
+        <span id="joinResult" style="font-size:12.5px;color:var(--muted)"></span>
+      </div>
+    </div>
+
+    <div class="sec-head">Modelling</div>
+    <div class="card">
+      <!-- Algorithm choice. These answer different questions, so the copy says
+           which rather than leaving it to be inferred from the names. -->
+      <div style="display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+        <button class="btn btn-primary" id="algoRfBtn" onclick="setAlgo('rf')">🎯 Random Forest lookalike</button>
+        <button class="btn btn-secondary" id="algoKmBtn" onclick="setAlgo('km')">🧩 K-Means segmentation</button>
+      </div>
+
+      <!-- ── Random Forest ─────────────────────────────────────────────── -->
+      <div id="algoRf">
+        <div class="info-note" style="margin-bottom:14px">Finds more people like your client list. Trains on the matched IDs against a random background sample.</div>
+        <div class="grid-2" style="margin-bottom:16px">
+          <div class="field"><label>Background sample size</label><input class="inp" id="lkSampleSize" type="number" value="500000" step="10000"></div>
+          <div class="field"><label>Top N traits to keep</label><input class="inp" id="lkTopN" type="number" value="40" step="1"></div>
+        </div>
+        <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-primary" id="lkTrainBtn" onclick="trainLookalike()" disabled>🎯 Build Lookalike Model</button>
+          <span id="lkStatus" style="font-size:12.5px;color:var(--muted)"></span>
+        </div>
+      </div>
+
+      <!-- ── K-Means ───────────────────────────────────────────────────── -->
+      <div id="algoKm" style="display:none">
+        <div class="info-note" style="margin-bottom:14px">Splits your matched audience into segments. Compare k by silhouette, the inertia elbow and the smallest cluster.</div>
+        <div class="grid-3" style="margin-bottom:16px">
+          <div class="field"><label>Audience sample size</label><input class="inp" id="kmSample" type="number" value="50000" step="5000"></div>
+          <div class="field"><label>Traits to cluster on</label><input class="inp" id="kmFeatures" type="number" value="40" step="1"></div>
+          <div class="field"><label>k range to sweep</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input class="inp" id="kmKMin" type="number" value="2" min="2" max="20" style="width:70px">
+              <span style="color:var(--muted)">to</span>
+              <input class="inp" id="kmKMax" type="number" value="12" min="3" max="20" style="width:70px">
+            </div>
+          </div>
+        </div>
+        <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-primary" id="kmSweepBtn" onclick="kmSweep()" disabled>📉 Run Cluster Sweep</button>
+          <span id="kmStatus" style="font-size:12.5px;color:var(--muted)"></span>
+        </div>
+        <div class="loader" id="kmLoader"><div class="spinner"></div>Running the sweep…</div>
+
+        <div id="kmSweepResults" style="display:none;margin-top:18px">
+          <div id="kmRecommend" class="info-note" style="margin-bottom:12px"></div>
+          <div class="preview-scroll" style="max-height:320px;margin-bottom:8px">
+            <table class="preview-table" id="kmSweepTable"></table>
+          </div>
+          <div style="font-size:11.5px;color:var(--muted);margin-bottom:14px">Click a row to choose that k.</div>
+          <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+            <div class="field" style="margin:0"><label>Clusters (k)</label>
+              <input class="inp" id="kmK" type="number" value="0" min="2" max="20" style="width:90px" oninput="kmSyncFit()"></div>
+            <button class="btn btn-primary" id="kmFitBtn" onclick="kmFit()" disabled>🧩 Fit Clusters</button>
+            <span id="kmFitStatus" style="font-size:12.5px;color:var(--muted)"></span>
+          </div>
+        </div>
+
+        <div id="kmFitResults" style="display:none;margin-top:18px">
+          <div class="grid-3" style="margin-bottom:14px">
+            <div class="field"><label>Clusters</label><div class="mono" id="kmOutK" style="font-size:20px;font-weight:700"></div></div>
+            <div class="field"><label>Silhouette</label><div class="mono" id="kmOutSil" style="font-size:20px;font-weight:700"></div></div>
+            <div class="field"><label>Fitted on</label><div class="mono" id="kmOutRows" style="font-size:13px"></div></div>
+          </div>
+          <div class="preview-scroll" style="max-height:340px;margin-bottom:14px">
+            <table class="preview-table" id="kmClusterTable"></table>
+          </div>
+          <div class="info-note" style="margin-bottom:12px">One tab per cluster, traits sorted by distance from the general population. Takes several minutes.</div>
+          <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-primary" id="kmExportBtn" onclick="kmStartExport()">⬇ Export Cluster Insights (Excel)</button>
+            <button class="btn btn-secondary btn-sm" id="kmCancelBtn" onclick="kmCancelExport()" style="display:none">Cancel</button>
+            <span id="kmExportStatus" style="font-size:12.5px;color:var(--muted)"></span>
+          </div>
+          <div id="kmBar" style="display:none;height:6px;border-radius:4px;background:rgba(255,255,255,0.09);overflow:hidden;margin-top:12px">
+            <i style="display:block;height:100%;width:0;border-radius:4px;background:linear-gradient(90deg,var(--teal),var(--violet));transition:width .4s ease"></i>
+          </div>
+          <div id="kmLog" style="display:none;margin-top:10px;max-height:130px;overflow-y:auto;font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.7;color:var(--muted);border-left:2px solid var(--card-border);padding-left:10px"></div>
+        </div>
+      </div>
+      <div class="loader" id="lkLoader"><div class="spinner"></div>Training the model…</div>
+
+      <div id="lkResults" style="display:none;margin-top:20px">
+        <div class="grid-3" style="margin-bottom:16px">
+          <div class="field"><label>Model quality (AUC)</label><div class="mono" id="lkAuc" style="font-size:20px;font-weight:700"></div></div>
+          <div class="field"><label>Lift @ top 1% / 5% / 10%</label><div class="mono" id="lkLift" style="font-size:20px;font-weight:700"></div></div>
+          <div class="field"><label>Trained on</label><div class="mono" id="lkCounts" style="font-size:13px"></div></div>
+        </div>
+        <div id="lkFeatureGroups"></div>
+
+        <div class="sec-head" style="margin-top:22px">Score Distribution &amp; Export</div>
+        <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px" id="lkPopLine"></div>
+        <div style="display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px">
+          <div class="field" style="max-width:180px">
+            <label>Bucket by</label>
+            <select class="inp" id="lkBucketCount">
+              <option value="10">Deciles (10)</option>
+              <option value="20">Twentiles (20)</option>
+              <option value="100">Percentiles (100)</option>
+            </select>
+          </div>
+          <button class="btn btn-secondary" id="lkDistBtn" onclick="previewDistribution()">📊 Preview Score Distribution</button>
+          <span id="lkDistStatus" style="font-size:12.5px;color:var(--muted)"></span>
+        </div>
+        <div class="loader" id="lkDistLoader"><div class="spinner"></div>Scoring the base table…</div>
+
+        <div id="lkDistResults" style="display:none">
+          <div class="preview-scroll" style="max-height:340px;margin-bottom:14px">
+            <table class="preview-table" id="lkDistTable"></table>
+          </div>
+          <div class="info-note" style="margin-bottom:14px">Click a tier to select the top slice through that tier.</div>
+          <div id="lkSelectedLine" style="font-size:13px;color:var(--text-sec);margin-bottom:14px"></div>
+          <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-secondary" id="lkInsightsBtn" onclick="previewInsights()" disabled>🔍 Preview Insights for This Segment</button>
+            <button class="btn btn-primary" id="lkExportBtn" onclick="scoreAndDownload()" disabled>⬇ Export This Segment (CSV)</button>
+            <span id="lkScoreStatus" style="font-size:12.5px;color:var(--muted)"></span>
+          </div>
+
+          <!-- Full-taxonomy, per-decile trait profile -->
+          <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--card-border)">
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px">Full purchase-based insights by decile</div>
+            <div class="info-note" style="margin-bottom:12px">Profiles every taxonomy trait by decile. Ticking fewer deciles runs faster.</div>
+            <div id="lkDecilePick" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px"></div>
+            <div class="field" style="max-width:420px;margin-bottom:12px">
+              <label>Layout</label>
+              <select class="inp" id="lkLayout">
+                <option value="consolidated">Consolidated — one block: index, composition %, count</option>
+                <option value="by_decile">One column block per decile</option>
+              </select>
+            </div>
+            <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+              <button class="btn btn-primary" id="lkFullExportBtn" onclick="startFullExport()" disabled>⬇ Export Full Insights (Excel)</button>
+              <button class="btn btn-secondary btn-sm" id="lkFullCancelBtn" onclick="cancelFullExport()" style="display:none">Cancel</button>
+              <span id="lkFullStatus" style="font-size:12.5px;color:var(--muted)"></span>
+            </div>
+            <div id="lkFullBar" style="display:none;height:6px;border-radius:4px;background:rgba(255,255,255,0.09);overflow:hidden;margin-top:12px">
+              <i style="display:block;height:100%;width:0;border-radius:4px;background:linear-gradient(90deg,var(--teal),var(--violet));transition:width .4s ease"></i>
+            </div>
+            <div id="lkFullLog" style="display:none;margin-top:10px;max-height:130px;overflow-y:auto;font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.7;color:var(--muted);border-left:2px solid var(--card-border);padding-left:10px"></div>
+          </div>
+          <div class="loader" id="lkInsightsLoader"><div class="spinner"></div>Computing averages…</div>
+          <div id="lkInsightsResults" style="display:none;margin-top:16px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:10px">
+              <div style="font-size:12.5px;color:var(--muted)" id="lkInsightsSummaryLine"></div>
+              <button class="btn btn-secondary btn-sm" onclick="exportInsights()">⬇ Export Insights (CSV)</button>
+            </div>
+            <div id="lkInsightsChart" style="margin-bottom:16px"></div>
+            <div class="preview-scroll" style="max-height:340px">
+              <table class="preview-table" id="lkInsightsTable"></table>
+            </div>
+            <div class="info-note" style="margin-top:12px">Segment averages are exact. The population average comes from the training sample.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec-head">Audience Visualizer </div>
+    <div class="card">
+      <div class="info-note" style="margin-bottom:14px">Shares come from the Binary flag. Index compares the audience share with the full base table (100 = same).</div>
+      <div style="display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px">
+        <div class="field" style="max-width:250px">
+          <label>Audience</label>
+          <select class="inp" id="vizAudience" onchange="onVizAudienceChange()">
+            <option value="matched">Matched client audience</option>
+            <option value="segment">Top lookalike scores</option>
+          </select>
+        </div>
+        <div class="field" style="max-width:160px;display:none" id="vizLimitField">
+          <label>Top N scored</label>
+          <input class="inp" id="vizLimit" value="1000000">
+        </div>
+        <div class="field" style="max-width:230px">
+          <label>Insight category</label>
+          <select class="inp" id="vizCategory" onchange="onVizCategoryChange()"><option value="">Load the taxonomy first</option></select>
+        </div>
+        <div class="field" style="max-width:330px">
+          <label>Insight group</label>
+          <select class="inp" id="vizGroup"><option value="">&mdash;</option></select>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+        <button class="btn btn-secondary" id="vizLoadBtn" onclick="loadTaxonomy()">&#8635; Load Taxonomy</button>
+        <button class="btn btn-primary" id="vizRunBtn" onclick="runProfile()" disabled>&#128202; Visualize This Group</button>
+        <span id="vizStatus" style="font-size:12.5px;color:var(--muted)"></span>
+      </div>
+      <div class="loader" id="vizLoader"><div class="spinner"></div>Aggregating&hellip;</div>
+
+      <div id="vizResults" style="display:none;margin-top:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:10px">
+          <div style="font-size:12.5px;color:var(--muted)" id="vizSummary"></div>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <select class="inp" id="vizIndexSrc" onchange="renderProfile()" style="max-width:230px;font-size:12px;padding:6px 10px" title="Which index drives the chart, colours and sorting">
+              <option value="provider">Index: provider (trait's own)</option>
+              <option value="coverage">Index: share, populated rows only</option>
+              <option value="share">Index: share, all rows</option>
+            </select>
+            <select class="inp" id="vizSort" onchange="renderProfile()" style="max-width:190px;font-size:12px;padding:6px 10px">
+              <option value="taxonomy">Taxonomy order</option>
+              <option value="share">Highest share first</option>
+              <option value="index">Strongest index first</option>
+            </select>
+            <button class="btn btn-secondary btn-sm" onclick="exportProfile()">&#8681; Export (CSV)</button>
+          </div>
+        </div>
+        <div id="vizChart" style="margin-bottom:18px"></div>
+        <div class="preview-scroll" style="max-height:360px"><table class="preview-table" id="vizTable"></table></div>
+        <div class="info-note" style="margin-top:12px" id="vizFootnote"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+</div>
+
+<!-- Preview modal -->
+<div class="modal-back" id="previewModal">
+  <div class="modal">
+    <h2 id="pmTitle">Preview</h2>
+    <div class="sub" id="pmSub"></div>
+    <div class="preview-scroll"><table class="preview-table" id="previewTable"></table></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-sm" onclick="setAsBase()">Set as Base Table</button>
+      <button class="btn btn-secondary btn-sm" onclick="setAsClient()">Set as Client Table</button>
+      <div class="spacer"></div>
+      <button class="btn btn-secondary" onclick="closePreview()">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+
+// Read a response as JSON, but if the server sent something else (an HTML error
+// page, a proxy timeout) report what it actually said instead of the useless
+// "Unexpected token '<' ... is not valid JSON" that r.json() would throw.
+async function readJson(r){
+  const text=await r.text();
+  try{ return JSON.parse(text); }
+  catch{
+    const snippet=text.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim().slice(0,200);
+    throw new Error(`server returned ${r.status} ${r.statusText||''} instead of JSON — ${snippet||'(empty response)'}`);
+  }
+}
+const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+let allObjects=[];
+
+function setStatus(cls, text){
+  const pill=$('statusPill');
+  pill.className='status-pill '+cls;
+  $('statusText').textContent=text;
+}
+
+async function loadStatus(){
+  const s=await readJson(await fetch('/1p-modeling/api/status'));
+  $('fAccount').value=s.account||'—';
+  $('fRole').value=s.role||'—';
+  $('fDatabase').value=s.database||'—';
+  $('fSchema').value=s.schema||'—';
+  if(s.warehouse) $('fWarehouse').value=s.warehouse;
+
+  // Each person types their own login — remembered in THIS browser only
+  // (localStorage), never written back to the shared config, so one
+  // person's email never leaks into someone else's session.
+  let savedUser=null; try{ savedUser=localStorage.getItem('sf_user'); }catch(e){}
+  $('fUser').value=savedUser||s.default_user||'';
+
+  if(!s.configured){
+    setStatus('st-error','Not configured');
+    $('errorBox').textContent='No warehouse config found — add tools/data/warehouse_config.json with the account first.';
+    $('errorBox').classList.add('visible');
+    $('connectBtn').disabled=true;
+    return;
+  }
+  if(s.connected){
+    setStatus('st-connected','Connected');
+    $('disconnectBtn').style.display='';
+    await loadDatabases(s.database, s.schema);
+  } else {
+    setStatus('st-idle','Not connected');
+  }
+}
+
+/* ── Database / schema browsing — not limited to the configured default ── */
+async function loadDatabases(preselectDb, preselectSchema){
+  try{
+    const r=await fetch('/1p-modeling/api/databases');
+    const data=await readJson(r);
+    if(!r.ok || data.error){
+      $('errorBox').textContent=data.error||'Could not list databases.';
+      $('errorBox').classList.add('visible');
+      return;
+    }
+    const dbSel=$('dbSelect');
+    dbSel.innerHTML=data.databases.map(d=>`<option value="${esc(d)}">${esc(d)}</option>`).join('');
+    if(preselectDb && data.databases.includes(preselectDb)) dbSel.value=preselectDb;
+    await loadSchemas(preselectSchema);
+  }catch(e){
+    $('errorBox').textContent='Unexpected error: '+e.message;
+    $('errorBox').classList.add('visible');
+  }
+}
+async function onDbChange(){ await loadSchemas(); }
+async function loadSchemas(preselectSchema){
+  const db=$('dbSelect').value;
+  try{
+    const r=await fetch('/1p-modeling/api/schemas?database='+encodeURIComponent(db));
+    const data=await readJson(r);
+    if(!r.ok || data.error){
+      $('errorBox').textContent=data.error||'Could not list schemas.';
+      $('errorBox').classList.add('visible');
+      return;
+    }
+    const schemas=data.schemas.filter(s=>s!=='INFORMATION_SCHEMA');
+    const schemaSel=$('schemaSelect');
+    schemaSel.innerHTML=schemas.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');
+    if(preselectSchema && schemas.includes(preselectSchema)) schemaSel.value=preselectSchema;
+    await loadObjects();
+  }catch(e){
+    $('errorBox').textContent='Unexpected error: '+e.message;
+    $('errorBox').classList.add('visible');
+  }
+}
+
+async function doConnect(){
+  const user=$('fUser').value.trim();
+  if(!user){
+    $('errorBox').textContent='Enter your warehouse login email first.';
+    $('errorBox').classList.add('visible');
+    $('fUser').focus();
+    return;
+  }
+  try{ localStorage.setItem('sf_user', user); }catch(e){}
+
+  $('errorBox').classList.remove('visible');
+  $('loader').classList.add('visible');
+  $('connectBtn').disabled=true;
+  setStatus('st-connecting','Connecting…');
+
+  try{
+    const r=await fetch('/1p-modeling/api/connect',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user, warehouse:$('fWarehouse').value.trim()})});
+    const data=await readJson(r);
+    if(!r.ok || data.error){
+      setStatus('st-error','Connection failed');
+      $('errorBox').textContent=data.error||'Connection failed.';
+      $('errorBox').classList.add('visible');
+      return;
+    }
+    setStatus('st-connected','Connected');
+    $('disconnectBtn').style.display='';
+    // Listing databases is a separate step: if it fails the connection is still
+    // live, so don't let its error masquerade as "Connection failed".
+    try{
+      await loadDatabases($('fDatabase').value, $('fSchema').value);
+    }catch(e2){
+      $('errorBox').textContent='Connected, but loading the database list failed: '+e2.message;
+      $('errorBox').classList.add('visible');
+    }
+  }catch(e){
+    setStatus('st-error','Connection failed');
+    $('errorBox').textContent='Unexpected error: '+e.message;
+    $('errorBox').classList.add('visible');
+  }finally{
+    $('loader').classList.remove('visible');
+    $('connectBtn').disabled=false;
+  }
+}
+
+async function doDisconnect(){
+  await fetch('/1p-modeling/api/disconnect',{method:'POST'});
+  setStatus('st-idle','Not connected');
+  $('disconnectBtn').style.display='none';
+  $('browseArea').classList.remove('visible');
+}
+
+async function loadObjects(){
+  const db=$('dbSelect').value, schema=$('schemaSelect').value;
+  if(!db||!schema) return;
+  try{
+    const r=await fetch('/1p-modeling/api/browse?database='+encodeURIComponent(db)+'&schema='+encodeURIComponent(schema));
+    const data=await readJson(r);
+    if(!r.ok || data.error){
+      $('errorBox').textContent=data.error||'Could not load schema contents.';
+      $('errorBox').classList.add('visible');
+      return;
+    }
+    allObjects=data.objects||[];
+    $('browseArea').classList.add('visible');
+    renderObjects();
+  }catch(e){
+    $('errorBox').textContent='Unexpected error: '+e.message;
+    $('errorBox').classList.add('visible');
+  }
+}
+
+function fmtBytes(n){
+  if(n==null) return '—';
+  n=Number(n);
+  if(n>=1e9) return (n/1e9).toFixed(2)+' GB';
+  if(n>=1e6) return (n/1e6).toFixed(2)+' MB';
+  if(n>=1e3) return (n/1e3).toFixed(1)+' KB';
+  return n+' B';
+}
+function fmtInt(n){ return n==null ? '—' : Number(n).toLocaleString('en-CA'); }
+
+function renderObjects(){
+  const q=($('searchBox').value||'').toLowerCase().trim();
+  const rows=allObjects.filter(o=>!q||o.table_name.toLowerCase().includes(q));
+  $('objBody').innerHTML=rows.length ? rows.map(o=>{
+    const isView=(o.table_type||'').toUpperCase().includes('VIEW');
+    return `<tr onclick="openPreview('${esc(o.table_name)}')">
+      <td><b>${esc(o.table_name)}</b></td>
+      <td><span class="type-pill ${isView?'tp-view':'tp-table'}">${esc(o.table_type||'')}</span></td>
+      <td class="mono">${fmtInt(o.row_count)}</td>
+      <td class="mono">${fmtBytes(o.bytes)}</td>
+      <td class="mono">${esc((o.last_altered||'').slice(0,19))}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px">No objects match your search.</td></tr>`;
+}
+
+/* ── Matching Setup: designate any browsed table as Base or Client,
+   pick its join column, and empirically test whether the join finds
+   any matches at all — reusable for any future client table. ── */
+let previewCurrent=null;   // {db, schema, table, columns} for whatever's open in the preview modal
+let baseInfo=null, clientInfo=null;
+
+async function openPreview(table){
+  $('pmTitle').textContent=table;
+  $('pmSub').textContent='Loading first 50 rows…';
+  $('previewTable').innerHTML='';
+  $('previewModal').classList.add('open');
+  previewCurrent=null;
+
+  const db=$('dbSelect').value, schema=$('schemaSelect').value;
+  try{
+    const r=await fetch('/1p-modeling/api/preview?table='+encodeURIComponent(table)+'&limit=50'
+      +'&database='+encodeURIComponent(db)+'&schema='+encodeURIComponent(schema));
+    const data=await readJson(r);
+    if(!r.ok || data.error){
+      $('pmSub').textContent=data.error||'Could not load preview.';
+      return;
+    }
+    $('pmSub').textContent=`First ${data.rows.length} rows`;
+    $('previewTable').innerHTML=
+      `<thead><tr>${data.columns.map(c=>`<th>${esc(c)}</th>`).join('')}</tr></thead>
+       <tbody>${data.rows.map(row=>`<tr>${row.map(v=>`<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody>`;
+    previewCurrent={db, schema, table, columns:data.columns};
+  }catch(e){
+    $('pmSub').textContent='Unexpected error: '+e.message;
+  }
+}
+
+function setAsBase(){
+  if(!previewCurrent){ alert('Preview a table first.'); return; }
+  baseInfo={...previewCurrent};
+  $('baseTableDisplay').value=`${baseInfo.db}.${baseInfo.schema}.${baseInfo.table}`;
+  const sel=$('baseColumnSelect');
+  sel.disabled=false;
+  sel.innerHTML=baseInfo.columns.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  if(baseInfo.columns.includes('HASHED_ID')) sel.value='HASHED_ID';
+  closePreview();
+  updateTestBtn();
+}
+function setAsClient(){
+  if(!previewCurrent){ alert('Preview a table first.'); return; }
+  clientInfo={...previewCurrent};
+  $('clientTableDisplay').value=`${clientInfo.db}.${clientInfo.schema}.${clientInfo.table}`;
+  const sel=$('clientColumnSelect');
+  sel.disabled=false;
+  sel.innerHTML=clientInfo.columns.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  if(clientInfo.columns.includes('HASHED_ID')) sel.value='HASHED_ID';
+  closePreview();
+  updateTestBtn();
+}
+function updateTestBtn(){
+  $('testJoinBtn').disabled = !(baseInfo && clientInfo);
+  // Both algorithms need the same two tables chosen, so they unlock together.
+  const ready = !!(baseInfo && clientInfo);
+  $('lkTrainBtn').disabled = !ready;
+  $('kmSweepBtn').disabled = !ready;
+  $('joinResult').textContent='';
+}
+$('baseColumnSelect').addEventListener('change', ()=>{ $('joinResult').textContent=''; });
+$('clientColumnSelect').addEventListener('change', ()=>{ $('joinResult').textContent=''; });
+
+async function testJoin(){
+  const baseCol=$('baseColumnSelect').value, clientCol=$('clientColumnSelect').value;
+  if(!baseCol||!clientCol){ $('joinResult').textContent='Pick a join column on both sides first.'; return; }
+  $('joinResult').textContent='Running…';
+  $('testJoinBtn').disabled=true;
+  try{
+    const r=await fetch('/1p-modeling/api/test-join',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        base:{db:baseInfo.db, schema:baseInfo.schema, table:baseInfo.table, column:baseCol},
+        client:{db:clientInfo.db, schema:clientInfo.schema, table:clientInfo.table, column:clientCol}
+      })});
+    const data=await readJson(r);
+    if(!r.ok || data.error){ $('joinResult').textContent='Error: '+(data.error||'join test failed'); return; }
+    const pctStr=data.pct.toFixed(1);
+    $('joinResult').innerHTML = data.matches>0
+      ? `<b style="color:var(--teal)">${data.matches.toLocaleString()} matches</b> out of ${data.client_total.toLocaleString()} client rows (${pctStr}%)`
+      : `<b style="color:var(--red)">0 matches</b> out of ${data.client_total.toLocaleString()} client rows — these two columns don't share any common values`;
+  }catch(e){
+    $('joinResult').textContent='Unexpected error: '+e.message;
+  }finally{
+    $('testJoinBtn').disabled=false;
+  }
+}
+/* ── Lookalike Model: RF for trait-association ranking, then a Logistic
+   Regression refit on the top-N for a deployable propensity score. ── */
+let lkJobId=null, lkBaseRows=0, lkDistBuckets=[], lkSelectedBucket=null;
+
+const KIND_LABEL={index:'Index', percentage:'Percentage', binary:'Binary', other:'Other'};
+
+function renderFeatureGroups(features){
+  const groups={index:[], percentage:[], binary:[], other:[]};
+  features.forEach(f=>groups[f.kind||'other'].push(f));
+  return ['index','percentage','binary','other'].filter(k=>groups[k].length).map(k=>{
+    const rows=groups[k].map(f=>{
+      const dir=f.coefficient>=0 ? '<span style="color:var(--teal)">↑ over-indexed</span>' : '<span style="color:var(--red)">↓ under-indexed</span>';
+      // Magnitude, not just the arrow: importance says how much the forest
+      // leaned on a trait, the coefficient says how hard it pushes the score
+      // (per standard deviation of that trait) and which way.
+      const coef=f.coefficient==null ? '—'
+        : (f.coefficient>=0?'+':'')+f.coefficient.toFixed(4);
+      const coefColor=f.coefficient>=0?'var(--teal)':'var(--red)';
+      return `<tr>
+        <td><b>${esc(f.label)}</b><div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(f.category)}${f.description?' — '+esc(f.description):''}</div></td>
+        <td class="mono">${f.importance.toFixed(4)}</td>
+        <td class="mono" style="color:${coefColor};font-weight:700">${coef}</td>
+        <td>${dir}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="feat-group-head"><span class="kind-pill kind-${k}">${KIND_LABEL[k]}</span><span style="color:var(--muted);font-weight:400">${groups[k].length} trait${groups[k].length!==1?'s':''}</span></div>
+      <div class="preview-scroll" style="max-height:280px;margin-bottom:6px">
+        <table class="preview-table"><thead><tr><th>Trait</th><th>RF Importance</th><th>LR Coefficient</th><th>Direction</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div>`;
+  }).join('');
+}
+
+async function trainLookalike(){
+  if(!(baseInfo && clientInfo)){ return; }
+  const sampleSize=parseInt($('lkSampleSize').value,10)||500000;
+  const topN=parseInt($('lkTopN').value,10)||40;
+
+  $('lkStatus').textContent='';
+  $('lkResults').style.display='none';
+  $('lkDistResults').style.display='none';
+  $('lkInsightsResults').style.display='none';
+  $('lkDistStatus').textContent='';
+  $('lkScoreStatus').textContent='';
+  lkDistBuckets=[]; lkSelectedBucket=null;
+  $('lkLoader').classList.add('visible');
+  $('lkTrainBtn').disabled=true;
+
+  try{
+    const r=await fetch('/1p-modeling/api/lookalike/train',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        base:{db:baseInfo.db, schema:baseInfo.schema, table:baseInfo.table, column:$('baseColumnSelect').value},
+        client:{db:clientInfo.db, schema:clientInfo.schema, table:clientInfo.table, column:$('clientColumnSelect').value},
+        sample_size:sampleSize, top_n:topN
+      })});
+    const data=await readJson(r);
+    if(!r.ok || data.error){ $('lkStatus').textContent='Error: '+(data.error||'training failed'); return; }
+
+    lkJobId=data.job_id;
+    lkBaseRows=data.base_table_rows||0;
+    $('lkAuc').textContent=data.auc.toFixed(3);
+    $('lkLift').textContent=`${data.lift['1'].toFixed(1)}x / ${data.lift['5'].toFixed(1)}x / ${data.lift['10'].toFixed(1)}x`;
+    // Show the split of wall-clock too — a slow run should say where it went
+    // rather than leaving "it took forever" as the only diagnosis.
+    const tm=data.timings;
+    $('lkCounts').innerHTML=
+      `${data.positive_count.toLocaleString()} matched vs ${data.background_count.toLocaleString()} background `+
+      `(of ${data.candidate_features} candidate traits)`+
+      (tm?`<div style="font-size:11.5px;color:var(--muted);margin-top:4px">`+
+          `${tm.total_secs}s total &middot; ${tm.pull_secs}s warehouse pull &middot; `+
+          `${tm.rank_secs}s trait ranking</div>`:'')+
+      (data.positive_capped?`<div style="font-size:11.5px;color:var(--amber);margin-top:2px">`+
+          `Audience was sampled down to the positive-class cap.</div>`:'');
+    $('lkPopLine').textContent = lkBaseRows
+      ? `Base table has ${lkBaseRows.toLocaleString()} rows — preview the distribution below to pick an insights/export cutoff.`
+      : '';
+
+    $('lkFeatureGroups').innerHTML=renderFeatureGroups(data.features);
+
+    $('lkResults').style.display='block';
+    $('lkStatus').textContent = data.arrow_fast_path===false
+      ? 'Model trained — note: this Python has no Arrow support, so the data pull used the slow JSON path. See the Arrow note in the README.'
+      : 'Model trained.';
+  }catch(e){
+    $('lkStatus').textContent='Unexpected error: '+e.message;
+  }finally{
+    $('lkLoader').classList.remove('visible');
+    $('lkTrainBtn').disabled=false;
+  }
+}
+
+async function previewDistribution(){
+  if(!lkJobId) return;
+  const buckets=parseInt($('lkBucketCount').value,10)||10;
+  $('lkDistStatus').textContent='';
+  $('lkDistResults').style.display='none';
+  $('lkInsightsResults').style.display='none';
+  $('lkSelectedLine').textContent='';
+  $('lkInsightsBtn').disabled=true;
+  $('lkExportBtn').disabled=true;
+  lkSelectedBucket=null;
+  $('lkDistLoader').classList.add('visible');
+  $('lkDistBtn').disabled=true;
+
+  try{
+    const r=await fetch('/1p-modeling/api/lookalike/distribution',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:lkJobId, buckets})});
+    const data=await readJson(r);
+    if(!r.ok || data.error){ $('lkDistStatus').textContent='Error: '+(data.error||'distribution failed'); return; }
+    lkDistBuckets=data.buckets;
+    renderDistribution();
+    $('lkDistResults').style.display='block';
+  }catch(e){
+    $('lkDistStatus').textContent='Unexpected error: '+e.message;
+  }finally{
+    $('lkDistLoader').classList.remove('visible');
+    $('lkDistBtn').disabled=false;
+  }
+}
+
+/* ── Algorithm switch ─────────────────────────────────────────────────────
+   lkLoader and lkResults are siblings of the two algorithm panels rather than
+   children of the Random Forest one, so they have to be toggled explicitly —
+   otherwise a trained RF's score-distribution section stays on screen while
+   K-Means is selected. */
+let algo='rf';
+function setAlgo(a){
+  algo=a;
+  const rf=a==='rf';
+  $('algoRf').style.display=rf?'':'none';
+  $('algoKm').style.display=rf?'none':'';
+  $('algoRfBtn').className=rf?'btn btn-primary':'btn btn-secondary';
+  $('algoKmBtn').className=rf?'btn btn-secondary':'btn btn-primary';
+  $('lkResults').style.display=(rf && lkJobId)?'block':'none';
+  if(!rf) $('lkLoader').classList.remove('visible');
+}
+
+/* ── K-Means ─────────────────────────────────────────────────────────────── */
+let kmToken=null, kmSweepData=null, kmFitted=null;
+
+async function kmSweep(){
+  const btn=$('kmSweepBtn');
+  btn.disabled=true;
+  $('kmSweepResults').style.display='none';
+  $('kmFitResults').style.display='none';
+  $('kmStatus').textContent='';
+  $('kmLoader').classList.add('visible');
+  try{
+    const r=await fetch('/1p-modeling/api/kmeans/sweep',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        base:{db:baseInfo.db, schema:baseInfo.schema, table:baseInfo.table,
+              column:$('baseColumnSelect').value},
+        client:{db:clientInfo.db, schema:clientInfo.schema, table:clientInfo.table,
+                column:$('clientColumnSelect').value},
+        sample_size:parseInt($('kmSample').value,10)||50000,
+        n_features:parseInt($('kmFeatures').value,10)||40,
+        k_min:parseInt($('kmKMin').value,10)||2,
+        k_max:parseInt($('kmKMax').value,10)||12})});
+    const d=await readJson(r);
+    if(!r.ok||d.error) throw new Error(d.error||'sweep failed');
+    kmToken=d.token; kmSweepData=d;
+    renderKmSweep();
+    $('kmSweepResults').style.display='block';
+    $('kmStatus').textContent=
+      `${d.sample_rows.toLocaleString()} matched rows · clustered on ${d.features_used} of `+
+      `${d.candidates} traits`+
+      (d.features_dropped_constant?` (${d.features_dropped_constant} constant traits dropped)`:'');
+  }catch(e){
+    $('kmStatus').textContent='Error: '+e.message;
+  }finally{
+    $('kmLoader').classList.remove('visible');
+    btn.disabled=false;
+  }
+}
+
+function renderKmSweep(){
+  const d=kmSweepData, rec=d.recommended;
+  const best=Math.max(...d.sweep.map(s=>s.silhouette==null?-1:s.silhouette));
+  $('kmSweepTable').innerHTML=
+    `<thead><tr><th>k</th><th>Silhouette</th><th>Inertia</th><th>Calinski-Harabasz</th>
+       <th>Davies-Bouldin</th><th>Smallest cluster</th><th>Sizes</th></tr></thead>
+     <tbody>${d.sweep.map(s=>{
+       const isBest=s.silhouette!=null && s.silhouette===best;
+       const thin=s.smallest_share<3;
+       return `<tr onclick="kmPickK(${s.k})" style="cursor:pointer;${isBest?'background:rgba(45,212,191,0.14)':''}">
+         <td class="mono"><b>${s.k}</b></td>
+         <td class="mono" style="${isBest?'color:var(--teal);font-weight:700':''}">${s.silhouette==null?'—':s.silhouette.toFixed(4)}</td>
+         <td class="mono">${Math.round(s.inertia).toLocaleString()}</td>
+         <td class="mono">${s.calinski_harabasz==null?'—':Math.round(s.calinski_harabasz).toLocaleString()}</td>
+         <td class="mono">${s.davies_bouldin==null?'—':s.davies_bouldin.toFixed(3)}</td>
+         <td class="mono" style="${thin?'color:var(--red)':''}">${s.smallest_share.toFixed(1)}%</td>
+         <td class="mono" style="font-size:11px">${s.sizes.join(', ')}</td>
+       </tr>`;
+     }).join('')}</tbody>`;
+  $('kmRecommend').innerHTML=
+    `<b>Suggested k = ${rec.suggested_k}.</b> ${esc(rec.note||'')} `+
+    `Silhouette is the primary read here; inertia always falls as k rises, so it only tells `+
+    `you where the improvement stops being worth an extra segment.`;
+  $('kmK').value=rec.suggested_k||2;
+  kmSyncFit();
+}
+
+function kmPickK(k){ $('kmK').value=k; kmSyncFit(); }
+function kmSyncFit(){
+  const k=parseInt($('kmK').value,10);
+  $('kmFitBtn').disabled=!(kmToken && k>=2);
+  const row=kmSweepData && kmSweepData.sweep.find(s=>s.k===k);
+  $('kmFitStatus').textContent = row
+    ? `k=${k}: silhouette ${row.silhouette==null?'—':row.silhouette.toFixed(4)}, smallest cluster ${row.smallest_share.toFixed(1)}%`
+    : (k>=2?`k=${k} was not in the sweep — it will still fit.`:'');
+}
+
+async function kmFit(){
+  const btn=$('kmFitBtn');
+  btn.disabled=true;
+  try{
+    const r=await fetch('/1p-modeling/api/kmeans/fit',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:kmToken, k:parseInt($('kmK').value,10)})});
+    const d=await readJson(r);
+    if(!r.ok||d.error) throw new Error(d.error||'fit failed');
+    kmFitted=d;
+    $('kmOutK').textContent=d.k;
+    $('kmOutSil').textContent=d.silhouette==null?'—':d.silhouette.toFixed(4);
+    $('kmOutRows').textContent=`${d.sample_rows.toLocaleString()} rows · ${d.features_used} traits`;
+    $('kmClusterTable').innerHTML=
+      `<thead><tr><th>Cluster</th><th>IDs</th><th>Share</th><th>Defined by (standard deviations from the audience average)</th></tr></thead>
+       <tbody>${d.clusters.map(cl=>`<tr>
+         <td class="mono"><b>${cl.cluster}</b></td>
+         <td class="mono">${cl.size.toLocaleString()}</td>
+         <td class="mono">${cl.share.toFixed(1)}%</td>
+         <td style="font-size:11.5px">${cl.distinguishing.slice(0,6).map(x=>
+            `<span style="color:${x.z>0?'var(--teal)':'var(--red)'}">${esc(x.label||x.column)} ${x.z>0?'+':''}${x.z.toFixed(2)}</span>`
+          ).join(' &nbsp;·&nbsp; ')}</td></tr>`).join('')}</tbody>`;
+    $('kmFitResults').style.display='block';
+    $('kmFitStatus').textContent='Fitted.';
+  }catch(e){
+    $('kmFitStatus').textContent='Error: '+e.message;
+  }finally{
+    btn.disabled=false;
+  }
+}
+
+let kmJob=null, kmPoll=null;
+
+async function kmStartExport(){
+  $('kmExportBtn').disabled=true; $('kmCancelBtn').style.display='';
+  $('kmBar').style.display=''; $('kmLog').style.display=''; $('kmLog').innerHTML='';
+  $('kmExportStatus').textContent='Starting…';
+  try{
+    const r=await fetch('/1p-modeling/api/kmeans/insights-export/start',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({token:kmToken})});
+    const d=await readJson(r);
+    if(!r.ok||d.error) throw new Error(d.error||'could not start');
+    kmJob=d.job;
+    $('kmExportStatus').textContent=
+      `${d.traits.toLocaleString()} traits × ${d.k} clusters…`+
+      (d.dropped?` (${d.dropped} traits over the ceiling omitted)`:'');
+    kmPoll=setInterval(kmPollExport,1500);
+    kmPollExport();
+  }catch(e){
+    $('kmExportStatus').textContent='Error: '+e.message;
+    kmStopPoll();
+  }
+}
+async function kmCancelExport(){
+  if(!kmJob) return;
+  try{ await fetch('/1p-modeling/api/lookalike/insights-export/cancel',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({job:kmJob})}); }catch(e){}
+  kmStopPoll();
+  $('kmExportStatus').textContent='Cancelled.';
+}
+function kmStopPoll(){
+  if(kmPoll){ clearInterval(kmPoll); kmPoll=null; }
+  $('kmExportBtn').disabled=false; $('kmCancelBtn').style.display='none';
+}
+async function kmPollExport(){
+  if(!kmJob) return;
+  let d;
+  try{
+    const r=await fetch('/1p-modeling/api/lookalike/insights-export/progress?job='+kmJob);
+    d=await readJson(r);
+    if(!r.ok||d.error) throw new Error(d.error||'progress failed');
+  }catch(e){ kmStopPoll(); $('kmExportStatus').textContent='Error: '+e.message; return; }
+
+  const pct=d.total?Math.round(d.step/d.total*100):0;
+  $('kmBar').firstElementChild.style.width=pct+'%';
+  if(d.log&&d.log.length) $('kmLog').innerHTML=d.log.map(l=>`<div>${esc(l)}</div>`).join('');
+  $('kmLog').scrollTop=$('kmLog').scrollHeight;
+
+  if(d.status==='running'){
+    $('kmExportStatus').textContent=`${d.current} — ${pct}%, ${d.elapsed}s elapsed`;
+    return;
+  }
+  kmStopPoll();
+  if(d.status==='error'){ $('kmExportStatus').textContent='Failed: '+d.error; return; }
+  if(d.status==='cancelled'){ $('kmExportStatus').textContent='Cancelled.'; return; }
+  $('kmExportStatus').textContent=`Done in ${d.elapsed}s — downloading.`;
+  const a=document.createElement('a');
+  a.href='/1p-modeling/api/lookalike/insights-export/download?job='+kmJob;
+  a.download='';
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+function renderDistribution(){
+  const n=lkDistBuckets.length;
+  const total=n ? lkDistBuckets[n-1].cumulative : 0;
+  const rows=lkDistBuckets.map(b=>{
+    const pctFrom=((b.bucket-1)/n*100).toFixed(1), pctTo=(b.bucket/n*100).toFixed(1);
+    const cumPct=(b.cumulative/total*100).toFixed(1);
+    const sel=lkSelectedBucket===b.bucket;
+    return `<tr onclick="selectBucket(${b.bucket})" style="cursor:pointer;${sel?'background:rgba(124,92,232,0.16)':''}">
+      <td class="mono">${sel?'▶ ':''}${pctFrom}–${pctTo}%</td>
+      <td class="mono">${b.n.toLocaleString()}</td>
+      <td class="mono">${b.cumulative.toLocaleString()} (${cumPct}%)</td>
+      <td class="mono">${b.min_score.toFixed(4)} – ${b.max_score.toFixed(4)}</td>
+    </tr>`;
+  }).join('');
+  $('lkDistTable').innerHTML=
+    `<thead><tr><th>Tier (top → bottom)</th><th>IDs in tier</th><th>Cumulative from top</th><th>Score range</th></tr></thead><tbody>${rows}</tbody>`;
+  renderDecilePicker();
+}
+
+/* ── Full-taxonomy per-decile export ──────────────────────────────────────
+   Independent of the single-tier selection above: that one picks a cumulative
+   cutoff, whereas this picks individual deciles to compare side by side. */
+function renderDecilePicker(){
+  const n=lkDistBuckets.length;
+  if(!n){ $('lkDecilePick').innerHTML=''; $('lkFullExportBtn').disabled=true; return; }
+  $('lkDecilePick').innerHTML=
+    lkDistBuckets.map(b=>`<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;
+        background:rgba(13,13,43,0.5);border:1px solid var(--card-border);border-radius:6px;
+        padding:5px 9px;cursor:pointer">
+        <input type="checkbox" class="lk-dec" value="${b.bucket}" ${b.bucket<=3?'checked':''}
+          onchange="syncFullExportBtn()" style="accent-color:var(--teal)">
+        ${b.bucket}</label>`).join('')+
+    `<button class="btn btn-secondary btn-sm" onclick="pickDeciles('all')" style="margin-left:6px">All</button>
+     <button class="btn btn-secondary btn-sm" onclick="pickDeciles('top3')">Top 3</button>
+     <button class="btn btn-secondary btn-sm" onclick="pickDeciles('none')">None</button>`;
+  syncFullExportBtn();
+}
+function pickDeciles(which){
+  document.querySelectorAll('.lk-dec').forEach(cb=>{
+    cb.checked = which==='all' ? true : which==='none' ? false : (+cb.value<=3);
+  });
+  syncFullExportBtn();
+}
+const selectedDeciles=()=>[...document.querySelectorAll('.lk-dec:checked')].map(cb=>+cb.value);
+function syncFullExportBtn(){
+  const k=selectedDeciles().length;
+  $('lkFullExportBtn').disabled = k===0 || !lkJobId;
+  $('lkFullStatus').textContent = k ? `${k} decile${k===1?'':'s'} selected` : 'Pick at least one decile';
+}
+
+let lkFullJob=null, lkFullPoll=null;
+
+async function startFullExport(){
+  const sel=selectedDeciles();
+  if(!sel.length){ $('lkFullStatus').textContent='Pick at least one decile.'; return; }
+  const btn=$('lkFullExportBtn');
+  btn.disabled=true; $('lkFullCancelBtn').style.display='';
+  $('lkFullBar').style.display=''; $('lkFullLog').style.display=''; $('lkFullLog').innerHTML='';
+  $('lkFullStatus').textContent='Starting…';
+  try{
+    const r=await fetch('/1p-modeling/api/lookalike/insights-export/start',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        base:{db:baseInfo.db, schema:baseInfo.schema, table:baseInfo.table,
+              column:$('baseColumnSelect').value},
+        job_id:lkJobId, buckets:lkDistBuckets.length, selected:sel,
+        layout:$('lkLayout').value})});
+    const d=await readJson(r);
+    if(!r.ok||d.error) throw new Error(d.error||'could not start');
+    lkFullJob=d.job;
+    $('lkFullStatus').textContent=
+      `${d.traits.toLocaleString()} traits × ${d.selected.length} deciles…`+
+      (d.dropped?` (${d.dropped} traits over the ceiling were omitted)`:'');
+    lkFullPoll=setInterval(pollFullExport,1500);
+    pollFullExport();
+  }catch(e){
+    $('lkFullStatus').textContent='Error: '+e.message;
+    btn.disabled=false; $('lkFullCancelBtn').style.display='none';
+  }
+}
+
+async function cancelFullExport(){
+  if(!lkFullJob) return;
+  try{ await fetch('/1p-modeling/api/lookalike/insights-export/cancel',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({job:lkFullJob})}); }catch(e){}
+  stopFullPoll();
+  $('lkFullStatus').textContent='Cancelled. The query already running finishes on the warehouse\'s side.';
+}
+function stopFullPoll(){
+  if(lkFullPoll){ clearInterval(lkFullPoll); lkFullPoll=null; }
+  $('lkFullExportBtn').disabled=false;
+  $('lkFullCancelBtn').style.display='none';
+  syncFullExportBtn();
+}
+
+async function pollFullExport(){
+  if(!lkFullJob) return;
+  let d;
+  try{
+    const r=await fetch('/1p-modeling/api/lookalike/insights-export/progress?job='+lkFullJob);
+    d=await readJson(r);
+    if(!r.ok||d.error) throw new Error(d.error||'progress failed');
+  }catch(e){ stopFullPoll(); $('lkFullStatus').textContent='Error: '+e.message; return; }
+
+  const pct=d.total?Math.round(d.step/d.total*100):0;
+  $('lkFullBar').firstElementChild.style.width=pct+'%';
+  if(d.log&&d.log.length) $('lkFullLog').innerHTML=d.log.map(l=>`<div>${esc(l)}</div>`).join('');
+  $('lkFullLog').scrollTop=$('lkFullLog').scrollHeight;
+
+  if(d.status==='running'){
+    $('lkFullStatus').textContent=`${d.current} — ${pct}%, ${d.elapsed}s elapsed`;
+    return;
+  }
+  stopFullPoll();
+  if(d.status==='error'){ $('lkFullStatus').textContent='Failed: '+d.error; return; }
+  if(d.status==='cancelled'){ $('lkFullStatus').textContent='Cancelled.'; return; }
+
+  $('lkFullStatus').textContent=`Done in ${d.elapsed}s — downloading.`;
+  const a=document.createElement('a');
+  a.href='/1p-modeling/api/lookalike/insights-export/download?job='+lkFullJob;
+  a.download='';
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+function selectBucket(bucket){
+  lkSelectedBucket=bucket;
+  renderDistribution();
+  const b=lkDistBuckets.find(x=>x.bucket===bucket);
+  const total=lkDistBuckets[lkDistBuckets.length-1].cumulative;
+  const cumPct=(b.cumulative/total*100).toFixed(1);
+  $('lkSelectedLine').innerHTML=`Selected: <b>top ${cumPct}%</b> — <b>${b.cumulative.toLocaleString()}</b> IDs alike at this cutoff (score ≥ ${b.min_score.toFixed(4)})`;
+  $('lkInsightsBtn').disabled=false;
+  $('lkExportBtn').disabled=false;
+  $('lkInsightsResults').style.display='none';
+}
+
+let lkLastInsights=null;
+
+function renderInsightsChart(features){
+  const CAP=250; // clamp so one runaway index doesn't crush the rest of the scale
+  const rows=features.slice(0,20).map(f=>{
+    const idx=f.index==null?100:f.index;
+    const clamped=Math.max(0,Math.min(CAP,idx));
+    const color=idx>110?'var(--teal)':(idx<90?'var(--red)':'var(--muted)');
+    return `<div class="ivbar-row">
+      <div class="ivbar-label" title="${esc(f.label)}">${esc(f.label)}</div>
+      <div class="ivbar-track">
+        <div class="ivbar-baseline" style="left:${100/CAP*100}%"></div>
+        <div class="ivbar-fill" style="width:${clamped/CAP*100}%;background:${color}"></div>
+      </div>
+      <div class="ivbar-val">${f.index==null?'—':Math.round(f.index)}</div>
+    </div>`;
+  }).join('');
+  return `<div style="font-size:10.5px;color:var(--muted);margin-bottom:6px">Index vs. population (100 = baseline, marked by the vertical line) — top ${Math.min(20,features.length)} traits by deviation</div>${rows}`;
+}
+
+async function previewInsights(){
+  if(!lkJobId || !lkSelectedBucket) return;
+  const b=lkDistBuckets.find(x=>x.bucket===lkSelectedBucket);
+  $('lkInsightsResults').style.display='none';
+  $('lkInsightsLoader').classList.add('visible');
+  $('lkInsightsBtn').disabled=true;
+  try{
+    const r=await fetch('/1p-modeling/api/lookalike/insights',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:lkJobId, limit:b.cumulative})});
+    const data=await readJson(r);
+    if(!r.ok || data.error){ $('lkScoreStatus').textContent='Error: '+(data.error||'insights failed'); return; }
+
+    lkLastInsights=data;
+    const rows=data.features.map(f=>{
+      const idx=f.index==null?'—':f.index.toFixed(0);
+      const color=f.index>110?'var(--teal)':(f.index<90?'var(--red)':'var(--text-sec)');
+      return `<tr>
+        <td><span class="kind-pill kind-${f.kind||'other'}" style="margin-right:6px">${KIND_LABEL[f.kind]||'Other'}</span></td>
+        <td><b>${esc(f.label)}</b><div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(f.category)}</div></td>
+        <td class="mono">${f.segment_avg.toFixed(2)}</td>
+        <td class="mono">${f.population_avg.toFixed(2)}</td>
+        <td class="mono" style="color:${color};font-weight:700">${idx}</td>
+      </tr>`;
+    }).join('');
+    $('lkInsightsTable').innerHTML=
+      `<thead><tr><th>Type</th><th>Trait</th><th>Segment Avg</th><th>Population Avg</th><th>Index</th></tr></thead><tbody>${rows}</tbody>`;
+    $('lkInsightsChart').innerHTML=renderInsightsChart(data.features);
+    $('lkInsightsSummaryLine').textContent=`Insights for the top tier — ${data.limit.toLocaleString()} IDs, queried live against the base trait table.`;
+    $('lkInsightsResults').style.display='block';
+  }catch(e){
+    $('lkScoreStatus').textContent='Unexpected error: '+e.message;
+  }finally{
+    $('lkInsightsLoader').classList.remove('visible');
+    $('lkInsightsBtn').disabled=false;
+  }
+}
+
+function exportInsights(){
+  if(!lkLastInsights) return;
+  const header='Type,Trait,Category,Segment Avg,Population Avg,Index\n';
+  const csvEsc=s=>`"${String(s==null?'':s).replace(/"/g,'""')}"`;
+  const body=lkLastInsights.features.map(f=>
+    [KIND_LABEL[f.kind]||'Other', f.label, f.category, f.segment_avg.toFixed(4), f.population_avg.toFixed(4), f.index==null?'':f.index.toFixed(2)]
+      .map(csvEsc).join(',')
+  ).join('\n');
+  const blob=new Blob([header+body],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='lookalike_insights.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function scoreAndDownload(){
+  if(!lkJobId || !lkSelectedBucket) return;
+  const b=lkDistBuckets.find(x=>x.bucket===lkSelectedBucket);
+  const limit=b.cumulative;
+
+  $('lkScoreStatus').textContent='Scoring in the warehouse — this can take a while for a large slice…';
+  $('lkExportBtn').disabled=true;
+  try{
+    const r=await fetch('/1p-modeling/api/lookalike/score',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:lkJobId, limit})});
+    if(!r.ok){
+      const data=await r.json().catch(()=>({}));
+      $('lkScoreStatus').textContent='Error: '+(data.error||'scoring failed');
+      return;
+    }
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='lookalike_scores.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    $('lkScoreStatus').textContent=`Downloaded top ${limit.toLocaleString()} rows.`;
+  }catch(e){
+    $('lkScoreStatus').textContent='Unexpected error: '+e.message;
+  }finally{
+    $('lkExportBtn').disabled=false;
+  }
+}
+
+// ── Audience Visualizer ───────────────────────────────────────────────────
+// Replaces the old SQL workspace. Reads the base table's dictionary taxonomy
+// once, then profiles one insight group at a time: what share of the chosen
+// audience carries each trait, and how that compares with the base table.
+let vizTax=null, vizLast=null;
+
+function onVizAudienceChange(){
+  $('vizLimitField').style.display = $('vizAudience').value==='segment' ? '' : 'none';
+}
+
+async function loadTaxonomy(){
+  if(!baseInfo){ $('vizStatus').textContent='Set a base table first (open a table above and click "Set as Base Table").'; return; }
+  $('vizStatus').textContent='Reading the dictionary…';
+  $('vizLoadBtn').disabled=true;
+  try{
+    const r=await fetch('/1p-modeling/api/taxonomy',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({base:{db:baseInfo.db, schema:baseInfo.schema, table:baseInfo.table}})});
+    const data=await readJson(r);
+    if(!r.ok || data.error){ $('vizStatus').textContent='Error: '+(data.error||'could not load taxonomy'); return; }
+
+    vizTax=data;
+    $('vizCategory').innerHTML=data.categories
+      .map(c=>`<option value="${esc(c.category)}">${esc(c.category)} (${c.groups.length})</option>`).join('');
+    onVizCategoryChange();
+    $('vizRunBtn').disabled=false;
+    $('vizStatus').textContent=`${data.categories.length} categories · ${data.group_count} insight groups · ${data.trait_count} traits`;
+  }catch(e){
+    $('vizStatus').textContent='Unexpected error: '+e.message;
+  }finally{
+    $('vizLoadBtn').disabled=false;
+  }
+}
+
+function onVizCategoryChange(){
+  if(!vizTax) return;
+  const cat=vizTax.categories.find(c=>c.category===$('vizCategory').value);
+  $('vizGroup').innerHTML=!cat ? '<option value="">—</option>'
+    : cat.groups.map(g=>`<option value="${esc(g.group)}">${esc(g.group)} (${g.traits.length})</option>`).join('');
+}
+
+async function runProfile(){
+  if(!baseInfo){ $('vizStatus').textContent='Set a base table first.'; return; }
+  const audience=$('vizAudience').value;
+  if(audience==='matched' && !clientInfo){ $('vizStatus').textContent='Set a client table first, or switch the audience to "Top lookalike scores".'; return; }
+  if(audience==='segment' && !lkJobId){ $('vizStatus').textContent='No trained model yet — build a lookalike model above first.'; return; }
+
+  const body={
+    base:{db:baseInfo.db, schema:baseInfo.schema, table:baseInfo.table, column:$('baseColumnSelect').value},
+    category:$('vizCategory').value, group:$('vizGroup').value, audience
+  };
+  if(audience==='matched'){
+    body.client={db:clientInfo.db, schema:clientInfo.schema, table:clientInfo.table, column:$('clientColumnSelect').value};
+  }else{
+    body.job_id=lkJobId;
+    body.limit=parseInt($('vizLimit').value,10)||1000000;
+  }
+
+  $('vizStatus').textContent='';
+  $('vizResults').style.display='none';
+  $('vizLoader').classList.add('visible');
+  $('vizRunBtn').disabled=true;
+  try{
+    const r=await fetch('/1p-modeling/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const data=await readJson(r);
+    if(!r.ok || data.error){ $('vizStatus').textContent='Error: '+(data.error||'profile failed'); return; }
+    vizLast=data;
+    renderProfile();
+    $('vizResults').style.display='block';
+    $('vizStatus').textContent='Done.';
+  }catch(e){
+    $('vizStatus').textContent='Unexpected error: '+e.message;
+  }finally{
+    $('vizLoader').classList.remove('visible');
+    $('vizRunBtn').disabled=false;
+  }
+}
+
+// Which index the chart, colours and sorting run off. The provider's own (Index)
+// column is the default: it is normalised to the provider's reference population, so
+// it is unaffected by how much of THIS base table is populated. The two
+// share-based indices divide the audience share by the base-table share, which
+// only agrees with the provider index when both sides have the same coverage.
+const IDX_SRC={
+  provider:{key:'provider_index', label:'Provider index',
+            note:"the mean of the trait's own <b>(Index)</b> column across the audience, calculated by the data provider against their reference population"},
+  coverage:{key:'coverage_index', label:'Share index (populated rows)',
+            note:'the audience share divided by the base-table share &times; 100, both computed over rows where the flag is actually populated'},
+  share:   {key:'index',          label:'Share index (all rows)',
+            note:'the audience share divided by the base-table share &times; 100, counting a blank flag as N'},
+};
+function idxSrc(){ return IDX_SRC[$('vizIndexSrc').value] || IDX_SRC.provider; }
+function idxOf(t){ const v=t[idxSrc().key]; return v==null?null:v; }
+
+function vizSorted(){
+  const t=[...vizLast.traits];
+  const mode=$('vizSort').value;
+  if(mode==='share') t.sort((a,b)=>b.audience_pct-a.audience_pct);
+  else if(mode==='index') t.sort((a,b)=>{
+    const av=idxOf(a), bv=idxOf(b);
+    return Math.abs((bv==null?100:bv)-100)-Math.abs((av==null?100:av)-100);
+  });
+  return t;
+}
+
+function renderProfile(){
+  if(!vizLast) return;
+  const d=vizLast, traits=vizSorted();
+  // Scale the track to the widest bar in this group rather than a flat 0-100:
+  // a group whose options all sit under 10% would otherwise be unreadable.
+  const peak=Math.max(1, ...traits.map(t=>Math.max(t.audience_pct||0, t.population_pct||0)));
+  const scale=Math.min(100, Math.ceil(peak*1.15/5)*5);
+
+  $('vizChart').innerHTML=
+    `<div style="font-size:10.5px;color:var(--muted);margin-bottom:8px">
+       <span style="display:inline-block;width:9px;height:9px;background:var(--teal);border-radius:2px;margin-right:5px"></span>% of audience
+       <span style="display:inline-block;width:2px;height:10px;background:rgba(255,255,255,0.55);margin:0 5px 0 14px;vertical-align:middle"></span>% of base table population
+       &nbsp;·&nbsp; bars scaled to ${scale}%
+     </div>` +
+    traits.map(t=>{
+      const a=t.audience_pct||0, p=t.population_pct;
+      const idx=idxOf(t);
+      const color=idx==null?'var(--muted)':(idx>110?'var(--teal)':(idx<90?'var(--red)':'var(--sky)'));
+      const idxTxt=idx==null?'—':Math.round(idx);
+      const idxColor=idx==null?'var(--muted)':(idx>110?'var(--teal)':(idx<90?'var(--red)':'var(--text-sec)'));
+      return `<div class="ivbar-row">
+        <div class="ivbar-label" style="width:270px" title="${esc(t.concept)}">${esc(t.label)}</div>
+        <div class="ivbar-track">
+          <div class="ivbar-fill" style="width:${Math.min(100,a/scale*100)}%;background:${color}"></div>
+          ${p==null?'':`<div class="vbar-pop" style="left:${Math.min(100,p/scale*100)}%"></div>`}
+        </div>
+        <div class="ivbar-val" style="width:52px">${a.toFixed(1)}%</div>
+        <div class="ivbar-val" style="width:46px;color:${idxColor};font-weight:700">${idxTxt}</div>
+      </div>`;
+    }).join('');
+
+  // The active index leads; the other two follow as context so a divergence
+  // between them stays visible instead of being hidden by the choice.
+  const src=idxSrc();
+  $('vizTable').innerHTML=
+    `<thead><tr><th>Trait</th><th>Audience</th><th>% of Audience</th><th>% of Population</th>
+       <th>${esc(src.label)}</th><th>Provider</th><th>Share (pop. rows)</th><th>Share (all rows)</th>
+       <th>Coverage</th></tr></thead>
+     <tbody>${traits.map(t=>{
+       const idx=idxOf(t);
+       const color=idx==null?'var(--muted)':(idx>110?'var(--teal)':(idx<90?'var(--red)':'var(--text-sec)'));
+       const dim='color:var(--muted)';
+       const num=(v,d)=>v==null?'—':v.toFixed(d==null?1:d);
+       return `<tr>
+         <td><b>${esc(t.label)}</b>${t.description?`<div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(t.description)}</div>`:''}</td>
+         <td class="mono">${t.audience_count.toLocaleString()}</td>
+         <td class="mono">${t.audience_pct.toFixed(2)}%</td>
+         <td class="mono">${t.population_pct==null?'—':t.population_pct.toFixed(2)+'%'}</td>
+         <td class="mono" style="color:${color};font-weight:700">${idx==null?'—':idx.toFixed(0)}</td>
+         <td class="mono" style="${dim}">${num(t.provider_index)}</td>
+         <td class="mono" style="${dim}">${num(t.coverage_index,0)}</td>
+         <td class="mono" style="${dim}">${num(t.index,0)}</td>
+         <td class="mono" style="${dim}">${t.audience_coverage==null?'—':t.audience_coverage.toFixed(0)+'%'}</td>
+       </tr>`;
+     }).join('')}</tbody>`;
+
+  $('vizSummary').textContent=
+    `${d.category} › ${d.group} — ${d.audience_label}, ${d.audience_rows.toLocaleString()} rows, `+
+    `indexed against ${d.population_rows.toLocaleString()} base-table rows`;
+
+  const prec=[...new Set(traits.map(t=>t.precision).filter(Boolean))].join(', ');
+
+  // A coverage gap between the audience and the base table is the usual reason
+  // the share indices sit far off 100 while the provider's own index does not. Say so
+  // with the measured numbers rather than leaving it to be inferred.
+  const ac=d.audience_coverage_median, pc=d.population_coverage_median;
+  let covNote='';
+  if(ac!=null && pc!=null && pc>0){
+    const ratio=ac/pc;
+    if(ratio<0.9 || ratio>1.1){
+      covNote=`<br><br><b>Coverage warning:</b> these flags are populated on `+
+        `<b>${ac.toFixed(0)}%</b> of the audience but <b>${pc.toFixed(0)}%</b> of the base table. `+
+        `Because a blank counts as N, that gap alone pushes every "share, all rows" index `+
+        `to roughly <b>${Math.round(ratio*100)}</b> before the audience itself is considered — `+
+        `which is why they can all read as under-indexed. Use the provider index, or `+
+        `"share, populated rows only", to compare like with like.`;
+    }
+  }
+
+  $('vizFootnote').innerHTML=
+    `Showing <b>${esc(src.label)}</b> &mdash; ${src.note}. 100 = parity.`+
+    ` Shares are <b>COUNT(trait = 'Y') / COUNT(rows)</b>, so a blank Binary column counts as N`+
+    ` in the "all rows" variant. The three index columns will not agree exactly; where they`+
+    ` diverge, the Coverage column is usually the reason.`+
+    covNote+
+    (prec?`<br><br>Precision level for these traits: <b>${esc(prec)}</b>, so they are modelled at that granularity rather than per individual.`:'')+
+    (d.dropped?` <b>Note:</b> ${d.dropped} further trait(s) in this group were not charted (per-group ceiling).`:'');
+}
+
+function exportProfile(){
+  if(!vizLast) return;
+  const d=vizLast;
+  const header='Category,Insight Group,Trait,Concept,Description,Precision,Audience,Audience Count,'+
+    '% of Audience,% of Population,Provider Index,Provider Index vs Base Mean,'+
+    'Share Index (populated rows),Share Index (all rows),'+
+    'Audience Coverage %,Population Coverage %\n';
+  const csvEsc=s=>`"${String(s==null?'':s).replace(/"/g,'""')}"`;
+  const f=(v,d2)=>v==null?'':v.toFixed(d2);
+  const body=vizSorted().map(t=>[
+    d.category, d.group, t.label, t.concept, t.description, t.precision,
+    d.audience_label, t.audience_count,
+    f(t.audience_pct,4), f(t.population_pct,4),
+    f(t.provider_index,2), f(t.provider_index_rel,2),
+    f(t.coverage_index,2), f(t.index,2),
+    f(t.audience_coverage,2), f(t.population_coverage,2)
+  ].map(csvEsc).join(',')).join('\n');
+  const blob=new Blob([header+body],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='audience_profile.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function closePreview(){ $('previewModal').classList.remove('open'); }
+$('previewModal').addEventListener('click',e=>{if(e.target===$('previewModal'))closePreview()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closePreview();});
+
+
+loadStatus();
+</script>
+</body>
+</html>

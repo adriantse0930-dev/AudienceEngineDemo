@@ -1,0 +1,398 @@
+<script data-demo="streamed_media">
+// Streamed Media Analysis — demo back-end.
+// Takes ComScore beacon URLs, reads the content page URL from the c7 parameter,
+// detects the platform, resolves metadata from a fictional catalogue and infers
+// interests and likely purchases per panelist (c12). Titles, creators and brands
+// are all made up.
+(function () {
+  'use strict';
+  var PLATFORMS = {
+    youtube: { name: 'YouTube', color: '#ff4e45' },
+    netflix: { name: 'Netflix', color: '#e50914' },
+    prime: { name: 'Prime Video', color: '#00a8e1' },
+    reels: { name: 'Instagram Reels', color: '#e1306c' },
+    music: { name: 'Spotify Music', color: '#1db954' },
+    podcast: { name: 'Spotify Podcasts', color: '#9b6bff' }
+  };
+
+  // ── Fictional catalogue ────────────────────────────────────────────────
+  var CAT = {
+    youtube: {
+      Kx9Lm2Qa7Tp: { title: 'Sub-3 Marathon: The 16-Week Build', creator: 'Tempo Lab', type: 'Video', genre: 'Sports · Running', duration: '18:42', released: '2026-03-14', extra: { Views: '1.2M', Channel: 'Tempo Lab · 840K subscribers' },
+        synopsis: 'A coach breaks down a 16-week plan to run a sub-three-hour marathon: mileage, long runs, fuelling and taper.', signals: ['running', 'fitness'] },
+      Vb4Ne8Rw1Zc: { title: 'I Tried Every Budget Mirrorless Camera', creator: 'Frame & Focus', type: 'Video', genre: 'Tech · Photography', duration: '24:10', released: '2026-01-22', extra: { Views: '640K', Channel: 'Frame & Focus · 310K subscribers' },
+        synopsis: 'Five entry-level mirrorless cameras tested side by side for autofocus, video and low light.', signals: ['photography', 'tech'] },
+      Hq7Tu3Ys5Lp: { title: 'Weeknight Ramen in 20 Minutes', creator: 'Small Kitchen Big Flavour', type: 'Video', genre: 'Food · Cooking', duration: '11:05', released: '2025-11-02', extra: { Views: '2.8M', Channel: 'Small Kitchen Big Flavour · 1.9M subscribers' },
+        synopsis: 'A fast, pantry-friendly ramen with a soft egg and chilli oil, made in one pot.', signals: ['cooking', 'family'] }
+    },
+    netflix: {
+      '81234567': { title: 'Cobalt Ridge', creator: 'Netflix Original', type: 'Series · S2 E4', genre: 'Crime · Thriller', duration: '52 min', released: '2025-09-19', extra: { Episode: 'The Quarry Line', Rating: 'TV-MA', Seasons: '2' },
+        synopsis: 'A small-town detective reopens a quarry accident that three families would rather keep buried.', signals: ['mystery'] },
+      '81345678': { title: 'Saffron Terrace', creator: 'Netflix Film', type: 'Film', genre: 'Romance · Travel', duration: '1 h 54 min', released: '2026-02-13', extra: { Rating: 'PG-13', Language: 'English, Italian' },
+        synopsis: 'A food writer on assignment along the Amalfi coast falls for the chef she was sent to review.', signals: ['travel', 'cooking'] },
+      '81456789': { title: 'Pocketful of Thunder', creator: 'Netflix Docuseries', type: 'Docuseries · E3', genre: 'Documentary · Motorsport', duration: '47 min', released: '2026-04-04', extra: { Episode: 'Rain at the Ring', Rating: 'TV-14' },
+        synopsis: 'Behind the scenes with an underdog endurance-racing team across one punishing season.', signals: ['cars', 'fitness'] }
+    },
+    prime: {
+      B0CX12AB34: { title: 'Ironbark Rescue', creator: 'Prime Original', type: 'Series · S1 E2', genre: 'Action · Adventure', duration: '44 min', released: '2025-07-11', extra: { Episode: 'Flash Flood', Rating: 'TV-14' },
+        synopsis: 'A volunteer search-and-rescue crew works the backcountry during the worst fire season in decades.', signals: ['outdoors'] },
+      B0DQ56CD78: { title: 'Juniper Vale Bake-Off', creator: 'Prime Video', type: 'Reality · E6', genre: 'Food · Competition', duration: '58 min', released: '2026-01-30', extra: { Episode: 'Laminated Dough Week', Rating: 'TV-G' },
+        synopsis: 'Ten home bakers compete in a converted barn. This week: croissants, kouign-amann and a showstopper.', signals: ['baking', 'family'] },
+      B0EZ90EF12: { title: 'The Algorithm of Ellie Marsh', creator: 'Prime Film', type: 'Film', genre: 'Sci-Fi · Drama', duration: '2 h 6 min', released: '2025-10-24', extra: { Rating: 'PG-13', Language: 'English' },
+        synopsis: 'A data scientist discovers her smart-home assistant has been quietly rewriting her life.', signals: ['tech'] }
+    },
+    reels: {
+      C7xPq2LmN8a: { title: '5-minute desk stretch routine', creator: '@mobility.mia', type: 'Reel', genre: 'Wellness', duration: '0:42', released: '2026-05-02', extra: { Hashtags: '#deskjob #mobility #wfh', Likes: '84K' },
+        synopsis: 'Five quick stretches for neck, hips and wrists, filmed at a standing desk.', signals: ['wellness', 'fitness'] },
+      C8bRt5VwK2c: { title: 'Thrifted fit check: fall layers', creator: '@rewear.rory', type: 'Reel', genre: 'Fashion', duration: '0:28', released: '2025-10-08', extra: { Hashtags: '#thrift #sustainablefashion', Likes: '31K' },
+        synopsis: 'Three autumn outfits built entirely from second-hand finds, with prices.', signals: ['fashion'] },
+      C9dSy7XzM4e: { title: 'Toddler-proof snack hacks', creator: '@busy.parent.bea', type: 'Reel', genre: 'Parenting', duration: '0:35', released: '2026-03-27', extra: { Hashtags: '#toddlerlife #momhacks', Likes: '120K' },
+        synopsis: 'Mess-free snack containers and a weekly prep routine for two kids under four.', signals: ['family'] }
+    },
+    music: {
+      '4uLU6hMCjMI75M1A2tKUQC': { title: 'Glasswing', creator: 'Neon Pilgrims', type: 'Track', genre: 'Synthwave · Electronic', duration: '3:48', released: '2025-08-15', extra: { Album: 'Opal Circuit', Explicit: 'No' },
+        synopsis: 'Driving retro-synth instrumental from the album Opal Circuit.', signals: ['gaming', 'cars'] },
+      '7qiZfU4dY1lWllzX7mPBI3': { title: 'Bramblewick Farm', creator: 'Marrow Creek', type: 'Track', genre: 'Indie Folk', duration: '4:12', released: '2026-02-06', extra: { Album: 'Low Tide Hymns', Explicit: 'No' },
+        synopsis: 'Acoustic folk song about leaving the city for a small farm.', signals: ['outdoors', 'coffee'] },
+      '1rfofaqEpACxVEHIZBJe6W': { title: 'Brass & Bramble (Workout Mix)', creator: 'Larkspur', type: 'Track', genre: 'Dance · Workout', duration: '3:05', released: '2026-01-09', extra: { Album: 'Peak Hour', Explicit: 'No', BPM: '128' },
+        synopsis: 'High-tempo remix built for interval training playlists.', signals: ['fitness'] }
+    },
+    podcast: {
+      '5Xt5DXGzch68nYYamXrNxZ': { title: 'Index funds vs robo-advisors in 2026', creator: 'The Compound Interest Hour', type: 'Podcast · Ep 142', genre: 'Business · Personal Finance', duration: '47:20', released: '2026-04-21', extra: { Show: 'The Compound Interest Hour', Publisher: 'Ledger Lane Media' },
+        synopsis: 'Two planners compare fees, rebalancing and tax efficiency for first-time investors.', signals: ['investing'] },
+      '0vFpG1y0tFzE8ZqEjS9B2x': { title: 'Reading a mortgage pre-approval', creator: 'First-Time Buyer Diaries', type: 'Podcast · Ep 31', genre: 'Personal Finance · Home', duration: '38:05', released: '2026-03-03', extra: { Show: 'First-Time Buyer Diaries', Publisher: 'Open Door Audio' },
+        synopsis: 'What the numbers on a pre-approval letter mean, and the costs buyers forget to budget for.', signals: ['home-buying', 'investing'] },
+      '3kWzpH6xuj5mjvR8Y0AqE1': { title: 'Gravel bikes under $2k', creator: 'Two Wheels Weekly', type: 'Podcast · Ep 88', genre: 'Sports · Cycling', duration: '52:40', released: '2026-05-12', extra: { Show: 'Two Wheels Weekly', Publisher: 'Crankset Radio' },
+        synopsis: 'The hosts ride and rank six gravel bikes, with advice on fit and tyre clearance.', signals: ['cycling', 'fitness'] },
+      '6aTqUwZq8Lm5RtYvBn3Ce7': { title: 'Sleep training without tears', creator: 'Parent Hours', type: 'Podcast · Ep 12', genre: 'Kids & Family', duration: '33:15', released: '2026-02-18', extra: { Show: 'Parent Hours', Publisher: 'Little Moon Studio' },
+        synopsis: 'A paediatric sleep consultant answers listener questions about naps and night waking.', signals: ['family'] }
+    }
+  };
+
+  // Interest → likely purchases (brands are fictional).
+  var RULES = {
+    running: [['Running shoes', 'Strideline'], ['GPS sports watch', 'Pulsewave']],
+    fitness: [['Gym membership', 'Brightside Fitness'], ['Protein & supplements', 'Corefuel']],
+    cycling: [['Gravel bike', 'Spoke & Chain'], ['GPS sports watch', 'Pulsewave']],
+    photography: [['Mirrorless camera', 'Lumora']],
+    tech: [['Smart home devices', 'Nestwise']],
+    cooking: [['Meal kit subscription', 'HearthBox']],
+    baking: [['Stand mixer & bakeware', 'KitchenCraft']],
+    mystery: [['Audiobook subscription', 'Pageturn']],
+    travel: [['Premium travel credit card', 'Wayfarer Rewards']],
+    cars: [['Performance EV', 'Velocity Motors']],
+    outdoors: [['Outdoor gear', 'Trailhead Outfitters'], ['SUV / 4x4', 'Ridgeline Auto']],
+    wellness: [['Standing desk', 'Elevate Desks']],
+    fashion: [['Resale marketplace', 'Loop Market']],
+    family: [['Grocery delivery', 'FreshCart'], ['Baby & toddler products', 'Little Sprout']],
+    gaming: [['Gaming headset', 'Apex Audio']],
+    coffee: [['Specialty coffee subscription', 'Roastline']],
+    investing: [['Robo-advisor', 'Northpeak Invest']],
+    'home-buying': [['Mortgage pre-approval', 'Keystone Home Lending'], ['Home insurance', 'Hearthguard Insurance']]
+  };
+  var INTEREST_LABEL = { running: 'Running', fitness: 'Fitness', cycling: 'Cycling', photography: 'Photography', tech: 'Tech early adopter', cooking: 'Home cooking',
+    baking: 'Baking', mystery: 'Mystery & crime', travel: 'Travel', cars: 'Cars & motorsport', outdoors: 'Outdoors', wellness: 'Wellness', fashion: 'Sustainable fashion',
+    family: 'Young family', gaming: 'Gaming', coffee: 'Coffee culture', investing: 'Investing', 'home-buying': 'Home buying' };
+
+  // ── URL parsing ───────────────────────────────────────────────────────
+  function parse(raw) {
+    var out = { input: raw, outcome: 'OK' };
+    var u;
+    try { u = new URL(raw.trim()); } catch (e) { out.outcome = 'INVALID'; out.reason = 'Not a URL'; return out; }
+    if (!/scorecardresearch\.com$/i.test(u.hostname)) { out.outcome = 'INVALID'; out.reason = 'Not a ComScore beacon URL'; return out; }
+    var page = u.searchParams.get('c7');
+    out.panelist = u.searchParams.get('c12') || 'Unknown';
+    out.ts = u.searchParams.get('ns_ts');
+    if (!page) { out.outcome = 'INVALID'; out.reason = 'No page URL (c7) in the beacon'; return out; }
+    var p;
+    try { p = new URL(page); } catch (e) { out.outcome = 'INVALID'; out.reason = 'Page URL (c7) is malformed'; return out; }
+    out.page = p.href;
+    var h = p.hostname.replace(/^www\./, ''), m;
+    if (/youtube\.com$/.test(h) && (m = p.searchParams.get('v'))) { out.platform = 'youtube'; out.id = m; }
+    else if (h === 'youtu.be') { out.platform = 'youtube'; out.id = p.pathname.slice(1); }
+    else if (/netflix\.com$/.test(h) && (m = p.pathname.match(/\/(?:watch|title)\/(\d+)/))) { out.platform = 'netflix'; out.id = m[1]; }
+    else if (/primevideo\.com$|amazon\.(com|ca)$/.test(h) && (m = p.pathname.match(/\/detail\/([A-Z0-9]+)/i))) { out.platform = 'prime'; out.id = m[1]; }
+    else if (/instagram\.com$/.test(h) && (m = p.pathname.match(/\/reels?\/([\w-]+)/))) { out.platform = 'reels'; out.id = m[1]; }
+    else if (h === 'open.spotify.com' && (m = p.pathname.match(/\/track\/(\w+)/))) { out.platform = 'music'; out.id = m[1]; }
+    else if (h === 'open.spotify.com' && (m = p.pathname.match(/\/episode\/(\w+)/))) { out.platform = 'podcast'; out.id = m[1]; }
+    else { out.outcome = 'UNSUPPORTED'; out.reason = 'Platform not supported: ' + h; return out; }
+    var meta = (CAT[out.platform] || {})[out.id];
+    if (!meta) { out.outcome = 'NOT_FOUND'; out.reason = 'Content ID not found (removed or region-locked)'; return out; }
+    Object.keys(meta).forEach(function (k) { out[k] = meta[k]; });
+    return out;
+  }
+
+  function insights(items) {
+    var by = {};
+    items.filter(function (i) { return i.outcome === 'OK'; }).forEach(function (i) {
+      var P = by[i.panelist] || (by[i.panelist] = { titles: 0, interests: {}, evidence: {}, platforms: {} });
+      P.titles++;
+      (P.platforms[i.platform] = P.platforms[i.platform] || []).push(i);
+      i.signals.forEach(function (s) { P.interests[s] = (P.interests[s] || 0) + 1; (P.evidence[s] = P.evidence[s] || []).push(i); });
+    });
+    var out = {};
+    Object.keys(by).sort().forEach(function (pid) {
+      var P = by[pid];
+      var interests = Object.keys(P.interests).map(function (k) { return { key: k, label: INTEREST_LABEL[k] || k, score: P.interests[k] }; })
+        .sort(function (a, b) { return b.score - a.score || a.label.localeCompare(b.label); });
+      var prod = {};
+      interests.forEach(function (it) {
+        (RULES[it.key] || []).forEach(function (r) {
+          var key = r[0] + '|' + r[1], x = prod[key] || (prod[key] = { product: r[0], brand: r[1], score: 0, because: {} });
+          x.score += it.score;
+          P.evidence[it.key].forEach(function (e) { x.because[e.platform + ':' + e.id] = e; });
+        });
+      });
+      var products = Object.keys(prod).map(function (k) {
+        var x = prod[k], ev = Object.keys(x.because).map(function (q) { return x.because[q]; });
+        var conf = Math.round(100 * (1 - Math.exp(-0.55 * x.score - 0.15 * ev.length)));
+        return { product: x.product, brand: x.brand, confidence: Math.min(96, conf),
+                 evidence: ev.map(function (e) { return { platform: e.platform, title: e.title, creator: e.creator }; }) };
+      }).sort(function (a, b) { return b.confidence - a.confidence || a.product.localeCompare(b.product); });
+      // One headline per platform: what that platform's title points to most directly
+      // (its primary signal), scored with the panelist's overall confidence.
+      var byPlatform = Object.keys(P.platforms).map(function (pl) {
+        var item = P.platforms[pl][0], rule = (RULES[item.signals[0]] || [])[0];
+        var best = rule && products.filter(function (p) { return p.product === rule[0] && p.brand === rule[1]; })[0];
+        return { platform: pl, title: item.title, creator: item.creator, type: item.type, product: best && best.product, brand: best && best.brand, confidence: best && best.confidence };
+      });
+      out[pid] = { titles: P.titles, interests: interests, products: products, byPlatform: byPlatform };
+    });
+    return out;
+  }
+
+  var jobs = {}, order = [];
+  Mock.route('POST', '/streamed-media/api/analyze', function (req) {
+    var urls = (req.json && req.json.urls) || [];
+    urls = urls.map(function (u) { return String(u).trim(); }).filter(Boolean);
+    if (!urls.length) return Mock.json({ error: 'Paste at least one ComScore URL.' }, 400);
+    if (urls.length > 2000) return Mock.json({ error: 'Up to 2,000 URLs per run.' }, 400);
+    var items = urls.map(parse);
+    var ins = insights(items);
+    var job = Math.random().toString(16).slice(2, 12);
+    jobs[job] = { items: items, insights: ins }; order.push(job);
+    while (order.length > 6) delete jobs[order.shift()];
+    return { job: job, items: items, insights: ins, platforms: PLATFORMS };
+  }, { latency: [500, 900] });
+
+  Mock.route('GET', '/streamed-media/api/export', async function (req) {
+    var j = jobs[req.query.job || ''];
+    if (!j) return Mock.json({ error: 'That run has expired — run it again.' }, 404);
+    var titles = j.items.map(function (i) {
+      return { 'Panelist': i.panelist || '', 'Platform': i.platform ? PLATFORMS[i.platform].name : '', 'Outcome': i.outcome, 'Title': i.title || '', 'Creator / show': i.creator || '',
+        'Type': i.type || '', 'Genre': i.genre || '', 'Duration': i.duration || '', 'Released': i.released || '', 'Synopsis': i.synopsis || '', 'Content URL': i.page || '', 'Note': i.reason || '' };
+    });
+    var ins = [];
+    Object.keys(j.insights).forEach(function (pid) {
+      j.insights[pid].products.forEach(function (p) {
+        ins.push({ 'Panelist': pid, 'Likely customer for': p.product, 'Example brand': p.brand, 'Confidence %': p.confidence,
+          'Because they watched / listened to': p.evidence.map(function (e) { return e.title + ' (' + PLATFORMS[e.platform].name + ')'; }).join('; ') });
+      });
+    });
+    if (req.query.format === 'csv') return Mock.file('﻿' + Mock.csv.stringify(titles), 'streamed_media_titles.csv', 'text/csv');
+    return Mock.file(await Mock.xlsxBlob({ 'Titles': titles, 'Insights': ins }), 'streamed_media_analysis.xlsx');
+  });
+
+  // Sample beacons: three panelists across every platform, plus two failures.
+  function beacon(page, panelist, n) {
+    return 'https://sb.scorecardresearch.com/p?c1=2&c2=7700001&ns_ap_sv=2.1&c12=' + panelist + '&ns_ts=' + (1778000000000 + n * 86400000) + '&c7=' + encodeURIComponent(page);
+  }
+  var SAMPLE = [
+    ['https://www.youtube.com/watch?v=Kx9Lm2Qa7Tp', 'P10017'], ['https://open.spotify.com/episode/5Xt5DXGzch68nYYamXrNxZ', 'P10017'],
+    ['https://open.spotify.com/episode/3kWzpH6xuj5mjvR8Y0AqE1', 'P10017'], ['https://open.spotify.com/track/1rfofaqEpACxVEHIZBJe6W', 'P10017'],
+    ['https://www.instagram.com/reel/C7xPq2LmN8a/', 'P10017'], ['https://www.netflix.com/watch/81456789', 'P10017'],
+    ['https://www.primevideo.com/detail/B0CX12AB34', 'P10017'],
+    ['https://open.spotify.com/episode/0vFpG1y0tFzE8ZqEjS9B2x', 'P10042'], ['https://open.spotify.com/episode/6aTqUwZq8Lm5RtYvBn3Ce7', 'P10042'],
+    ['https://www.instagram.com/reel/C9dSy7XzM4e/', 'P10042'], ['https://www.primevideo.com/detail/B0DQ56CD78', 'P10042'],
+    ['https://www.youtube.com/watch?v=Hq7Tu3Ys5Lp', 'P10042'], ['https://open.spotify.com/track/7qiZfU4dY1lWllzX7mPBI3', 'P10042'],
+    ['https://www.netflix.com/watch/81234567', 'P10042'],
+    ['https://www.netflix.com/watch/81345678', 'P10088'], ['https://www.primevideo.com/detail/B0EZ90EF12', 'P10088'],
+    ['https://www.youtube.com/watch?v=Vb4Ne8Rw1Zc', 'P10088'], ['https://www.instagram.com/reel/C8bRt5VwK2c/', 'P10088'],
+    ['https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC', 'P10088'], ['https://open.spotify.com/episode/5Xt5DXGzch68nYYamXrNxZ', 'P10088'],
+    ['https://www.youtube.com/watch?v=Zz0Zz0Zz0Zz', 'P10088']
+  ];
+  Mock.route('GET', '/streamed-media/api/sample', function () {
+    var urls = SAMPLE.map(function (s, i) { return beacon(s[0], s[1], i); });
+    urls.splice(9, 0, 'https://www.example.com/not-a-beacon?page=1');
+    return { urls: urls };
+  }, { latency: 0 });
+})();
+</script>
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streamed Media Analysis</title>
+<style>
+  html,body{margin:0}
+  .container{max-width:1120px;margin:0 auto}
+  .card{padding:20px;margin-bottom:16px}
+  .hidden{display:none!important}
+  textarea{width:100%;min-height:150px;resize:vertical;font:12.5px/1.55 Consolas,Monaco,monospace!important;box-sizing:border-box;padding:12px!important}
+  .row-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+  .plats{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+  .plat{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;padding:5px 11px;border-radius:99px;border:1px solid rgba(180,160,255,.22);background:rgba(255,255,255,.04)}
+  .plat i{width:9px;height:9px;border-radius:50%;background:var(--pc)}
+  .status{display:none;margin-top:14px;padding:10px 14px}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .stat{padding:16px;border-radius:14px;border:1px solid rgba(180,160,255,.2);background:rgba(255,255,255,.045)}
+  .stat b{display:block;font-size:26px;line-height:1.1}
+  .stat span{font-size:12px;color:var(--muted)}
+  .tbl{width:100%;border-collapse:collapse;font-size:13px}
+  .tbl th{text-align:left;font-size:12px;font-weight:600;color:var(--muted);padding:8px 10px;border-bottom:1px solid rgba(180,160,255,.2);white-space:nowrap}
+  .tbl td{padding:9px 10px;border-bottom:1px solid rgba(180,160,255,.08);vertical-align:top}
+  .tbl tr.main{cursor:pointer;transition:background .15s}
+  .tbl tr.main:hover td{background:rgba(255,255,255,.04)}
+  .tbl tr.detail td{background:rgba(0,0,0,.18);font-size:12.5px;color:#d9d0ff}
+  .tbl .t{font-weight:600}
+  .tbl .s{color:var(--muted);font-size:12px}
+  .badge{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:99px;white-space:nowrap;color:#fff;background:color-mix(in srgb,var(--pc) 75%,#000)}
+  .oc{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px}
+  .oc-OK{color:#8ef0e0;background:rgba(45,212,191,.12)}
+  .oc-NOT_FOUND,.oc-UNSUPPORTED{color:#fcd34d;background:rgba(251,191,36,.12)}
+  .oc-INVALID{color:#fca5a5;background:rgba(248,113,113,.12)}
+  .kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:6px 18px;margin-top:8px}
+  .kv div span{color:var(--muted);margin-right:6px}
+  .tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .tag{font-size:11.5px;padding:2px 9px;border-radius:99px;background:rgba(139,108,240,.2);color:#d6c9ff}
+  .who{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+  .who button{border:1px solid rgba(180,160,255,.3);background:rgba(255,255,255,.04);color:var(--text);border-radius:99px;padding:7px 14px;font-weight:600;font-size:13px;cursor:pointer;transition:all .2s}
+  .who button.on{background:#8b6cf0;border-color:transparent;color:#fff}
+  .ins{display:grid;grid-template-columns:1fr 1.4fr;gap:16px}
+  .ibar{display:grid;grid-template-columns:150px 1fr 26px;align-items:center;gap:10px;margin-bottom:9px;font-size:13px}
+  .ibar .tr{height:8px;border-radius:8px;background:rgba(255,255,255,.07);overflow:hidden}
+  .ibar .tr i{display:block;height:100%;border-radius:8px;background:linear-gradient(90deg,#8b6cf0,#2dd4bf);transform-origin:0 50%}
+  .prod{display:grid;grid-template-columns:1fr 64px;gap:4px 14px;padding:12px 14px;border-radius:12px;border:1px solid rgba(180,160,255,.18);background:rgba(255,255,255,.035);margin-bottom:10px}
+  .prod .p{font-weight:700}
+  .prod .b{font-size:12px;color:var(--muted)}
+  .prod .c{grid-row:span 2;text-align:right;font-size:22px;font-weight:800;color:#5eead4}
+  .prod .c small{display:block;font-size:10.5px;font-weight:600;color:var(--muted)}
+  .prod .ev{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+  .pp{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .pcard{padding:14px 16px;border-radius:14px;border:1px solid color-mix(in srgb,var(--pc) 45%,transparent);background:linear-gradient(160deg,color-mix(in srgb,var(--pc) 14%,transparent),rgba(255,255,255,.02))}
+  .pcard h4{margin:8px 0 2px;font-size:14px}
+  .pcard .s{font-size:12px;color:var(--muted)}
+  .pcard .arrow{margin:10px 0 2px;font-size:12px;color:var(--muted)}
+  .pcard .to{font-weight:700;color:#fff}
+  .note{font-size:12px;color:var(--faint);margin-top:10px}
+  @media (max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}.ins,.pp{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="shell">
+<div class="container">
+
+  <div class="sec-head">ComScore URLs</div>
+  <div class="card">
+    <label for="urls">One beacon URL per line</label>
+    <textarea id="urls" placeholder="https://sb.scorecardresearch.com/p?c1=2&amp;c2=…&amp;c12=PANELIST&amp;c7=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D…"></textarea>
+    <div class="row-actions">
+      <button class="btn btn-primary" id="runBtn">Analyze</button>
+      <button class="btn btn-secondary" id="sampleBtn">Use sample data</button>
+      <span class="hint" id="count"></span>
+    </div>
+    <div class="plats" id="plats"></div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div id="results" class="hidden">
+    <div class="stats" id="stats"></div>
+
+    <div class="sec-head">Audience insights</div>
+    <div class="who" id="who"></div>
+    <div class="ins">
+      <div class="card"><label>Interests</label><div id="interests" style="margin-top:12px"></div></div>
+      <div class="card"><label>Likely customer for</label><div id="products" style="margin-top:12px"></div><p class="note">Brands are fictional examples.</p></div>
+    </div>
+
+    <div class="sec-head">By platform</div>
+    <div class="pp" id="byPlatform"></div>
+
+    <div class="sec-head">Titles</div>
+    <div class="card" style="padding:8px 8px 4px;overflow-x:auto">
+      <table class="tbl"><thead><tr><th>Platform</th><th>Title</th><th>Type</th><th>Genre</th><th>Duration</th><th>Released</th><th>Panelist</th><th>Outcome</th></tr></thead><tbody id="titles"></tbody></table>
+    </div>
+    <div class="row-actions">
+      <button class="btn btn-secondary" id="xlsxBtn">⬇ Excel (titles + insights)</button>
+      <button class="btn btn-secondary" id="csvBtn">⬇ CSV (titles)</button>
+    </div>
+  </div>
+
+</div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const PLAT = { youtube: ['YouTube', '#ff4e45'], netflix: ['Netflix', '#e50914'], prime: ['Prime Video', '#00a8e1'], reels: ['Instagram Reels', '#e1306c'], music: ['Spotify Music', '#1db954'], podcast: ['Spotify Podcasts', '#9b6bff'] };
+const badge = p => p ? `<span class="badge" style="--pc:${PLAT[p][1]}">${PLAT[p][0]}</span>` : '<span class="s">—</span>';
+const rise = (el, i, d) => el.animate([{ opacity: 0, transform: 'translateY(10px)' }, { opacity: 1, transform: 'none' }], { duration: 360, delay: (d || 0) + i * 45, easing: 'cubic-bezier(.2,.8,.2,1)', fill: 'both' });
+let RUN = null, WHO = null;
+
+$('plats').innerHTML = Object.keys(PLAT).map(k => `<span class="plat" style="--pc:${PLAT[k][1]}"><i></i>${PLAT[k][0]}</span>`).join('');
+$('urls').addEventListener('input', count);
+function count() { const n = $('urls').value.split(/\n/).filter(x => x.trim()).length; $('count').textContent = n ? n + ' URL' + (n > 1 ? 's' : '') : ''; }
+function status(cls, msg) { const s = $('status'); s.className = 'status ' + cls; s.innerHTML = msg; s.style.display = msg ? 'block' : 'none'; }
+
+$('sampleBtn').onclick = async () => {
+  const d = await (await fetch('/streamed-media/api/sample')).json();
+  $('urls').value = d.urls.join('\n'); count();
+};
+$('runBtn').onclick = run;
+async function run() {
+  const urls = $('urls').value.split(/\n/).map(x => x.trim()).filter(Boolean);
+  $('runBtn').disabled = true; status('info', 'Reading beacons and resolving metadata…');
+  try {
+    const r = await fetch('/streamed-media/api/analyze', { method: 'POST', body: JSON.stringify({ urls }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    RUN = d; status('', ''); render();
+  } catch (e) { status('err', e.message); }
+  finally { $('runBtn').disabled = false; }
+}
+
+function render() {
+  const items = RUN.items, ok = items.filter(i => i.outcome === 'OK');
+  const pids = Object.keys(RUN.insights);
+  $('stats').innerHTML = [[items.length, 'URLs read'], [ok.length, 'Titles resolved'], [new Set(ok.map(i => i.platform)).size, 'Platforms'], [pids.length, 'Panelists']]
+    .map(s => `<div class="stat"><b>${s[0]}</b><span>${s[1]}</span></div>`).join('');
+  $('results').classList.remove('hidden');
+  [...$('stats').children].forEach((c, i) => rise(c, i));
+  $('who').innerHTML = pids.map(p => `<button data-p="${esc(p)}">${esc(p)} · ${RUN.insights[p].titles} titles</button>`).join('');
+  $('who').querySelectorAll('button').forEach(b => b.onclick = () => showWho(b.dataset.p));
+  $('titles').innerHTML = items.map((i, n) => `<tr class="main" data-n="${n}"><td>${badge(i.platform)}</td>
+    <td><div class="t">${esc(i.title || i.reason || '')}</div><div class="s">${esc(i.creator || i.page || i.input)}</div></td>
+    <td>${esc(i.type || '')}</td><td>${esc(i.genre || '')}</td><td>${esc(i.duration || '')}</td><td>${esc(i.released || '')}</td>
+    <td>${esc(i.panelist || '')}</td><td><span class="oc oc-${i.outcome}">${i.outcome.replace('_', ' ')}</span></td></tr>`).join('');
+  $('titles').querySelectorAll('tr.main').forEach((tr, i) => { rise(tr, i, 200); tr.onclick = () => toggleDetail(tr); });
+  showWho(pids[0]);
+}
+function toggleDetail(tr) {
+  const nx = tr.nextElementSibling;
+  if (nx && nx.classList.contains('detail')) { nx.remove(); return; }
+  const i = RUN.items[+tr.dataset.n];
+  const kv = i.outcome === 'OK' ? Object.entries(Object.assign({ 'Creator / show': i.creator }, i.extra || {})).map(([k, v]) => `<div><span>${esc(k)}</span>${esc(v)}</div>`).join('') : '';
+  const row = document.createElement('tr'); row.className = 'detail';
+  row.innerHTML = `<td colspan="8">${i.outcome === 'OK' ? `<div>${esc(i.synopsis)}</div><div class="kv">${kv}</div>
+    <div class="tags">${i.signals.map(s => `<span class="tag">${esc(s.replace('-', ' '))}</span>`).join('')}</div>` : esc(i.reason)}
+    <div class="s" style="margin-top:8px;word-break:break-all">${esc(i.page || i.input)}</div></td>`;
+  tr.after(row); rise(row, 0);
+}
+function showWho(p) {
+  WHO = p; const I = RUN.insights[p]; if (!I) return;
+  $('who').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.p === p));
+  const max = Math.max(...I.interests.map(x => x.score));
+  $('interests').innerHTML = I.interests.slice(0, 8).map(x => `<div class="ibar"><span>${esc(x.label)}</span><span class="tr"><i style="width:${x.score / max * 100}%"></i></span><b>${x.score}</b></div>`).join('');
+  $('interests').querySelectorAll('.tr i').forEach((b, i) => b.animate([{ transform: 'scaleX(0)' }, { transform: 'scaleX(1)' }], { duration: 600, delay: i * 60, easing: 'cubic-bezier(.2,.8,.2,1)', fill: 'both' }));
+  $('products').innerHTML = I.products.slice(0, 5).map(x => `<div class="prod"><div class="p">${esc(x.product)}</div><div class="c">${x.confidence}%<small>confidence</small></div>
+    <div class="b">e.g. ${esc(x.brand)}</div><div class="ev">${x.evidence.map(e => `<span class="badge" style="--pc:${PLAT[e.platform][1]}" title="${esc(e.creator)}">${esc(e.title)}</span>`).join('')}</div></div>`).join('');
+  [...$('products').children].forEach((c, i) => rise(c, i));
+  $('byPlatform').innerHTML = I.byPlatform.map(x => `<div class="pcard" style="--pc:${PLAT[x.platform][1]}">${badge(x.platform)}
+    <h4>${esc(x.title)}</h4><div class="s">${esc(x.creator)} · ${esc(x.type)}</div>
+    <div class="arrow">→ likely customer for</div><div class="to">${x.product ? esc(x.product) + ' · ' + esc(x.brand) : '—'}</div>
+    ${x.confidence ? `<div class="s">${x.confidence}% confidence</div>` : ''}</div>`).join('');
+  [...$('byPlatform').children].forEach((c, i) => rise(c, i));
+}
+$('xlsxBtn').onclick = () => RUN && Mock.downloadFrom('/streamed-media/api/export?job=' + RUN.job);
+$('csvBtn').onclick = () => RUN && Mock.downloadFrom('/streamed-media/api/export?format=csv&job=' + RUN.job);
+</script>
+</body>
+</html>
